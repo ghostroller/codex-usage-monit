@@ -124,6 +124,179 @@ fn session_management_restored_raw_session_returns_to_the_normal_list() {
     );
 }
 
+fn reconciliation_fixture(
+    offline: bool,
+) -> (tempfile::TempDir, CollectConfig, Arc<Mutex<RolloutCache>>) {
+    let temporary = tempfile::tempdir().unwrap();
+    let home = temporary.path().join("home");
+    std::fs::create_dir_all(home.join("sessions")).unwrap();
+    let config = CollectConfig {
+        codex_home: home,
+        codex_bin: Some(PathBuf::from(
+            "/nonexistent/read-only-reconciliation-fixture",
+        )),
+        deleted_sessions_dir: Some(temporary.path().join("ledger")),
+        event_log: EventLog::open(
+            Some(temporary.path().join("events.jsonl")),
+            LogLevel::Debug,
+            false,
+        ),
+        offline,
+        ..CollectConfig::default()
+    };
+    let app = interaction_test_app(4, 0);
+    let at = app.snapshot.as_of;
+    crate::deleted_sessions::prepare_delete(
+        &config,
+        "readonly-ui",
+        &[
+            record(&app.snapshot.tasks[1], at, DeletionStatus::Pending),
+            record(&app.snapshot.tasks[2], at, DeletionStatus::Pending),
+        ],
+    )
+    .unwrap();
+    for (thread, status) in [
+        ("task-thread-1", DeletionStatus::Deleted),
+        ("task-thread-2", DeletionStatus::Unknown),
+    ] {
+        crate::deleted_sessions::set_deletion_outcome(&config, "readonly-ui", thread, status, at)
+            .unwrap();
+    }
+    (temporary, config, Arc::new(Mutex::new(RolloutCache::new())))
+}
+
+#[test]
+fn session_management_live_raw_unknown_receipt_does_not_repeat_inventory_reads() {
+    let (_temporary, config, cache) = reconciliation_fixture(false);
+    std::fs::write(
+        config.codex_home.join("sessions/live.jsonl"),
+        format!(
+            "{}\n",
+            serde_json::json!({"timestamp":Utc::now(),"type":"session_meta",
+            "payload":{"id":"task-thread-2","source":"cli"}})
+        ),
+    )
+    .unwrap();
+    cache.lock().unwrap().scan(&config, Utc::now()).unwrap();
+    assert!(cache.lock().unwrap().has_live_thread("task-thread-2"));
+    let records =
+        crate::tui::session_management::load_records_with_reconcile(&config, &cache, |_| {
+            panic!("a visible raw session already proves it is not deleted")
+        })
+        .unwrap();
+    assert_eq!(records.len(), 2);
+    assert!(
+        records
+            .iter()
+            .any(|record| record.thread_id == "task-thread-2"
+                && record.status == DeletionStatus::Unknown)
+    );
+}
+
+#[test]
+fn session_management_offline_record_worker_never_requests_reconciliation() {
+    let (_temporary, config, cache) = reconciliation_fixture(true);
+    let records =
+        crate::tui::session_management::load_records_with_reconcile(&config, &cache, |_| {
+            panic!("offline loading must not start an App Server or any reconciliation")
+        })
+        .unwrap();
+    assert_eq!(records.len(), 2);
+    assert!(
+        records
+            .iter()
+            .any(|record| record.status == DeletionStatus::Unknown)
+    );
+    let mut app = interaction_test_app(4, 0);
+    app.apply_deleted_session_records(Ok(records));
+    assert!(app.is_deleted_task(&app.snapshot.tasks[1]));
+    assert!(!app.is_deleted_task(&app.snapshot.tasks[2]));
+}
+
+#[test]
+fn session_management_reconciliation_error_keeps_confirmed_records_and_deduplicates_warning() {
+    let (temporary, config, cache) = reconciliation_fixture(false);
+    for _ in 0..2 {
+        let records =
+            crate::tui::session_management::load_records_with_reconcile(&config, &cache, |_| {
+                assert!(
+                    cache.try_lock().is_ok(),
+                    "the cache mutex must not be held across read-only RPCs"
+                );
+                Err("fixture inventory is incomplete".into())
+            })
+            .unwrap();
+        let mut app = interaction_test_app(4, 0);
+        app.apply_deleted_session_records(Ok(records));
+        assert!(
+            app.is_deleted_task(&app.snapshot.tasks[1]),
+            "a failed recheck cannot undo a different confirmed deletion"
+        );
+        assert!(
+            !app.is_deleted_task(&app.snapshot.tasks[2]),
+            "uncertainty is not a successful deletion"
+        );
+    }
+    let events = std::fs::read_to_string(temporary.path().join("events.jsonl")).unwrap();
+    let warnings = events
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|event| event["event"] == "session_delete.reconciliation")
+        .count();
+    assert_eq!(
+        warnings, 1,
+        "repeated inventory failure is one observed warning"
+    );
+    let stored = crate::deleted_sessions::load_deleted_sessions(&config).unwrap();
+    assert!(
+        stored
+            .iter()
+            .any(|record| record.thread_id == "task-thread-1"
+                && record.status == DeletionStatus::Deleted)
+    );
+    assert!(
+        stored
+            .iter()
+            .any(|record| record.thread_id == "task-thread-2"
+                && record.status == DeletionStatus::Unknown)
+    );
+}
+
+#[test]
+fn session_management_readonly_recovery_reloads_ledger_without_repeating_a_completed_operation() {
+    let (_temporary, config, cache) = reconciliation_fixture(false);
+    let records =
+        crate::tui::session_management::load_records_with_reconcile(&config, &cache, |config| {
+            assert!(cache.try_lock().is_ok());
+            crate::deleted_sessions::set_deletion_outcome(
+                config,
+                "readonly-ui",
+                "task-thread-2",
+                DeletionStatus::Deleted,
+                Utc::now(),
+            )
+            .unwrap();
+            Ok(vec!["task-thread-2".into()])
+        })
+        .unwrap();
+    assert_eq!(records.len(), 2);
+    assert!(
+        records
+            .iter()
+            .all(|record| record.status == DeletionStatus::Deleted)
+    );
+    let mut app = interaction_test_app(4, 0);
+    app.apply_deleted_session_records(Ok(records));
+    assert!(app.is_deleted_task(&app.snapshot.tasks[1]));
+    assert!(app.is_deleted_task(&app.snapshot.tasks[2]));
+    let records =
+        crate::tui::session_management::load_records_with_reconcile(&config, &cache, |_| {
+            panic!("all recorded outcomes are confirmed; no further reconciliation is necessary")
+        })
+        .unwrap();
+    assert_eq!(records.len(), 2);
+}
+
 #[test]
 fn session_management_same_named_deleted_sessions_keep_distinct_uuid_tails_visible() {
     let ids = [
@@ -225,6 +398,152 @@ fn ready_confirmation(harness: &mut TuiHarness) {
 }
 
 #[test]
+fn session_management_deleted_root_sorts_by_latest_deletion_time() {
+    for mode in [TaskListMode::Flat, TaskListMode::Tree] {
+        for (offset_minutes, expected) in [
+            (1, [DELETED_TASK_ROOT, 0, 3]),
+            (0, [0, DELETED_TASK_ROOT, 3]),
+            (-3, [0, DELETED_TASK_ROOT, 3]),
+            (-10, [0, 3, DELETED_TASK_ROOT]),
+        ] {
+            let mut harness = harness(80, 24, Theme::Dark);
+            harness.app.task_list_mode = mode;
+            let at = harness.app.snapshot.as_of;
+            for (index, age) in [(0, 0), (1, 100), (2, 120), (3, 5)] {
+                harness.app.snapshot.tasks[index].updated_at =
+                    Some(at - ChronoDuration::minutes(age));
+            }
+            let latest_deletion = at + ChronoDuration::minutes(offset_minutes);
+            harness.app.apply_deleted_session_records(Ok(vec![
+                record(
+                    &harness.app.snapshot.tasks[1],
+                    latest_deletion - ChronoDuration::minutes(1),
+                    DeletionStatus::Deleted,
+                ),
+                record(
+                    &harness.app.snapshot.tasks[2],
+                    latest_deletion,
+                    DeletionStatus::Deleted,
+                ),
+            ]));
+            harness.app.reconcile_task_filter(false);
+            let indices = |harness: &TuiHarness| {
+                harness
+                    .app
+                    .filtered_task_rows()
+                    .iter()
+                    .map(|row| row.index)
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(indices(&harness), expected);
+            harness.app.select_task(DELETED_TASK_ROOT, true);
+            harness.key(KeyCode::Enter);
+            let mut expanded = expected.to_vec();
+            let root = expanded
+                .iter()
+                .position(|index| *index == DELETED_TASK_ROOT)
+                .unwrap();
+            expanded.splice(root + 1..root + 1, [2, 1]);
+            assert_eq!(
+                indices(&harness),
+                expanded,
+                "deleted children stay with the root in newest-deletion order"
+            );
+            harness.key(KeyCode::Enter);
+            assert_eq!(indices(&harness), expected);
+        }
+    }
+}
+
+#[test]
+fn session_management_deleted_root_never_splits_a_recent_normal_subtree() {
+    let mut harness = harness(120, 40, Theme::Dark);
+    harness.app.snapshot = interaction_test_app(5, 0).snapshot;
+    harness.app.task_list_mode = TaskListMode::Tree;
+    let at = harness.app.snapshot.as_of;
+    for (index, age) in [(0, 0), (1, 8), (2, 10), (3, 20), (4, 30)] {
+        harness.app.snapshot.tasks[index].updated_at = Some(at - ChronoDuration::minutes(age));
+    }
+    let parent = harness.app.snapshot.tasks[3].thread_id.clone();
+    harness.app.snapshot.tasks[0].parent_thread_id = Some(parent.clone());
+    harness.app.snapshot.tasks[0].source = Some("subagent".into());
+    harness.app.apply_deleted_session_records(Ok(vec![
+        record(
+            &harness.app.snapshot.tasks[1],
+            at - ChronoDuration::minutes(6),
+            DeletionStatus::Deleted,
+        ),
+        record(
+            &harness.app.snapshot.tasks[4],
+            at - ChronoDuration::minutes(5),
+            DeletionStatus::Deleted,
+        ),
+    ]));
+    for normal_expanded in [false, true] {
+        harness.app.expanded_task_threads.clear();
+        if normal_expanded {
+            harness.app.expanded_task_threads.insert(parent.clone());
+        }
+        for deleted_expanded in [false, true] {
+            harness.app.session_management.expanded = deleted_expanded;
+            let mut expected = vec![3];
+            if normal_expanded {
+                expected.push(0);
+            }
+            expected.push(DELETED_TASK_ROOT);
+            if deleted_expanded {
+                expected.extend([4, 1]);
+            }
+            expected.push(2);
+            assert_eq!(
+                harness
+                    .app
+                    .filtered_task_rows()
+                    .iter()
+                    .map(|row| row.index)
+                    .collect::<Vec<_>>(),
+                expected,
+                "the recent child ranks its complete normal branch ahead of the deletion group"
+            );
+        }
+    }
+}
+
+#[test]
+fn session_management_deleted_root_sort_uses_matching_children_after_filtering() {
+    let mut harness = harness(80, 24, Theme::Dark);
+    let at = harness.app.snapshot.as_of;
+    harness.app.snapshot.tasks[0].title = "matched new task".into();
+    harness.app.snapshot.tasks[3].title = "matched old task".into();
+    harness.app.snapshot.tasks[3].updated_at = Some(at - ChronoDuration::minutes(5));
+    harness.app.snapshot.tasks[1].title = "hidden newest deletion".into();
+    harness.app.snapshot.tasks[2].title = "matched old deletion".into();
+    harness.app.apply_deleted_session_records(Ok(vec![
+        record(
+            &harness.app.snapshot.tasks[1],
+            at + ChronoDuration::minutes(1),
+            DeletionStatus::Deleted,
+        ),
+        record(
+            &harness.app.snapshot.tasks[2],
+            at - ChronoDuration::minutes(10),
+            DeletionStatus::Deleted,
+        ),
+    ]));
+    assert_eq!(
+        harness.app.filtered_task_rows()[0].kind,
+        TaskRowKind::DeletedRoot
+    );
+    harness.app.task_search = "matched".into();
+    let rows = harness.app.filtered_task_rows();
+    assert_eq!(
+        rows.iter().map(|row| row.index).collect::<Vec<_>>(),
+        [0, 3, DELETED_TASK_ROOT]
+    );
+    assert_eq!(rows[2].hidden_descendants, [2]);
+}
+
+#[test]
 fn session_management_deleted_root_is_independent_of_flat_tree_and_counts_usage_once() {
     for mode in [TaskListMode::Flat, TaskListMode::Tree] {
         let mut harness = harness(120, 40, Theme::Dark);
@@ -237,7 +556,10 @@ fn session_management_deleted_root_is_independent_of_flat_tree_and_counts_usage_
                 .count(),
             2
         );
-        let root = rows.last().unwrap();
+        let root = rows
+            .iter()
+            .find(|row| row.kind == TaskRowKind::DeletedRoot)
+            .unwrap();
         assert_eq!(root.kind, TaskRowKind::DeletedRoot);
         assert_eq!(root.index, DELETED_TASK_ROOT);
         assert!(root.collapsed);
@@ -291,7 +613,15 @@ fn session_management_deleted_root_is_independent_of_flat_tree_and_counts_usage_
         harness.app.activate_open();
         assert!(harness.app.pending_resume.is_none());
         harness.key(KeyCode::Enter);
-        assert!(harness.app.filtered_task_rows().last().unwrap().collapsed);
+        assert!(
+            harness
+                .app
+                .filtered_task_rows()
+                .iter()
+                .find(|row| row.kind == TaskRowKind::DeletedRoot)
+                .unwrap()
+                .collapsed
+        );
     }
 }
 
@@ -308,7 +638,12 @@ fn session_management_local_scoped_copies_are_grouped_once_and_foreign_identity_
     foreign.thread_id = "task-thread-1@node-22222222222222222222222222222222".into();
     assert!(!harness.app.is_deleted_task(&foreign));
     harness.app.snapshot.tasks.push(foreign);
-    let root = harness.app.filtered_task_rows().pop().unwrap();
+    let root = harness
+        .app
+        .filtered_task_rows()
+        .into_iter()
+        .find(|row| row.kind == TaskRowKind::DeletedRoot)
+        .unwrap();
     assert_eq!(root.kind, TaskRowKind::DeletedRoot);
     assert_eq!(root.hidden_descendants.len(), 2);
     assert_eq!(
@@ -319,7 +654,10 @@ fn session_management_local_scoped_copies_are_grouped_once_and_foreign_identity_
     );
     harness.app.snapshot.tasks.remove(1);
     let rows = harness.app.filtered_task_rows();
-    let root = rows.last().unwrap();
+    let root = rows
+        .iter()
+        .find(|row| row.kind == TaskRowKind::DeletedRoot)
+        .unwrap();
     assert_eq!(
         root.hidden_descendants.len(),
         2,
@@ -336,8 +674,16 @@ fn session_management_deleted_filters_and_selection_survive_refresh_without_trea
     harness.app.select_task(DELETED_TASK_ROOT, true);
     let anchor = harness.app.overview_refresh_anchor();
     harness.app.snapshot.tasks.reverse();
+    let latest_deletion = harness.app.snapshot.as_of + ChronoDuration::minutes(1);
+    for record in harness.app.session_management.deleted.values_mut() {
+        record.deleted_at = Some(latest_deletion);
+    }
     harness.app.restore_overview_refresh_anchor(anchor);
     assert_eq!(harness.app.selected_task, DELETED_TASK_ROOT);
+    assert_eq!(
+        harness.app.filtered_task_rows()[0].kind,
+        TaskRowKind::DeletedRoot
+    );
     harness.app.task_search = "task 2".into();
     harness.app.reconcile_task_filter(false);
     let rows = harness.app.filtered_task_rows();

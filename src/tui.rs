@@ -4291,7 +4291,7 @@ impl App {
                     hidden_descendants: Vec::new(),
                 })
                 .collect();
-            self.append_deleted_task_rows(&mut rows);
+            self.insert_deleted_task_rows(&mut rows);
             return rows;
         }
 
@@ -4361,7 +4361,7 @@ impl App {
                 &mut rows,
             );
         }
-        self.append_deleted_task_rows(&mut rows);
+        self.insert_deleted_task_rows(&mut rows);
         rows
     }
 

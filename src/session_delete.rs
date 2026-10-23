@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ffi::OsString;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::time::SystemTime;
 
@@ -12,12 +12,13 @@ use anyhow::{Context, Result, bail, ensure};
 use chrono::{DateTime, Utc};
 
 use crate::app_server::session_management::{
-    ManagedThread, SessionManagementClient, is_missing_thread,
+    ManagedThread, SessionManagementClient, SharedEndpointIdentity, is_missing_thread,
+    is_thread_not_loaded,
 };
 use crate::config::CollectConfig;
 use crate::deleted_sessions::{self, DeletedSessionRecord, DeletionStatus};
 use crate::domain::{TaskStatus, TokenUsage, TurnStatus};
-use crate::rollout::{SessionUsageCapture, capture_session_usage};
+use crate::rollout::{SessionCaptureRoots, SessionUsageCapture, capture_session_usage};
 
 #[cfg(all(test, unix))]
 #[path = "session_delete/protocol_tests.rs"]
@@ -35,6 +36,7 @@ pub(crate) struct PreparedSessionDeletion {
     threads: Vec<ManagedThread>,
     capture: SessionUsageCapture,
     operation_id: String,
+    shared_endpoint: Option<SharedEndpointIdentity>,
 }
 
 #[derive(Clone, Debug)]
@@ -45,6 +47,7 @@ pub(crate) struct DeletionOutcome {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct LocalBinding {
     home: PathBuf,
+    session_roots: SessionCaptureRoots,
     program: PathBuf,
     program_len: u64,
     program_modified: SystemTime,
@@ -73,6 +76,7 @@ impl LocalBinding {
             "Codex CLI must be a local executable file"
         );
         Ok(Self {
+            session_roots: SessionCaptureRoots::resolve(&home)?,
             home,
             program,
             program_len: metadata.len(),
@@ -105,7 +109,11 @@ pub(crate) fn prepare_session_delete(
     let binding = LocalBinding::resolve(config)?;
     let bound = binding.bound_config(config);
     let mut client = SessionManagementClient::connect(&bound)?;
-    prepare_with_client(&bound, raw_uuid, binding, &mut client)
+    let endpoint = client.endpoint_identity().clone();
+    let mut prepared = prepare_with_client(&bound, raw_uuid, binding, &mut client)?;
+    endpoint.validate_unchanged()?;
+    prepared.shared_endpoint = Some(endpoint);
+    Ok(prepared)
 }
 
 /// Persists all captured members before issuing one `thread/delete`. A failed
@@ -117,18 +125,98 @@ pub(crate) fn execute_session_delete(
     validate_prepared_summary(&prepared)?;
     ensure!(
         LocalBinding::resolve(config)? == prepared.binding,
-        "Codex home, CLI executable or PATH changed; prepare deletion again"
+        "Codex home, session roots, CLI executable or PATH changed; prepare deletion again"
     );
     let bound = prepared.binding.bound_config(config);
     let _operation_lock = deleted_sessions::acquire_operation_lock(&bound)?;
     let mut client = SessionManagementClient::connect(&bound)?;
+    let expected_endpoint = prepared
+        .shared_endpoint
+        .as_ref()
+        .context("prepared deletion has no shared App Server identity; prepare again")?;
+    ensure!(
+        client.endpoint_identity() == expected_endpoint,
+        "desktop App Server endpoint changed after confirmation; prepare deletion again"
+    );
+    expected_endpoint.validate_unchanged()?;
     execute_with_client(&bound, prepared, &mut client)
+}
+
+/// Rechecks only unresolved receipts already owned by this local ledger. This
+/// never prepares or sends a delete RPC, including after a timeout or crash.
+pub(crate) fn reconcile_pending_deletions(config: &CollectConfig) -> Result<Vec<String>> {
+    if config.offline || deleted_sessions::pending_deletion_receipts(config)?.is_empty() {
+        return Ok(Vec::new());
+    }
+    let binding = LocalBinding::resolve(config)?;
+    let bound = binding.bound_config(config);
+    let _operation_lock = deleted_sessions::acquire_operation_lock(&bound)?;
+    let receipts = deleted_sessions::pending_deletion_receipts(&bound)?;
+    if receipts.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut client = SessionManagementClient::connect(&bound)?;
+    reconcile_with_client(&bound, &binding.session_roots, &receipts, &mut client)
+}
+
+fn reconcile_with_client(
+    config: &CollectConfig,
+    roots: &SessionCaptureRoots,
+    receipts: &[deleted_sessions::PendingDeletionReceipt],
+    client: &mut impl ManagementClient,
+) -> Result<Vec<String>> {
+    let mut targets = HashSet::new();
+    for receipt in receipts {
+        validate_uuid(&receipt.thread_id)?;
+        ensure!(
+            targets.insert(receipt.thread_id.clone()),
+            "duplicate unresolved deletion receipt"
+        );
+    }
+    ensure!(
+        !targets.is_empty()
+            && targets.len() <= crate::app_server::session_management::MAX_DELETION_THREADS,
+        "unresolved deletion verification exceeded its target budget"
+    );
+    roots.validate_unchanged()?;
+    let persisted = client.persisted_threads(&targets)?;
+    let mut candidates = HashSet::new();
+    for id in &targets {
+        if !persisted.contains(id)
+            && client.read_thread(id).as_ref().err().is_some_and(|error| {
+                is_missing_thread(error, id) || is_thread_not_loaded(error, id)
+            })
+        {
+            candidates.insert(id.clone());
+        }
+    }
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Scan every configured owner file to completion after the fresh API
+    // observations. Missing/failed pagination or ownership never reaches here.
+    let owners = roots.remaining_owned_threads(&targets)?;
+    let mut confirmed = Vec::new();
+    for receipt in receipts {
+        if candidates.contains(&receipt.thread_id) && !owners.contains(&receipt.thread_id) {
+            deleted_sessions::set_deletion_outcome(
+                config,
+                &receipt.operation_id,
+                &receipt.thread_id,
+                DeletionStatus::Deleted,
+                Utc::now(),
+            )?;
+            confirmed.push(receipt.thread_id.clone());
+        }
+    }
+    Ok(confirmed)
 }
 
 trait ManagementClient {
     fn read_thread(&mut self, id: &str) -> Result<ManagedThread>;
     fn descendants(&mut self, root: &str) -> Result<Vec<ManagedThread>>;
-    fn delete_thread(&mut self, root: &str) -> Result<()>;
+    fn delete_thread(&mut self, root: &str, expected: &HashSet<String>) -> Result<()>;
+    fn persisted_threads(&mut self, targets: &HashSet<String>) -> Result<HashSet<String>>;
 }
 
 impl ManagementClient for SessionManagementClient {
@@ -138,8 +226,11 @@ impl ManagementClient for SessionManagementClient {
     fn descendants(&mut self, root: &str) -> Result<Vec<ManagedThread>> {
         SessionManagementClient::descendants(self, root)
     }
-    fn delete_thread(&mut self, root: &str) -> Result<()> {
-        SessionManagementClient::delete_thread(self, root)
+    fn delete_thread(&mut self, root: &str, expected: &HashSet<String>) -> Result<()> {
+        SessionManagementClient::delete_thread_with_notifications(self, root, expected)
+    }
+    fn persisted_threads(&mut self, targets: &HashSet<String>) -> Result<HashSet<String>> {
+        SessionManagementClient::persisted_threads(self, targets)
     }
 }
 
@@ -149,7 +240,7 @@ fn prepare_with_client(
     binding: LocalBinding,
     client: &mut impl ManagementClient,
 ) -> Result<PreparedSessionDeletion> {
-    let threads = fresh_tree(client, root, &binding.home)?;
+    let threads = fresh_tree(client, root, &binding.session_roots)?;
     let thread_ids = threads
         .iter()
         .map(|thread| thread.id.clone())
@@ -159,7 +250,7 @@ fn prepare_with_client(
     let capture = capture_session_usage(config, &targets, captured_at, &AtomicBool::new(false))?;
     validate_capture(&threads, &capture)?;
     ensure!(
-        fresh_tree(client, root, &binding.home)? == threads,
+        fresh_tree(client, root, &binding.session_roots)? == threads,
         "session state or spawned descendants changed while preparing deletion"
     );
     capture.validate_unchanged()?;
@@ -190,6 +281,7 @@ fn prepare_with_client(
         threads,
         capture,
         operation_id,
+        shared_endpoint: None,
     })
 }
 
@@ -200,7 +292,11 @@ fn execute_with_client(
 ) -> Result<DeletionOutcome> {
     validate_prepared_summary(&prepared)?;
     ensure!(
-        fresh_tree(client, &prepared.root_thread_id, &prepared.binding.home)? == prepared.threads,
+        fresh_tree(
+            client,
+            &prepared.root_thread_id,
+            &prepared.binding.session_roots
+        )? == prepared.threads,
         "session state or spawned descendants changed after confirmation; prepare again"
     );
     prepared.capture.validate_unchanged()?;
@@ -228,8 +324,11 @@ fn execute_with_client(
     let final_validation = (|| -> Result<()> {
         prepared.capture.validate_unchanged()?;
         ensure!(
-            fresh_tree(client, &prepared.root_thread_id, &prepared.binding.home)?
-                == prepared.threads,
+            fresh_tree(
+                client,
+                &prepared.root_thread_id,
+                &prepared.binding.session_roots
+            )? == prepared.threads,
             "session state or spawned descendants changed before the delete request"
         );
         prepared.capture.validate_unchanged()
@@ -246,7 +345,8 @@ fn execute_with_client(
         }
         return Err(error).context("logs changed before deletion; no delete request was sent");
     }
-    let deletion_result = client.delete_thread(&prepared.root_thread_id);
+    let expected_notifications = prepared.thread_ids.iter().cloned().collect();
+    let deletion_result = client.delete_thread(&prepared.root_thread_id, &expected_notifications);
     // A restored copy at a different path must not be mistaken for deletion
     // merely because the original path and an index lookup are now missing.
     let remaining_owned = prepared.capture.remaining_owned_threads();
@@ -254,16 +354,16 @@ fn execute_with_client(
     let mut unresolved = Vec::new();
     for id in &prepared.thread_ids {
         let observation = client.read_thread(id);
-        let missing = observation
-            .as_ref()
-            .err()
-            .is_some_and(|error| is_missing_thread(error, id));
+        let missing = observation.as_ref().err().is_some_and(|error| {
+            is_missing_thread(error, id)
+                || (deletion_result.is_ok() && is_thread_not_loaded(error, id))
+        });
         let paths = prepared.capture.paths_for_thread(id);
         let files_absent = remaining_owned.as_ref().is_ok_and(|owners| !owners.contains(id))
             && !paths.is_empty() && paths.iter().all(|path| {
             matches!(fs::symlink_metadata(path), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
         });
-        let status = if missing && files_absent {
+        let status = if deletion_result.is_ok() && missing && files_absent {
             deleted_threads.push(id.clone());
             DeletionStatus::Deleted
         } else {
@@ -285,7 +385,7 @@ fn execute_with_client(
     }
     if let Err(error) = deletion_result {
         bail!(
-            "deletion request failed or its result is unknown; captured usage remains saved ({} members absent, {} unresolved): {error:#}",
+            "deletion request failed or its result is unknown; desktop deletion notification is unconfirmed; captured usage remains saved ({} members absent, {} unresolved); no automatic retry: {error:#}",
             deleted_threads.len(),
             unresolved.len()
         );
@@ -322,9 +422,10 @@ fn validate_prepared_summary(prepared: &PreparedSessionDeletion) -> Result<()> {
 fn fresh_tree(
     client: &mut impl ManagementClient,
     root: &str,
-    home: &Path,
+    roots: &SessionCaptureRoots,
 ) -> Result<Vec<ManagedThread>> {
     validate_uuid(root)?;
+    roots.validate_unchanged()?;
     let mut members = BTreeMap::new();
     let root_thread = client.read_thread(root)?;
     ensure!(
@@ -359,13 +460,7 @@ fn fresh_tree(
             "session {} is active or its runtime state is unavailable",
             thread.id
         );
-        let path =
-            fs::canonicalize(&thread.path).context("persisted session log is unavailable")?;
-        ensure!(
-            path.starts_with(home.join("sessions"))
-                || path.starts_with(home.join("archived_sessions")),
-            "session log is outside the local Codex sessions directories"
-        );
+        roots.validate_log_path(&thread.path)?;
         if thread.id != root {
             let mut current = thread;
             let mut seen = BTreeSet::new();
@@ -384,6 +479,7 @@ fn fresh_tree(
             }
         }
     }
+    roots.validate_unchanged()?;
     Ok(members.into_values().collect())
 }
 
@@ -468,6 +564,7 @@ pub(crate) fn prepared_session_deletion_for_test(
         capture_boundary: captured_at,
         binding: LocalBinding {
             home: PathBuf::from("/nonexistent/monit-ui-test-codex-home"),
+            session_roots: SessionCaptureRoots::empty_for_test(),
             program: PathBuf::from("/nonexistent/monit-ui-test-codex"),
             program_len: 0,
             program_modified: SystemTime::UNIX_EPOCH,
@@ -478,6 +575,7 @@ pub(crate) fn prepared_session_deletion_for_test(
         threads: Vec::new(),
         capture: SessionUsageCapture::empty_for_test(),
         operation_id: "ui-only-never-execute".to_owned(),
+        shared_endpoint: None,
     }
 }
 
@@ -498,6 +596,7 @@ mod tests {
         Success,
         Partial,
         Timeout,
+        TimeoutAfterRemoval,
         Crash,
     }
 
@@ -507,14 +606,23 @@ mod tests {
         missing: HashSet<String>,
         deletion: MockDeletion,
         calls: usize,
+        not_loaded: bool,
+        read_error: bool,
+        inventory_error: bool,
+        inventory: Option<HashSet<String>>,
     }
 
     impl ManagementClient for MockClient {
         fn read_thread(&mut self, id: &str) -> Result<ManagedThread> {
+            ensure!(!self.read_error, "mock transport failed");
             if self.missing.contains(id) {
                 return Err(ManagementRpcError {
                     code: Some(-32600),
-                    message: format!("thread not found: {id}"),
+                    message: if self.not_loaded {
+                        format!("thread not loaded: {id}")
+                    } else {
+                        format!("thread not found: {id}")
+                    },
                 }
                 .into());
             }
@@ -534,7 +642,11 @@ mod tests {
                 .collect())
         }
 
-        fn delete_thread(&mut self, root: &str) -> Result<()> {
+        fn delete_thread(&mut self, root: &str, expected: &HashSet<String>) -> Result<()> {
+            ensure!(
+                expected == &self.threads.keys().cloned().collect(),
+                "delete notification scope must include every confirmed member"
+            );
             ensure!(root == ROOT, "unexpected mock deletion target");
             self.calls += 1;
             let records = deleted_sessions::load_deleted_sessions(&self.config)?;
@@ -575,7 +687,24 @@ mod tests {
                 fs::rename(&thread.path, retired)?;
                 self.missing.insert(thread.id.clone());
             }
+            if matches!(self.deletion, MockDeletion::TimeoutAfterRemoval) {
+                bail!("mock lost deletion response");
+            }
             Ok(())
+        }
+
+        fn persisted_threads(&mut self, targets: &HashSet<String>) -> Result<HashSet<String>> {
+            ensure!(
+                !self.inventory_error,
+                "mock persisted pagination was incomplete"
+            );
+            Ok(self.inventory.clone().unwrap_or_else(|| {
+                targets
+                    .iter()
+                    .filter(|id| !self.missing.contains(*id))
+                    .cloned()
+                    .collect()
+            }))
         }
     }
 
@@ -632,6 +761,10 @@ mod tests {
             missing: HashSet::new(),
             deletion: MockDeletion::Success,
             calls: 0,
+            not_loaded: false,
+            read_error: false,
+            inventory_error: false,
+            inventory: None,
         };
         (directory, config, client)
     }
@@ -702,6 +835,126 @@ mod tests {
                 .sum::<u64>(),
             20
         );
+    }
+
+    #[test]
+    fn successful_delete_accepts_exact_not_loaded_after_complete_file_absence() {
+        let (_directory, config, mut client) = fixture();
+        client.not_loaded = true;
+        let prepared = prepare(&config, &mut client);
+        let outcome = execute_with_client(&config, prepared, &mut client).unwrap();
+        assert_eq!(outcome.deleted_threads, [ROOT, CHILD]);
+        assert_eq!(client.calls, 1);
+        assert!(
+            deleted_sessions::load_deleted_sessions(&config)
+                .unwrap()
+                .iter()
+                .all(|record| record.status == DeletionStatus::Deleted)
+        );
+    }
+
+    #[test]
+    fn unknown_receipts_reconcile_without_repeating_delete_or_counting_usage_twice() {
+        let (_directory, config, mut client) = fixture();
+        client.not_loaded = true;
+        let prepared = prepare(&config, &mut client);
+        let roots = prepared.binding.session_roots.clone();
+        client.deletion = MockDeletion::TimeoutAfterRemoval;
+        assert!(execute_with_client(&config, prepared, &mut client).is_err());
+        let before = deleted_sessions::load_deleted_sessions(&config).unwrap();
+        assert!(
+            before
+                .iter()
+                .all(|record| record.status == DeletionStatus::Unknown),
+            "not-loaded plus absent logs cannot rescue an unsuccessful delete reply"
+        );
+        let receipts = deleted_sessions::pending_deletion_receipts(&config).unwrap();
+        let mut confirmed = reconcile_with_client(&config, &roots, &receipts, &mut client).unwrap();
+        confirmed.sort();
+        assert_eq!(confirmed, [ROOT, CHILD]);
+        assert_eq!(
+            client.calls, 1,
+            "reconciliation must never send another deletion"
+        );
+        let after = deleted_sessions::load_deleted_sessions(&config).unwrap();
+        assert!(
+            after
+                .iter()
+                .all(|record| record.status == DeletionStatus::Deleted)
+        );
+        assert_eq!(
+            after
+                .iter()
+                .map(|record| record.token_usage().total_tokens)
+                .sum::<u64>(),
+            20
+        );
+        assert_eq!(
+            before
+                .iter()
+                .map(|record| record.calls.len())
+                .sum::<usize>(),
+            after.iter().map(|record| record.calls.len()).sum::<usize>()
+        );
+        assert!(
+            deleted_sessions::pending_deletion_receipts(&config)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn reconciliation_requires_all_three_independent_absence_proofs() {
+        for missing_proof in ["inventory", "read", "owner", "owner_scan", "pagination"] {
+            let (_directory, config, mut client) = fixture();
+            client.not_loaded = true;
+            let prepared = prepare(&config, &mut client);
+            let roots = prepared.binding.session_roots.clone();
+            client.deletion = MockDeletion::TimeoutAfterRemoval;
+            assert!(execute_with_client(&config, prepared, &mut client).is_err());
+            match missing_proof {
+                "inventory" => {
+                    client.inventory = Some(HashSet::from([ROOT.to_owned(), CHILD.to_owned()]))
+                }
+                "read" => client.read_error = true,
+                "owner" => {
+                    for thread in client.threads.values() {
+                        fs::rename(
+                            config.codex_home.join(format!("retired-{}", thread.id)),
+                            &thread.path,
+                        )
+                        .unwrap();
+                    }
+                }
+                "owner_scan" => {
+                    fs::write(config.codex_home.join("sessions/unknown.jsonl"), "{}\n").unwrap()
+                }
+                "pagination" => client.inventory_error = true,
+                _ => unreachable!(),
+            }
+            let receipts = deleted_sessions::pending_deletion_receipts(&config).unwrap();
+            let result = reconcile_with_client(&config, &roots, &receipts, &mut client);
+            if matches!(missing_proof, "owner_scan" | "pagination") {
+                assert!(result.is_err(), "{missing_proof}");
+            } else {
+                assert!(result.unwrap().is_empty(), "{missing_proof}");
+            }
+            assert_eq!(client.calls, 1, "{missing_proof}: no repeated delete");
+            let records = deleted_sessions::load_deleted_sessions(&config).unwrap();
+            assert!(
+                records
+                    .iter()
+                    .all(|record| record.status == DeletionStatus::Unknown),
+                "{missing_proof}"
+            );
+            assert_eq!(
+                records
+                    .iter()
+                    .map(|record| record.token_usage().total_tokens)
+                    .sum::<u64>(),
+                20
+            );
+        }
     }
 
     #[test]

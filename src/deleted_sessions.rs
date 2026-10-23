@@ -30,6 +30,7 @@ const MAX_RECORD_BYTES: usize = 64 * 1024 * 1024;
 const MAX_READ_BYTES: usize = 256 * 1024 * 1024;
 const MAX_RECORDS: usize = 100_000;
 const MAX_CALLS: usize = 500_000;
+const MAX_PENDING_RECEIPTS: usize = 512;
 const LAYOUT: PrivateStoreLayout = PrivateStoreLayout {
     store_name: "deleted-session ledger",
     data_file_name: "ledger.sqlite3",
@@ -49,6 +50,12 @@ pub(crate) enum DeletionStatus {
     Unknown,
     Partial,
     Failed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PendingDeletionReceipt {
+    pub(crate) operation_id: String,
+    pub(crate) thread_id: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -672,6 +679,63 @@ pub(crate) fn load_deleted_sessions(config: &CollectConfig) -> Result<Vec<Delete
     })?.unwrap_or_default())
 }
 
+/// Return only the current operation's unresolved members. Historical receipts
+/// are audit evidence, never authority to update a later attempt for the same
+/// thread. The caller holds operation.lock across this query and reconciliation.
+pub(crate) fn pending_deletion_receipts(
+    config: &CollectConfig,
+) -> Result<Vec<PendingDeletionReceipt>> {
+    Ok(with_database(config, false, |connection| {
+        let mut statement = connection.prepare(
+            "SELECT s.thread_id,s.operation_id,length(s.payload),s.payload,o.id,r.status \
+             FROM sessions s \
+             LEFT JOIN operations o ON o.id=s.operation_id \
+             LEFT JOIN outcomes r ON r.operation_id=s.operation_id AND r.thread_id=s.thread_id \
+             ORDER BY s.thread_id",
+        )?;
+        let mut rows = statement.query([])?;
+        let mut receipts = Vec::new();
+        let mut bytes = 0usize;
+        let mut count = 0usize;
+        while let Some(row) = rows.next()? {
+            let len = usize::try_from(row.get::<_, i64>(2)?)
+                .context("invalid pending deletion evidence length")?;
+            bytes = bytes.saturating_add(len);
+            count += 1;
+            ensure!(len <= MAX_RECORD_BYTES && bytes <= MAX_READ_BYTES && count <= MAX_RECORDS,
+                "pending deletion evidence exceeds the bounded read limit; reconciliation refused");
+            let thread_id: String = row.get(0)?;
+            let operation_id: String = row.get(1)?;
+            ensure!(!operation_id.is_empty() && operation_id.len() <= 256
+                && !operation_id.chars().any(char::is_control),
+                "invalid current deletion operation identity");
+            let parent: Option<String> = row.get(4)?;
+            ensure!(parent.as_deref() == Some(operation_id.as_str()),
+                "current deletion operation is missing from the ledger");
+            let payload: Vec<u8> = row.get(3)?;
+            let record: DeletedSessionRecord = serde_json::from_slice(&payload)
+                .context("invalid pending deletion usage evidence")?;
+            record.validate()?;
+            ensure!(record.thread_id == thread_id, "pending deletion thread identity mismatch");
+            let outcome: Option<String> = row.get(5)?;
+            let outcome = outcome.context("current deletion operation has no member outcome")?;
+            // Version 1 prepare stored bare `pending`; outcome updates stored
+            // JSON enum strings. Accept both existing representations without
+            // rewriting the journal during a read-only reconciliation query.
+            let status: DeletionStatus = serde_json::from_str(&outcome).or_else(|_| {
+                serde_json::from_value(serde_json::Value::String(outcome.clone()))
+            }).context("invalid current deletion member outcome")?;
+            ensure!(status == record.status, "current deletion member status disagrees with saved usage evidence");
+            if matches!(status, DeletionStatus::Pending | DeletionStatus::Unknown | DeletionStatus::Partial) {
+                ensure!(receipts.len() < MAX_PENDING_RECEIPTS,
+                    "more than 512 pending deletion receipts; reconciliation refused without truncation");
+                receipts.push(PendingDeletionReceipt { operation_id, thread_id });
+            }
+        }
+        Ok(receipts)
+    })?.unwrap_or_default())
+}
+
 pub(crate) fn ledger_fingerprint(config: &CollectConfig) -> Result<Option<String>> {
     let (root, directory, _) = location(config)?;
     if !LAYOUT.directory_exists_beneath(&root, &directory)? {
@@ -941,6 +1005,158 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    #[test]
+    fn deleted_sessions_pending_receipts_follow_only_the_current_operation_and_status() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = config(&directory, "home");
+        assert!(pending_deletion_receipts(&config).unwrap().is_empty());
+        prepare_delete(&config, "old", &[record("repeated", "old-event", 40)]).unwrap();
+        set_deletion_outcome(&config, "old", "repeated", DeletionStatus::Unknown, at()).unwrap();
+        prepare_delete(
+            &config,
+            "current",
+            &[
+                record("repeated", "new-event", 7),
+                record("unknown", "event", 1),
+                record("partial", "event", 1),
+                record("failed", "event", 1),
+                record("deleted", "event", 1),
+            ],
+        )
+        .unwrap();
+        for (id, status) in [
+            ("unknown", DeletionStatus::Unknown),
+            ("partial", DeletionStatus::Partial),
+            ("failed", DeletionStatus::Failed),
+            ("deleted", DeletionStatus::Deleted),
+        ] {
+            set_deletion_outcome(&config, "current", id, status, at()).unwrap();
+        }
+        let receipts = pending_deletion_receipts(&config).unwrap();
+        assert_eq!(
+            receipts,
+            vec![
+                PendingDeletionReceipt {
+                    operation_id: "current".into(),
+                    thread_id: "partial".into()
+                },
+                PendingDeletionReceipt {
+                    operation_id: "current".into(),
+                    thread_id: "repeated".into()
+                },
+                PendingDeletionReceipt {
+                    operation_id: "current".into(),
+                    thread_id: "unknown".into()
+                },
+            ]
+        );
+        assert_eq!(
+            load_deleted_sessions(&config)
+                .unwrap()
+                .iter()
+                .find(|record| record.thread_id == "repeated")
+                .unwrap()
+                .token_usage()
+                .total_tokens,
+            47
+        );
+        with_database(&config, false, |connection| {
+            let old: String = connection.query_row(
+                "SELECT status FROM outcomes WHERE operation_id='old' AND thread_id='repeated'",
+                [],
+                |row| row.get(0),
+            )?;
+            assert_eq!(
+                serde_json::from_str::<DeletionStatus>(&old)?,
+                DeletionStatus::Unknown,
+                "reading current receipts must not rewrite historical attempts"
+            );
+            Ok(())
+        })
+        .unwrap();
+        assert!(
+            set_deletion_outcome(&config, "old", "repeated", DeletionStatus::Deleted, at())
+                .is_err()
+        );
+        assert_eq!(pending_deletion_receipts(&config).unwrap(), receipts);
+    }
+
+    #[test]
+    fn deleted_sessions_pending_receipts_check_member_consistency_and_home_binding() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = config(&directory, "home");
+        let other = super::tests::config(&directory, "other-home");
+        prepare_delete(&config, "operation", &[record("thread", "event", 42)]).unwrap();
+        set_deletion_outcome(
+            &config,
+            "operation",
+            "thread",
+            DeletionStatus::Unknown,
+            at(),
+        )
+        .unwrap();
+        assert!(pending_deletion_receipts(&other).unwrap().is_empty());
+        with_database(&config, true, |connection| {
+            connection.execute(
+                "UPDATE outcomes SET status='unknown' WHERE operation_id='operation'",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            pending_deletion_receipts(&config).unwrap().len(),
+            1,
+            "bare and JSON-encoded version-1 status strings remain readable"
+        );
+        with_database(&config, true, |connection| {
+            connection.execute(
+                "UPDATE outcomes SET status='failed' WHERE operation_id='operation'",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        assert!(
+            pending_deletion_receipts(&config).is_err(),
+            "a mismatched current outcome cannot authorize reconciliation"
+        );
+        with_database(&config, true, |connection| {
+            connection.execute("DELETE FROM outcomes WHERE operation_id='operation'", [])?;
+            Ok(())
+        })
+        .unwrap();
+        assert!(
+            pending_deletion_receipts(&config).is_err(),
+            "an absent current member receipt fails closed"
+        );
+    }
+
+    #[test]
+    fn deleted_sessions_pending_receipts_enforce_the_complete_512_member_budget() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = config(&directory, "home");
+        let records = (0..MAX_PENDING_RECEIPTS)
+            .map(|index| record(&format!("thread-{index:03}"), "event", 1))
+            .collect::<Vec<_>>();
+        prepare_delete(&config, "operation", &records).unwrap();
+        assert_eq!(
+            pending_deletion_receipts(&config).unwrap().len(),
+            MAX_PENDING_RECEIPTS
+        );
+        prepare_delete(&config, "overflow", &[record("extra", "event", 1)]).unwrap();
+        assert!(
+            pending_deletion_receipts(&config).is_err(),
+            "513 pending members must not silently return a truncated list"
+        );
+        set_deletion_outcome(&config, "overflow", "extra", DeletionStatus::Failed, at()).unwrap();
+        assert_eq!(
+            pending_deletion_receipts(&config).unwrap().len(),
+            MAX_PENDING_RECEIPTS,
+            "the pending budget counts unresolved members, not completed or failed history"
+        );
     }
 
     #[test]

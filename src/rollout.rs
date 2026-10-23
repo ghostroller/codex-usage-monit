@@ -984,12 +984,152 @@ pub fn scan_rollouts(config: &CollectConfig, now: DateTime<Utc>) -> Result<Rollo
     RolloutCache::default().scan(config, now)
 }
 
+/// Configured root links are allowed, but their resolved targets and directory
+/// identities stay fixed throughout an explicit deletion operation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SessionCaptureRoots {
+    home: PathBuf,
+    roots: Vec<SessionCaptureRoot>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SessionCaptureRoot {
+    configured: PathBuf,
+    canonical: Option<PathBuf>,
+    #[cfg(unix)]
+    identity: Option<(u64, u64)>,
+    #[cfg(windows)]
+    identity: Option<(u64, [u8; 16])>,
+}
+
+impl SessionCaptureRoots {
+    #[cfg(test)]
+    pub(crate) fn empty_for_test() -> Self {
+        Self {
+            home: PathBuf::new(),
+            roots: Vec::new(),
+        }
+    }
+
+    pub(crate) fn resolve(home: &Path) -> Result<Self> {
+        ensure!(home.is_dir(), "local Codex home is unavailable");
+        let home = home.to_path_buf();
+        let mut roots = Vec::new();
+        for name in ["sessions", "archived_sessions"] {
+            let configured = home.join(name);
+            let exists = match fs::symlink_metadata(&configured) {
+                Err(error) if error.kind() == ErrorKind::NotFound => false,
+                Err(error) => return Err(error).context("could not inspect session capture root"),
+                Ok(_) => true,
+            };
+            let canonical = if exists {
+                let path = fs::canonicalize(&configured)
+                    .context("session capture root target is unavailable")?;
+                ensure!(
+                    path.is_dir(),
+                    "session capture root must resolve to a directory"
+                );
+                Some(path)
+            } else {
+                None
+            };
+            #[cfg(unix)]
+            let identity = {
+                use std::os::unix::fs::MetadataExt;
+                canonical
+                    .as_ref()
+                    .map(|path| fs::metadata(path).map(|metadata| (metadata.dev(), metadata.ino())))
+                    .transpose()?
+            };
+            #[cfg(windows)]
+            let identity = canonical
+                .as_deref()
+                .map(windows_stable_file_identity)
+                .transpose()?;
+            roots.push(SessionCaptureRoot {
+                configured,
+                canonical,
+                #[cfg(any(unix, windows))]
+                identity,
+            });
+        }
+        if let (Some(active), Some(archived)) = (&roots[0].canonical, &roots[1].canonical) {
+            ensure!(
+                !active.starts_with(archived) && !archived.starts_with(active),
+                "active and archived session capture roots must not overlap"
+            );
+        }
+        Ok(Self { home, roots })
+    }
+
+    pub(crate) fn validate_unchanged(&self) -> Result<()> {
+        ensure!(
+            Self::resolve(&self.home)? == *self,
+            "session capture root targets changed; prepare deletion again"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn validate_log_path(&self, path: &Path) -> Result<()> {
+        let canonical = fs::canonicalize(path).context("persisted session log is unavailable")?;
+        let root = self
+            .roots
+            .iter()
+            .find(|root| {
+                root.canonical
+                    .as_ref()
+                    .is_some_and(|target| canonical.starts_with(target))
+            })
+            .context("session log is outside the local Codex sessions directories")?;
+        let target = root.canonical.as_ref().expect("matched an existing root");
+        // Only the configured root may be a link. Inspect the supplied relative
+        // path too, so a descendant alias cannot hide behind canonicalization.
+        let relative = path
+            .strip_prefix(&root.configured)
+            .or_else(|_| path.strip_prefix(target))
+            .unwrap_or_else(|_| canonical.strip_prefix(target).expect("matched root"));
+        let mut current = target.clone();
+        for component in relative.components() {
+            ensure!(
+                matches!(component, std::path::Component::Normal(_)),
+                "session log path has an invalid descendant component"
+            );
+            current.push(component.as_os_str());
+            let metadata = fs::symlink_metadata(&current)?;
+            ensure!(
+                !metadata.file_type().is_symlink(),
+                "session log descendants must not be symbolic links"
+            );
+        }
+        ensure!(
+            fs::canonicalize(&current)? == canonical && current.is_file(),
+            "persisted session log must be an ordinary file within its capture root"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn remaining_owned_threads(
+        &self,
+        targets: &HashSet<String>,
+    ) -> Result<HashSet<String>> {
+        ensure!(
+            !targets.is_empty() && targets.len() <= 1024,
+            "invalid session absence verification target set"
+        );
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        Ok(discover_session_capture_files(self, targets, &cancel)?
+            .into_iter()
+            .map(|(_, owner)| owner)
+            .collect())
+    }
+}
+
 /// Complete, owner-verified inputs for one explicit deletion operation. This
 /// never reads the persistent rollout cache or writes a history observation.
 #[derive(Clone, Debug)]
 pub(crate) struct SessionUsageCapture {
     pub(crate) dataset: RolloutDataset,
-    codex_home: PathBuf,
+    roots: SessionCaptureRoots,
     targets: HashSet<String>,
     files: Vec<(RolloutFile, String)>,
 }
@@ -999,7 +1139,7 @@ impl SessionUsageCapture {
     pub(crate) fn empty_for_test() -> Self {
         Self {
             dataset: RolloutDataset::default(),
-            codex_home: PathBuf::new(),
+            roots: SessionCaptureRoots::empty_for_test(),
             targets: HashSet::new(),
             files: Vec::new(),
         }
@@ -1022,7 +1162,7 @@ impl SessionUsageCapture {
 
     pub(crate) fn validate_unchanged(&self) -> Result<()> {
         let cancel = std::sync::atomic::AtomicBool::new(false);
-        let current = discover_session_capture_files(&self.codex_home, &self.targets, &cancel)?;
+        let current = discover_session_capture_files(&self.roots, &self.targets, &cancel)?;
         ensure!(
             current == self.files,
             "session rollout files changed after usage capture; prepare deletion again"
@@ -1031,18 +1171,12 @@ impl SessionUsageCapture {
     }
 
     pub(crate) fn remaining_owned_threads(&self) -> Result<HashSet<String>> {
-        let cancel = std::sync::atomic::AtomicBool::new(false);
-        Ok(
-            discover_session_capture_files(&self.codex_home, &self.targets, &cancel)?
-                .into_iter()
-                .map(|(_, owner)| owner)
-                .collect(),
-        )
+        self.roots.remaining_owned_threads(&self.targets)
     }
 }
 
 fn discover_session_capture_files(
-    codex_home: &Path,
+    roots: &SessionCaptureRoots,
     targets: &HashSet<String>,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<Vec<(RolloutFile, String)>> {
@@ -1050,17 +1184,12 @@ fn discover_session_capture_files(
     let mut files = Vec::new();
     let mut entries = 0usize;
     let mut probes = 0usize;
-    for name in ["sessions", "archived_sessions"] {
-        let root = codex_home.join(name);
-        match fs::symlink_metadata(&root) {
-            Err(error) if error.kind() == ErrorKind::NotFound => continue,
-            Err(error) => return Err(error).context("could not inspect session capture root"),
-            Ok(metadata) => ensure!(
-                metadata.is_dir() && !metadata.file_type().is_symlink(),
-                "session capture root must be an ordinary directory"
-            ),
-        }
-        for entry in WalkDir::new(&root).follow_links(false).max_depth(16) {
+    roots.validate_unchanged()?;
+    for root in &roots.roots {
+        let Some(target) = &root.canonical else {
+            continue;
+        };
+        for entry in WalkDir::new(target).follow_links(false).max_depth(16) {
             ensure!(
                 !cancel.load(Ordering::Relaxed),
                 "session usage capture cancelled"
@@ -1088,9 +1217,11 @@ fn discover_session_capture_files(
                 probes <= 16_384,
                 "session ownership discovery exceeded its file limit; deletion refused"
             );
-            let handle = open_rollout_source_for_validation(entry.path())?;
+            // Keep the configured logical path for active/archive replay rules;
+            // only traversal uses the frozen canonical target.
+            let path = root.configured.join(entry.path().strip_prefix(target)?);
+            let handle = open_rollout_source_for_validation(&path)?;
             let metadata = handle.metadata()?;
-            let path = entry.into_path();
             let file = RolloutFile {
                 fingerprint: FileFingerprint::from_path_and_metadata(&path, &metadata)?,
                 path,
@@ -1155,6 +1286,7 @@ fn discover_session_capture_files(
         files.len() <= 4_096,
         "session capture exceeded its file-count budget"
     );
+    roots.validate_unchanged()?;
     Ok(files)
 }
 
@@ -1181,7 +1313,8 @@ pub(crate) fn capture_session_usage(
         !targets.is_empty() && targets.len() <= 1024,
         "invalid session usage capture target set"
     );
-    let owned = discover_session_capture_files(&config.codex_home, targets, cancel)?;
+    let roots = SessionCaptureRoots::resolve(&config.codex_home)?;
+    let owned = discover_session_capture_files(&roots, targets, cancel)?;
     let mut cache = HashMap::new();
     let mut files = Vec::new();
     let mut bytes = 0u64;
@@ -1309,7 +1442,7 @@ pub(crate) fn capture_session_usage(
     );
     let capture = SessionUsageCapture {
         dataset,
-        codex_home: config.codex_home.clone(),
+        roots,
         targets: targets.clone(),
         files: owned,
     };
@@ -1378,6 +1511,137 @@ mod deleted_capture_tests {
             capture.validate_unchanged().is_err(),
             "new same-owner copies must invalidate the destructive plan"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deleted_sessions_capture_accepts_root_links_and_preserves_archive_replay() {
+        use std::os::unix::fs::symlink;
+        for archived_only in [false, true] {
+            let (directory, config, original) = fixture(&log(false, false));
+            let active_target = directory.path().join("active-target");
+            let archive_target = directory.path().join("archive-target");
+            fs::rename(config.codex_home.join("sessions"), &active_target).unwrap();
+            fs::create_dir(&archive_target).unwrap();
+            symlink(&active_target, config.codex_home.join("sessions")).unwrap();
+            symlink(&archive_target, config.codex_home.join("archived_sessions")).unwrap();
+            let archived = config
+                .codex_home
+                .join("archived_sessions")
+                .join(original.file_name().unwrap());
+            fs::copy(&original, &archived).unwrap();
+            if archived_only {
+                fs::remove_file(&original).unwrap();
+            }
+            let capture = capture_session_usage(
+                &config,
+                &HashSet::from([THREAD.to_owned()]),
+                time(),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+            assert_eq!(
+                capture
+                    .dataset
+                    .calls
+                    .iter()
+                    .map(|call| call.tokens.total_tokens)
+                    .sum::<u64>(),
+                17
+            );
+            assert_eq!(capture.dataset.tasks.len(), 1);
+            assert_eq!(capture.dataset.tasks[0].archived, archived_only);
+            assert!(capture.paths().contains(&archived));
+            assert_eq!(capture.paths().len(), if archived_only { 1 } else { 2 });
+            capture.validate_unchanged().unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deleted_sessions_capture_freezes_root_links_even_for_identical_copies() {
+        use std::os::unix::fs::symlink;
+        for name in ["sessions", "archived_sessions"] {
+            let (directory, config, original) = fixture(&log(false, false));
+            let target = directory.path().join("root-target");
+            fs::rename(config.codex_home.join("sessions"), &target).unwrap();
+            let root = config.codex_home.join(name);
+            symlink(&target, &root).unwrap();
+            let capture = capture_session_usage(
+                &config,
+                &HashSet::from([THREAD.to_owned()]),
+                time(),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+            let replacement = directory.path().join("replacement");
+            fs::create_dir(&replacement).unwrap();
+            fs::copy(
+                target.join(original.file_name().unwrap()),
+                replacement.join(original.file_name().unwrap()),
+            )
+            .unwrap();
+            fs::remove_file(&root).unwrap();
+            symlink(&replacement, &root).unwrap();
+            assert!(
+                target.join(original.file_name().unwrap()).is_file(),
+                "old scope still exists"
+            );
+            assert!(capture.validate_unchanged().is_err());
+            assert!(capture.remaining_owned_threads().is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deleted_sessions_capture_rejects_descendant_links_beneath_a_linked_root() {
+        use std::os::unix::fs::symlink;
+        for directory_link in [false, true] {
+            let (directory, config, original) = fixture(&log(false, false));
+            let target = directory.path().join("root-target");
+            fs::rename(config.codex_home.join("sessions"), &target).unwrap();
+            symlink(&target, config.codex_home.join("sessions")).unwrap();
+            let outside = directory.path().join("outside");
+            fs::create_dir(&outside).unwrap();
+            let external_file = outside.join("copied.jsonl");
+            fs::copy(&original, &external_file).unwrap();
+            symlink(
+                if directory_link {
+                    &outside
+                } else {
+                    &external_file
+                },
+                target.join(if directory_link {
+                    "nested"
+                } else {
+                    "alias.jsonl"
+                }),
+            )
+            .unwrap();
+            let error = capture_session_usage(
+                &config,
+                &HashSet::from([THREAD.to_owned()]),
+                time(),
+                &AtomicBool::new(false),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("symbolic link"), "{error:#}");
+        }
+    }
+
+    #[test]
+    fn deleted_sessions_capture_freezes_a_missing_archive_root() {
+        let (_directory, config, _) = fixture(&log(false, false));
+        let capture = capture_session_usage(
+            &config,
+            &HashSet::from([THREAD.to_owned()]),
+            time(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        fs::create_dir(config.codex_home.join("archived_sessions")).unwrap();
+        assert!(capture.validate_unchanged().is_err());
+        assert!(capture.remaining_owned_threads().is_err());
     }
 
     #[test]

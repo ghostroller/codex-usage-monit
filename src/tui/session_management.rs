@@ -59,8 +59,52 @@ pub(super) fn load_records(
     config: &CollectConfig,
     rollout_cache: &Arc<Mutex<RolloutCache>>,
 ) -> Result<Vec<DeletedSessionRecord>, String> {
+    load_records_with_reconcile(config, rollout_cache, |config| {
+        crate::session_delete::reconcile_pending_deletions(config)
+            .map_err(|error| error.to_string())
+    })
+}
+
+pub(super) fn load_records_with_reconcile(
+    config: &CollectConfig,
+    rollout_cache: &Arc<Mutex<RolloutCache>>,
+    reconcile: impl FnOnce(&CollectConfig) -> Result<Vec<String>, String>,
+) -> Result<Vec<DeletedSessionRecord>, String> {
     let mut records = crate::deleted_sessions::load_deleted_sessions(config)
         .map_err(|error| error.to_string())?;
+    if !config.offline {
+        let mut warnings = Vec::new();
+        let needs_reconciliation = {
+            let cache = rollout_cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            records.iter().any(|record| {
+                matches!(
+                    record.status,
+                    DeletionStatus::Pending | DeletionStatus::Unknown | DeletionStatus::Partial
+                ) && !cache.has_live_thread(&record.thread_id)
+            })
+        };
+        if needs_reconciliation {
+            // This may start a read-only App Server inventory. Never hold the
+            // shared rollout-cache mutex while waiting for that process.
+            match reconcile(config) {
+                Ok(recovered) if !recovered.is_empty() => {
+                    match crate::deleted_sessions::load_deleted_sessions(config) {
+                        Ok(reloaded) => records = reloaded,
+                        Err(error) => warnings.push((LogLevel::Warn, "session_delete.reconciliation", format!("Read-only deletion reconciliation could not reload retained records: {error}"))),
+                    }
+                    rollout_cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .invalidate_after_session_mutation();
+                }
+                Ok(_) => {}
+                Err(error) => warnings.push((LogLevel::Warn, "session_delete.reconciliation", format!("Read-only deletion reconciliation failed; retained records are unchanged: {error}"))),
+            }
+        }
+        config
+            .event_log
+            .observe("session_delete.reconciliation", &warnings);
+    }
     let cache = rollout_cache
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -191,7 +235,7 @@ impl App {
         tail
     }
 
-    pub(super) fn append_deleted_task_rows(&self, rows: &mut Vec<TaskListRow>) {
+    pub(super) fn insert_deleted_task_rows(&self, rows: &mut Vec<TaskListRow>) {
         let query = self.task_search.to_lowercase();
         let mut by_thread = BTreeMap::new();
         for (index, task) in self.snapshot.tasks.iter().enumerate() {
@@ -226,7 +270,29 @@ impl App {
         if deleted.is_empty() {
             return;
         }
-        rows.push(TaskListRow {
+        let latest_deleted_at = deleted[0].1.deleted_at;
+        let mut insert_at = 0;
+        // A normal tree's newest descendant ranks the whole branch, including
+        // collapsed descendants. Insert only between complete top-level trees.
+        for group in rows.chunk_by(|_, next| next.depth > 0) {
+            let latest_activity = group
+                .iter()
+                .flat_map(|row| {
+                    std::iter::once(row.index).chain(row.hidden_descendants.iter().copied())
+                })
+                .filter_map(|index| {
+                    self.snapshot
+                        .tasks
+                        .get(index)
+                        .and_then(|task| task.updated_at)
+                })
+                .max();
+            if latest_activity < latest_deleted_at {
+                break;
+            }
+            insert_at += group.len();
+        }
+        let mut deleted_rows = vec![TaskListRow {
             kind: TaskRowKind::DeletedRoot,
             index: DELETED_TASK_ROOT,
             prefix: String::new(),
@@ -234,11 +300,11 @@ impl App {
             has_children: true,
             collapsed: !self.session_management.expanded,
             hidden_descendants: deleted.iter().map(|(index, _)| *index).collect(),
-        });
+        }];
         if self.session_management.expanded {
             let count = deleted.len();
             for (position, (index, _)) in deleted.into_iter().enumerate() {
-                rows.push(TaskListRow {
+                deleted_rows.push(TaskListRow {
                     kind: TaskRowKind::DeletedSession,
                     index,
                     prefix: if position + 1 == count {
@@ -254,6 +320,7 @@ impl App {
                 });
             }
         }
+        rows.splice(insert_at..insert_at, deleted_rows);
     }
 
     pub(super) fn activate_selected_task(&mut self) {

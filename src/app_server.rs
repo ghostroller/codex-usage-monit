@@ -527,16 +527,36 @@ pub fn fetch_account_snapshot(config: &CollectConfig) -> Result<AccountSnapshot>
 
 /// Explicit local session management, separate from account collection. Only
 /// `delete_thread` mutates sessions; callers must persist their audit first.
+#[path = "app_server/shared_session_transport.rs"]
+mod shared_session_transport;
+
 pub(crate) mod session_management {
     use std::collections::HashSet;
     use std::path::PathBuf;
-    use std::process::ChildStdin;
 
+    use anyhow::ensure;
+
+    pub(crate) use super::shared_session_transport::SharedEndpointIdentity;
+    use super::shared_session_transport::SharedSessionTransport;
     use super::*;
 
     pub(crate) const MAX_DELETION_THREADS: usize = 512;
     const MAX_LIST_PAGES: usize = 32;
-    const MAX_MANAGEMENT_MESSAGES: usize = 4_096;
+    // Persisted history can be much larger than the recent rollout window.
+    // Keep its absence check separately bounded from one deletion's descendants.
+    const MAX_INVENTORY_PAGES: usize = 128;
+    const ALL_SOURCE_KINDS: [&str; 10] = [
+        "cli",
+        "vscode",
+        "exec",
+        "appServer",
+        "subAgent",
+        "subAgentReview",
+        "subAgentCompact",
+        "subAgentThreadSpawn",
+        "subAgentOther",
+        "unknown",
+    ];
     const MANAGEMENT_LIFETIME: Duration = Duration::from_secs(120);
 
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -619,14 +639,23 @@ pub(crate) mod session_management {
             })
     }
 
+    /// This is a runtime diagnostic, not proof that a persisted thread is gone.
+    /// Callers must independently prove deletion or persisted/file absence.
+    pub(crate) fn is_thread_not_loaded(error: &anyhow::Error, thread_id: &str) -> bool {
+        error
+            .downcast_ref::<ManagementRpcError>()
+            .is_some_and(|rpc| {
+                rpc.code == Some(-32600)
+                    && rpc
+                        .message
+                        .to_ascii_lowercase()
+                        .strip_prefix("thread not loaded:")
+                        .is_some_and(|suffix| suffix.trim() == thread_id)
+            })
+    }
+
     pub(crate) struct SessionManagementClient {
-        child: Option<ChildGuard>,
-        stdin: Option<ChildStdin>,
-        receiver: Option<mpsc::Receiver<ReaderEvent>>,
-        stdout_reader: Option<thread::JoinHandle<()>>,
-        stderr_reader: Option<thread::JoinHandle<()>>,
-        reader_done: Option<mpsc::Receiver<ReaderTask>>,
-        stderr: Arc<Mutex<String>>,
+        transport: SharedSessionTransport,
         timeout: Duration,
         overall_deadline: Instant,
         next_id: u64,
@@ -637,73 +666,11 @@ pub(crate) mod session_management {
             if config.offline || config.app_server_timeout.is_zero() {
                 bail!("session management requires a local app-server with a nonzero timeout");
             }
-            let mut command = codex_command(config)?;
-            command
-                .args(["app-server", "--listen", "stdio://"])
-                .env("CODEX_HOME", &config.codex_home)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-            if let Some(path) = &config.app_server_path {
-                command.env("PATH", path);
-            }
-            configure_process_tree(&mut command);
-            let mut child = command
-                .spawn()
-                .context("failed to start local session management")?;
-            let process_tree = match attach_process_tree(&mut child) {
-                Ok(tree) => tree,
-                Err(error) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(error).context("failed to contain session management process");
-                }
-            };
-            let mut child = ChildGuard {
-                child,
-                process_tree,
-                startup_trace: config.startup_trace.clone(),
-                trace_log: config.trace_log.clone(),
-                reaped: false,
-            };
-            let stdin = child
-                .child
-                .stdin
-                .take()
-                .context("session management stdin missing")?;
-            let stdout = child
-                .child
-                .stdout
-                .take()
-                .context("session management stdout missing")?;
-            let stderr = child
-                .child
-                .stderr
-                .take()
-                .context("session management stderr missing")?;
-            let (sender, receiver) = mpsc::sync_channel(APP_SERVER_READER_QUEUE);
-            let (done_sender, reader_done) = mpsc::channel();
-            let stdout_done = done_sender.clone();
-            let stdout_reader = thread::spawn(move || {
-                read_stdout(stdout, sender);
-                let _ = stdout_done.send(ReaderTask::Stdout);
-            });
-            let stderr_output = Arc::new(Mutex::new(String::new()));
-            let stderr_writer = Arc::clone(&stderr_output);
-            let stderr_reader = thread::spawn(move || {
-                capture_stderr(stderr, stderr_writer);
-                let _ = done_sender.send(ReaderTask::Stderr);
-            });
+            let overall_deadline = app_server_rpc_deadline(MANAGEMENT_LIFETIME)?;
             let mut client = Self {
-                child: Some(child),
-                stdin: Some(stdin),
-                receiver: Some(receiver),
-                stdout_reader: Some(stdout_reader),
-                stderr_reader: Some(stderr_reader),
-                reader_done: Some(reader_done),
-                stderr: stderr_output,
+                transport: SharedSessionTransport::connect(config, overall_deadline)?,
                 timeout: config.app_server_timeout,
-                overall_deadline: app_server_rpc_deadline(MANAGEMENT_LIFETIME)?,
+                overall_deadline,
                 next_id: 1,
             };
             client.rpc(
@@ -713,65 +680,42 @@ pub(crate) mod session_management {
                     "capabilities": {"experimentalApi":true}
                 }),
             )?;
-            write_message(
-                client.stdin.as_mut().unwrap(),
-                &json!({"method":"initialized"}),
-            )?;
+            client
+                .transport
+                .notify(json!({"method":"initialized"}), client.request_deadline()?)?;
             Ok(client)
         }
 
+        pub(crate) fn endpoint_identity(&self) -> &SharedEndpointIdentity {
+            self.transport.endpoint_identity()
+        }
+
+        fn request_deadline(&self) -> Result<Instant> {
+            Ok(app_server_rpc_deadline(self.timeout)?.min(self.overall_deadline))
+        }
+
         fn rpc(&mut self, method: &str, params: Value) -> Result<Value> {
+            self.rpc_with_notifications(method, params, HashSet::new())
+        }
+
+        fn rpc_with_notifications(
+            &mut self,
+            method: &str,
+            params: Value,
+            expected_deleted: HashSet<String>,
+        ) -> Result<Value> {
             let id = self.next_id;
             self.next_id = self
                 .next_id
                 .checked_add(1)
                 .context("management request ID exhausted")?;
-            let deadline = app_server_rpc_deadline(self.timeout)?.min(self.overall_deadline);
-            if deadline <= Instant::now() {
-                return Err(app_server_timeout_error(method, &self.stderr));
-            }
-            write_message(
-                self.stdin
-                    .as_mut()
-                    .context("session management connection closed")?,
-                &json!({"id":id,"method":method,"params":params}),
-            )?;
-            for _ in 0..MAX_MANAGEMENT_MESSAGES {
-                match recv_event(
-                    deadline,
-                    self.receiver.as_ref().unwrap(),
-                    method,
-                    &self.stderr,
-                )? {
-                    ReaderEvent::Message(message) if response_id(&message) == Some(id) => {
-                        if let Some(error) = message.get("error") {
-                            return Err(ManagementRpcError {
-                                code: error.get("code").and_then(Value::as_i64),
-                                message: compact_diagnostic_text(
-                                    error
-                                        .get("message")
-                                        .and_then(Value::as_str)
-                                        .unwrap_or("unknown management error"),
-                                    RPC_ERROR_MESSAGE_LIMIT,
-                                ),
-                            }
-                            .into());
-                        }
-                        return message
-                            .get("result")
-                            .cloned()
-                            .context("management reply has no result");
-                    }
-                    ReaderEvent::Message(_) => {}
-                    ReaderEvent::Malformed(_) => {
-                        bail!("invalid or oversized session management response")
-                    }
-                    ReaderEvent::Eof => {
-                        bail!("session management closed while waiting for {method}")
-                    }
-                }
-            }
-            bail!("session management notification budget exceeded")
+            self.transport.rpc(
+                id,
+                method,
+                params,
+                expected_deleted,
+                self.request_deadline()?,
+            )
         }
 
         pub(crate) fn read_thread(&mut self, thread_id: &str) -> Result<ManagedThread> {
@@ -793,7 +737,7 @@ pub(crate) mod session_management {
                 for _ in 0..MAX_LIST_PAGES {
                     let result = self.rpc("thread/list", json!({
                         "ancestorThreadId":root,"archived":archived,"limit":100,"cursor":cursor,"useStateDbOnly":true,
-                        "sourceKinds":["cli","vscode","exec","appServer","subAgent","subAgentReview","subAgentCompact","subAgentThreadSpawn","subAgentOther","unknown"]
+                        "sourceKinds":ALL_SOURCE_KINDS,"modelProviders":[]
                     }))?;
                     let data = result
                         .get("data")
@@ -829,8 +773,90 @@ pub(crate) mod session_management {
             Ok(threads)
         }
 
-        pub(crate) fn delete_thread(&mut self, thread_id: &str) -> Result<()> {
-            let result = self.rpc("thread/delete", json!({"threadId":thread_id}))?;
+        /// Complete persisted inventory, without JSONL scan/repair or runtime
+        /// mutation. A truncated/failed listing never proves target absence.
+        pub(crate) fn persisted_threads(
+            &mut self,
+            targets: &HashSet<String>,
+        ) -> Result<HashSet<String>> {
+            ensure!(
+                !targets.is_empty() && targets.len() <= MAX_DELETION_THREADS,
+                "invalid persisted thread verification target set"
+            );
+            let mut present = HashSet::new();
+            let mut seen = HashSet::new();
+            for archived in [false, true] {
+                let mut cursor: Option<String> = None;
+                let mut cursors = HashSet::new();
+                let mut complete = false;
+                for _ in 0..MAX_INVENTORY_PAGES {
+                    let result = self.rpc(
+                        "thread/list",
+                        json!({
+                            "archived":archived,"limit":100,"cursor":cursor,
+                            "useStateDbOnly":true,"sourceKinds":ALL_SOURCE_KINDS,
+                            "modelProviders":[]
+                        }),
+                    )?;
+                    let data = result
+                        .get("data")
+                        .and_then(Value::as_array)
+                        .context("persisted thread/list has no data array")?;
+                    ensure!(
+                        data.len() <= 100,
+                        "persisted thread/list exceeded its requested page size"
+                    );
+                    for entry in data {
+                        let id = entry
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .filter(|id| !id.is_empty() && id.len() <= 256)
+                            .context("persisted thread/list has no valid thread identity")?;
+                        ensure!(
+                            seen.insert(id.to_owned()),
+                            "persisted thread/list repeated a thread identity"
+                        );
+                        if targets.contains(id) {
+                            present.insert(id.to_owned());
+                        }
+                    }
+                    match result.get("nextCursor") {
+                        None | Some(Value::Null) => {
+                            complete = true;
+                            break;
+                        }
+                        Some(Value::String(next))
+                            if !next.is_empty() && cursors.insert(next.clone()) =>
+                        {
+                            cursor = Some(next.clone());
+                        }
+                        _ => bail!("invalid or repeated persisted thread pagination cursor"),
+                    }
+                }
+                ensure!(
+                    complete,
+                    "persisted thread pagination budget exceeded; absence is unconfirmed"
+                );
+            }
+            Ok(present)
+        }
+
+        pub(crate) fn delete_thread_with_notifications(
+            &mut self,
+            thread_id: &str,
+            expected: &HashSet<String>,
+        ) -> Result<()> {
+            ensure!(
+                !expected.is_empty()
+                    && expected.len() <= MAX_DELETION_THREADS
+                    && expected.contains(thread_id),
+                "invalid expected deletion notification scope"
+            );
+            let result = self.rpc_with_notifications(
+                "thread/delete",
+                json!({"threadId":thread_id}),
+                expected.clone(),
+            )?;
             if !result.as_object().is_some_and(Map::is_empty) {
                 bail!("unexpected thread/delete response; deletion outcome is unknown");
             }
@@ -869,25 +895,6 @@ pub(crate) mod session_management {
             runtime_status,
             ephemeral,
         })
-    }
-
-    impl Drop for SessionManagementClient {
-        fn drop(&mut self) {
-            // EOF is sent immediately, including on success. Never leave the
-            // app-server waiting for stdin during its shutdown/cleanup grace.
-            drop(self.stdin.take());
-            if let Some(mut child) = self.child.take() {
-                let _ = child.terminate_and_reap();
-            }
-            drop(self.receiver.take());
-            if let (Some(stdout), Some(stderr), Some(done)) = (
-                self.stdout_reader.take(),
-                self.stderr_reader.take(),
-                self.reader_done.take(),
-            ) {
-                finish_reader_threads(stdout, stderr, done);
-            }
-        }
     }
 
     #[cfg(test)]
@@ -969,6 +976,38 @@ pub(crate) mod session_management {
                 message: format!("no rollout found for thread id {other} while reading {ID}"),
             });
             assert!(!is_missing_thread(&error, ID));
+        }
+
+        #[test]
+        fn runtime_not_loaded_is_exact_and_never_global_missing_evidence() {
+            let diagnostic =
+                |code, message| anyhow::Error::new(ManagementRpcError { code, message });
+            let message = format!("thread not loaded: {ID}");
+            assert!(is_thread_not_loaded(
+                &diagnostic(Some(-32600), message.clone()),
+                ID
+            ));
+            assert!(!is_missing_thread(
+                &diagnostic(Some(-32600), message.clone()),
+                ID
+            ));
+            assert!(!is_thread_not_loaded(
+                &diagnostic(Some(-32602), message),
+                ID
+            ));
+            for message in [
+                "thread not loaded".to_owned(),
+                format!(
+                    "thread not loaded: 22222222-2222-4222-8222-222222222222 while reading {ID}"
+                ),
+                format!("thread not loaded: {ID}-extra"),
+                format!("thread not loaded: {ID} permission denied"),
+            ] {
+                assert!(!is_thread_not_loaded(
+                    &diagnostic(Some(-32600), message),
+                    ID
+                ));
+            }
         }
     }
 }
