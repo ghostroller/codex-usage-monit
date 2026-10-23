@@ -1,9 +1,12 @@
 //! One release identity and one artifact per platform, shared by installers and
 //! remote deployment. Archive bytes and executable bytes have separate hashes.
+use std::fs;
+use std::io::Read;
+use std::path::Path;
+
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{fs, io::Read, path::Path};
 
 pub(crate) const MAX_BINARY: u64 = 128 * 1024 * 1024;
 const MAX_MANIFEST: u64 = 64 * 1024;

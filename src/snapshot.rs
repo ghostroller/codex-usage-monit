@@ -51,8 +51,52 @@ struct AccountCollection {
     elapsed_us: u64,
 }
 
-fn sources_run_in_parallel(scan_local: bool, refresh_account: bool, offline: bool) -> bool {
-    scan_local && refresh_account && !offline
+/// Incremental collection only reuses account state and always has a cache.
+/// Limits-only collection cannot discover or parse local rollout files.
+enum SnapshotCollectionPolicy<'cache> {
+    Full {
+        refresh_account: bool,
+        rollout_cache: Option<&'cache mut RolloutCache>,
+    },
+    IfChanged {
+        rollout_cache: &'cache mut RolloutCache,
+    },
+    CoalescedIfChanged {
+        rollout_cache: &'cache mut RolloutCache,
+    },
+    LimitsOnly {
+        refresh_account: bool,
+    },
+}
+
+impl SnapshotCollectionPolicy<'_> {
+    fn refresh_account(&self) -> bool {
+        match self {
+            Self::Full {
+                refresh_account, ..
+            }
+            | Self::LimitsOnly { refresh_account } => *refresh_account,
+            Self::IfChanged { .. } | Self::CoalescedIfChanged { .. } => false,
+        }
+    }
+
+    fn scans_local(&self) -> bool {
+        !matches!(self, Self::LimitsOnly { .. })
+    }
+
+    fn sources_run_in_parallel(&self, offline: bool) -> bool {
+        self.scans_local() && self.refresh_account() && !offline
+    }
+
+    fn rollout_cache_mut(&mut self) -> Option<&mut RolloutCache> {
+        match self {
+            Self::Full { rollout_cache, .. } => rollout_cache.as_deref_mut(),
+            Self::IfChanged { rollout_cache } | Self::CoalescedIfChanged { rollout_cache } => {
+                Some(rollout_cache)
+            }
+            Self::LimitsOnly { .. } => None,
+        }
+    }
 }
 
 fn next_account_evidence_boundary(
@@ -100,35 +144,44 @@ where
 fn collect_local_source(
     config: &CollectConfig,
     now: DateTime<Utc>,
-    scan_local: bool,
-    rollout_cache: Option<&mut RolloutCache>,
-    only_if_changed: bool,
-    coalesce_materialization: bool,
+    policy: &mut SnapshotCollectionPolicy<'_>,
     next_external_boundary: Option<DateTime<Utc>>,
 ) -> LocalCollection {
     let span = config.startup_trace.span("snapshot.local_scan");
-    let collection = if scan_local {
-        let (scan_result, local_coverage_starts_at, rollout_refresh, rollout_metrics) =
-            match rollout_cache {
+    let scan_result = match policy {
+        SnapshotCollectionPolicy::Full {
+            rollout_cache: Some(cache),
+            ..
+        } => Some(
+            cache
+                .scan_with_external_boundary(config, now, next_external_boundary)
+                .map(Some),
+        ),
+        SnapshotCollectionPolicy::Full {
+            rollout_cache: None,
+            ..
+        } => Some(scan_rollouts(config, now).map(Some)),
+        SnapshotCollectionPolicy::IfChanged { rollout_cache } => {
+            Some(rollout_cache.scan_if_changed_with_external_boundary(
+                config,
+                now,
+                next_external_boundary,
+            ))
+        }
+        SnapshotCollectionPolicy::CoalescedIfChanged { rollout_cache } => Some(
+            rollout_cache.scan_if_changed_coalesced_with_external_boundary(
+                config,
+                now,
+                next_external_boundary,
+            ),
+        ),
+        SnapshotCollectionPolicy::LimitsOnly { .. } => None,
+    };
+    let collection = if let Some(scan_result) = scan_result {
+        let (local_coverage_starts_at, rollout_refresh, rollout_metrics) =
+            match policy.rollout_cache_mut() {
                 Some(cache) => {
-                    let result = if only_if_changed && coalesce_materialization {
-                        cache.scan_if_changed_coalesced_with_external_boundary(
-                            config,
-                            now,
-                            next_external_boundary,
-                        )
-                    } else if only_if_changed {
-                        cache.scan_if_changed_with_external_boundary(
-                            config,
-                            now,
-                            next_external_boundary,
-                        )
-                    } else {
-                        cache
-                            .scan_with_external_boundary(config, now, next_external_boundary)
-                            .map(Some)
-                    };
-                    let local_coverage_starts_at = match &result {
+                    let local_coverage_starts_at = match &scan_result {
                         Ok(Some(dataset)) => {
                             cache.update_local_coverage(now, rollout_dataset_complete(dataset))
                         }
@@ -136,18 +189,16 @@ fn collect_local_source(
                         Err(_) => cache.update_local_coverage(now, false),
                     };
                     (
-                        result,
                         local_coverage_starts_at,
                         Some(cache.last_refresh()),
                         Some(cache.metrics()),
                     )
                 }
                 None => {
-                    let result = scan_rollouts(config, now).map(Some);
                     // Stateless one-shot scans cannot establish continuity across
                     // observations, so they provide call evidence but no zero-use
                     // coverage interval.
-                    (result, None, None, None)
+                    (None, None, None)
                 }
             };
         match scan_result {
@@ -277,11 +328,10 @@ pub fn collect_snapshot(
     collect_snapshot_with_local(
         config,
         cached_account,
-        refresh_account,
-        true,
-        None,
-        false,
-        false,
+        SnapshotCollectionPolicy::Full {
+            refresh_account,
+            rollout_cache: None,
+        },
     )
     .expect("a forced snapshot collection always returns a result")
 }
@@ -295,11 +345,10 @@ pub fn collect_snapshot_cached(
     collect_snapshot_with_local(
         config,
         cached_account,
-        refresh_account,
-        true,
-        Some(rollout_cache),
-        false,
-        false,
+        SnapshotCollectionPolicy::Full {
+            refresh_account,
+            rollout_cache: Some(rollout_cache),
+        },
     )
     .expect("a forced cached snapshot collection always returns a result")
 }
@@ -314,11 +363,7 @@ pub fn collect_snapshot_cached_if_changed(
     collect_snapshot_with_local(
         config,
         cached_account,
-        false,
-        true,
-        Some(rollout_cache),
-        true,
-        false,
+        SnapshotCollectionPolicy::IfChanged { rollout_cache },
     )
 }
 
@@ -334,11 +379,7 @@ pub(crate) fn collect_snapshot_cached_if_changed_coalesced(
     collect_snapshot_with_local(
         config,
         cached_account,
-        false,
-        true,
-        Some(rollout_cache),
-        true,
-        true,
+        SnapshotCollectionPolicy::CoalescedIfChanged { rollout_cache },
     )
 }
 
@@ -350,11 +391,7 @@ pub fn collect_limits_snapshot(
     collect_snapshot_with_local(
         config,
         cached_account,
-        refresh_account,
-        false,
-        None,
-        false,
-        false,
+        SnapshotCollectionPolicy::LimitsOnly { refresh_account },
     )
     .expect("a forced limits collection always returns a result")
 }
@@ -666,13 +703,10 @@ fn snapshot_requires_partial_status(snapshot: &Snapshot) -> bool {
 fn collect_snapshot_with_local(
     config: &CollectConfig,
     cached_account: Option<AccountSnapshot>,
-    refresh_account: bool,
-    scan_local: bool,
-    mut rollout_cache: Option<&mut RolloutCache>,
-    only_if_changed: bool,
-    coalesce_materialization: bool,
+    mut policy: SnapshotCollectionPolicy<'_>,
 ) -> Option<CollectionResult> {
-    debug_assert!(!only_if_changed || !refresh_account);
+    let refresh_account = policy.refresh_account();
+    let scan_local = policy.scans_local();
     let total_started = config.startup_trace.is_active().then(Instant::now);
     let perf_started = config.perf_log.is_enabled().then(Instant::now);
     let now = Utc::now();
@@ -681,35 +715,17 @@ fn collect_snapshot_with_local(
     let mut warnings = Vec::new();
     let mut errors = Vec::new();
 
-    let parallel_sources = sources_run_in_parallel(scan_local, refresh_account, config.offline);
+    let parallel_sources = policy.sources_run_in_parallel(config.offline);
     let (local, prefetched_account, parallel_account_us) = if parallel_sources {
         let (local, account) = run_sources_in_parallel(
-            || {
-                collect_local_source(
-                    config,
-                    now,
-                    scan_local,
-                    rollout_cache.as_deref_mut(),
-                    only_if_changed,
-                    coalesce_materialization,
-                    next_external_boundary,
-                )
-            },
+            || collect_local_source(config, now, &mut policy, next_external_boundary),
             || fetch_account_source(config, now),
         );
         let account = flatten_account_thread(account);
         (local, Some(account.result), account.elapsed_us)
     } else {
         (
-            collect_local_source(
-                config,
-                now,
-                scan_local,
-                rollout_cache.as_deref_mut(),
-                only_if_changed,
-                coalesce_materialization,
-                next_external_boundary,
-            ),
+            collect_local_source(config, now, &mut policy, next_external_boundary),
             None,
             0,
         )
@@ -1099,7 +1115,7 @@ fn collect_snapshot_with_local(
         history_observation,
         local_session_digests,
     };
-    if let Some(cache) = rollout_cache {
+    if let Some(cache) = policy.rollout_cache_mut() {
         cache.set_external_boundary(
             now,
             next_account_evidence_boundary(Some(&result.account), now),
@@ -1508,10 +1524,152 @@ mod tests {
 
     #[test]
     fn only_full_online_refresh_runs_sources_in_parallel() {
-        assert!(sources_run_in_parallel(true, true, false));
-        assert!(!sources_run_in_parallel(false, true, false));
-        assert!(!sources_run_in_parallel(true, false, false));
-        assert!(!sources_run_in_parallel(true, true, true));
+        let full_refresh = SnapshotCollectionPolicy::Full {
+            refresh_account: true,
+            rollout_cache: None,
+        };
+        assert!(full_refresh.sources_run_in_parallel(false));
+        assert!(!full_refresh.sources_run_in_parallel(true));
+        assert!(
+            !SnapshotCollectionPolicy::LimitsOnly {
+                refresh_account: true,
+            }
+            .sources_run_in_parallel(false)
+        );
+        assert!(
+            !SnapshotCollectionPolicy::Full {
+                refresh_account: false,
+                rollout_cache: None,
+            }
+            .sources_run_in_parallel(false)
+        );
+        let mut cache = RolloutCache::new();
+        assert!(
+            !SnapshotCollectionPolicy::IfChanged {
+                rollout_cache: &mut cache,
+            }
+            .sources_run_in_parallel(false)
+        );
+        assert!(
+            !SnapshotCollectionPolicy::CoalescedIfChanged {
+                rollout_cache: &mut cache,
+            }
+            .sources_run_in_parallel(false)
+        );
+    }
+
+    #[test]
+    fn collection_policies_preserve_scan_boundaries_and_pending_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = temp.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        // Freeze the scan clock away from coverage and freshness boundaries.
+        let now = DateTime::from_timestamp(Utc::now().timestamp().div_euclid(60) * 60, 0).unwrap();
+        let path = sessions.join("rollout-policy.jsonl");
+        let initial = format!(
+            "{}\n",
+            serde_json::json!({
+                "timestamp": now.to_rfc3339(),
+                "type": "session_meta",
+                "payload": {"id": "policy-thread"}
+            })
+        );
+        std::fs::write(&path, &initial).unwrap();
+        let config = CollectConfig {
+            codex_home: temp.path().to_owned(),
+            offline: true,
+            ..CollectConfig::default()
+        };
+
+        let limits = collect_local_source(
+            &config,
+            now,
+            &mut SnapshotCollectionPolicy::LimitsOnly {
+                refresh_account: false,
+            },
+            None,
+        );
+        assert!(limits.dataset.tasks.is_empty());
+        assert!(limits.source.is_none());
+        assert!(!limits.unchanged);
+        let stateless = collect_local_source(
+            &config,
+            now,
+            &mut SnapshotCollectionPolicy::Full {
+                refresh_account: false,
+                rollout_cache: None,
+            },
+            None,
+        );
+        assert_eq!(stateless.dataset.tasks.len(), 1);
+        assert!(stateless.local_coverage_starts_at.is_none());
+
+        let mut cache = RolloutCache::new();
+        let cached = collect_local_source(
+            &config,
+            now,
+            &mut SnapshotCollectionPolicy::Full {
+                refresh_account: false,
+                rollout_cache: Some(&mut cache),
+            },
+            None,
+        );
+        assert_eq!(cached.dataset.tasks.len(), 1);
+        assert_eq!(cached.local_coverage_starts_at, Some(now));
+        let next = now + Duration::seconds(1);
+        let unchanged = collect_local_source(
+            &config,
+            next,
+            &mut SnapshotCollectionPolicy::IfChanged {
+                rollout_cache: &mut cache,
+            },
+            None,
+        );
+        assert!(unchanged.unchanged);
+
+        std::fs::write(
+            &path,
+            format!(
+                "{initial}{}\n",
+                serde_json::json!({
+                    "timestamp": next.to_rfc3339(),
+                    "type": "event_msg",
+                    "payload": {"type": "task_started", "turn_id": "pending-turn"}
+                })
+            ),
+        )
+        .unwrap();
+        let coalesced = collect_local_source(
+            &config,
+            next,
+            &mut SnapshotCollectionPolicy::CoalescedIfChanged {
+                rollout_cache: &mut cache,
+            },
+            None,
+        );
+        assert!(coalesced.unchanged);
+        let immediate = collect_local_source(
+            &config,
+            next,
+            &mut SnapshotCollectionPolicy::IfChanged {
+                rollout_cache: &mut cache,
+            },
+            None,
+        );
+        assert!(!immediate.unchanged);
+        assert_eq!(immediate.dataset.turns.len(), 1);
+        assert_eq!(immediate.dataset.turns[0].turn_id, "pending-turn");
+        let forced = collect_local_source(
+            &config,
+            next,
+            &mut SnapshotCollectionPolicy::Full {
+                refresh_account: false,
+                rollout_cache: Some(&mut cache),
+            },
+            None,
+        );
+        assert!(!forced.unchanged);
+        assert_eq!(forced.dataset.turns.len(), 1);
     }
 
     #[test]

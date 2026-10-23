@@ -1,7 +1,43 @@
 //! Forward-recoverable replacement of an existing, current-user recorder.
 //! The candidate binary runs this operation, never the recorder being stopped.
-use super::*;
+use std::env;
+use std::ffi::OsString;
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result, bail};
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+
+use super::recorder_coordination::{
+    RECORDER_CUTOVER_BLOCKER_FILE, RecorderInstanceLockGuard, RecorderStatusFile,
+    TryRecorderInstanceLock, read_recorder_status, service_coordination_root,
+    try_acquire_recorder_instance_lock,
+};
+use super::{
+    LaunchdOperation, Platform, RECORDER_CUTOVER_BLOCKER_SCHEMA_VERSION, RecorderCutoverBlocker,
+    SERVICE_DEFINITION_MAX_BYTES, SERVICE_LABEL, SERVICE_TRUST_MARKER_MAX_BYTES, SYSTEMD_UNIT,
+    ServiceDefinitionObservation, ServiceOptions, ServiceStatus, SystemdQuiesceOperation,
+    canonical_windows_task_fingerprint, cleanup_launchd_registration, cleanup_systemd_registration,
+    cleanup_windows_task_registration, current_platform,
+    current_user_service_definition_observation, decode_windows_task_xml,
+    ensure_service_definition_is_trusted_at, install_launchd, install_systemd,
+    install_windows_task, launchd_domain, launchd_output_reports_running, launchd_plist,
+    launchd_print_reports_missing, launchd_registration_path, output_detail,
+    parse_windows_task_xml, persist_current_service_definition_marker, quiesce_launchd_for_install,
+    quiesce_systemd_for_install, quiesce_windows_task_for_install,
+    read_private_regular_file_bounded, replace_service_checked, run_checked, run_launchd_operation,
+    run_service_command, run_systemd_quiesce_operation, run_windows_task_operation,
+    service_definition_fingerprint, start_launchd, start_systemd, start_windows_task,
+    systemd_definition_arguments, systemd_definition_environment_path, systemd_registration_path,
+    systemd_unit, validate_options, verify_systemd_definition_disabled, verify_systemd_inactive,
+    verify_windows_task_structure, windows_current_user_sid, windows_host,
+    windows_task_is_installed_with, windows_task_is_running_with, windows_task_name,
+    windows_task_xml, windows_task_xml_bounded, write_private_atomically,
+};
 
 const JOURNAL: &str = "recorder-upgrade.json";
 const JOURNAL_VERSION: u32 = 2;
@@ -1249,7 +1285,8 @@ fn parse_registered_options(
 
 #[cfg(windows)]
 pub(super) fn windows_arguments(text: &str) -> Result<Vec<String>> {
-    use windows_sys::Win32::{Foundation::LocalFree, UI::Shell::CommandLineToArgvW};
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
     let line = format!("recorder.exe {text}")
         .encode_utf16()
         .chain(Some(0))
@@ -1285,6 +1322,13 @@ pub(super) fn windows_arguments(_text: &str) -> Result<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    use super::super::windows_recorder_arguments;
+    use super::super::{
+        CURRENT_SERVICE_DEFINITION_FILE, CURRENT_SERVICE_DEFINITION_SCHEMA_VERSION,
+        CurrentServiceDefinitionMarker, create_private_directory, recorder_coordination,
+        service_status,
+    };
     use super::*;
 
     fn fixture() -> (tempfile::TempDir, UpgradeJournal) {

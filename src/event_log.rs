@@ -1,4 +1,6 @@
 //! Persistent application diagnostics, separate from content-free timing traces.
+#![deny(missing_docs)]
+
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -13,17 +15,36 @@ use sha2::{Digest, Sha256};
 
 use crate::diagnostic_log::{DIAGNOSTIC_LOG_MAX_BYTES, JsonlWriter, prune_event_sessions};
 
+/// Event severity and the maximum verbosity accepted by an [`EventLog`].
+///
+/// A configured level includes every non-`Off` level up to itself. Session
+/// metadata is written whenever logging opens successfully, regardless of level.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, ValueEnum, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LogLevel {
+    /// Disable logging, including file creation and session metadata.
     Off,
+    /// Failures that prevent an operation from completing.
     Error,
+    /// Degraded operation or recoverable diagnostics; the default verbosity.
     #[default]
     Warn,
+    /// Lifecycle, operation, and state changes in addition to diagnostics.
     Info,
+    /// Include diagnostic telemetry as well as all less verbose levels.
     Debug,
 }
 
+/// A shared, best-effort JSONL diagnostic sink; the default value is disabled.
+///
+/// Clones share one writer, failure state, and observation history. Opening and
+/// writing can fail without interrupting the application; callers that need to
+/// surface lost diagnostics must check [`Self::error`]. A failed writer stays
+/// inactive until the caller opens a new log.
+///
+/// Pass diagnostic text only, never credentials, payloads, or session contents.
+/// Message sanitization bounds text and removes recognized credential patterns
+/// and the current home path; it is not a general-purpose secret scrubber.
 #[derive(Clone, Default)]
 pub struct EventLog {
     inner: Option<Arc<Inner>>,
@@ -82,6 +103,23 @@ impl EventLog {
         )))
     }
 
+    /// Open a diagnostic session for append and immediately write its metadata.
+    ///
+    /// Except at [`LogLevel::Off`], this may create parent directories and the
+    /// private log file, repair an unfinished last line, and rotate the file at
+    /// the byte limit. Only one writer may hold the file at a time. The writer
+    /// uses an 8 MiB rotation limit and retains one backup.
+    ///
+    /// `managed` marks this session for retention and, after a successful open,
+    /// attempts to prune older generated session files in the same directory,
+    /// keeping the newest 20 candidates and skipping live or unmanaged files.
+    /// Do not enable it for an arbitrary user-selected log location.
+    ///
+    /// Initialization and write failures, including a missing `path`, are stored
+    /// in [`Self::error`] rather than returned. Retention is best-effort: directory
+    /// enumeration failures become warning events when the level permits, while
+    /// individual file failures are ignored. `Off` performs no I/O and returns a
+    /// disabled log without retaining `path`.
     pub fn open(path: Option<PathBuf>, level: LogLevel, managed: bool) -> Self {
         if level == LogLevel::Off {
             return Self::default();
@@ -130,10 +168,15 @@ impl EventLog {
         log
     }
 
+    /// Return the configured path, even if opening or writing the log failed.
     pub fn path(&self) -> Option<&Path> {
         self.inner.as_ref()?.path.as_deref()
     }
 
+    /// Return the retained initialization or write failure, if any.
+    ///
+    /// A disabled or explicitly finished log can return `None`; this is not a
+    /// test that logging is active. Retention warnings are recorded separately.
     pub fn error(&self) -> Option<String> {
         self.inner
             .as_ref()?
@@ -144,6 +187,9 @@ impl EventLog {
             .clone()
     }
 
+    /// Report whether the shared writer is open and has not failed or finished.
+    ///
+    /// Individual events can still be suppressed by the configured level.
     pub fn is_active(&self) -> bool {
         self.inner.as_ref().is_some_and(|inner| {
             inner
@@ -174,10 +220,19 @@ impl EventLog {
         );
     }
 
+    /// Append and flush one sanitized diagnostic if its level is enabled.
+    ///
+    /// `event` must be a static event identifier, and `message` must contain
+    /// diagnostic text only, as described by [`EventLog`]. Failure disables the
+    /// shared writer and is available through [`Self::error`].
     pub fn record(&self, level: LogLevel, event: &'static str, message: &str) {
         self.record_context(level, event, message, RecordContext::default());
     }
 
+    /// Record a lifecycle event at info level, subject to the normal filter.
+    ///
+    /// `event` and `status` are static identifiers; `message` has the same
+    /// diagnostic-only contract and failure reporting as [`Self::record`].
     pub fn lifecycle(&self, event: &'static str, status: &'static str, message: &str) {
         self.record_context(
             LogLevel::Info,
@@ -242,6 +297,10 @@ impl EventLog {
     /// recoveries. Absence means no longer observed, not independently verified.
     /// Incomplete observations retain already published states and admit new
     /// ones only within a fixed bound, until a complete sample releases slots.
+    ///
+    /// Reuse `scope` for successive complete samples of the same source. More
+    /// than 1024 entries makes a sample incomplete; omitted diagnostics then
+    /// remain active. Messages have [`Self::record`]'s diagnostic-only contract.
     pub fn observe(&self, scope: &'static str, issues: &[(LogLevel, &'static str, String)]) {
         let Some(inner) = &self.inner else { return };
         let mut new = Vec::new();
@@ -333,6 +392,12 @@ impl EventLog {
         }
     }
 
+    /// Begin an operation, recording its start at info level when enabled.
+    ///
+    /// The log stores a fingerprint of `subject` and replaces its occurrences
+    /// in the completion message. The returned handle retains the original
+    /// subject in memory, so it must not contain credentials. Call
+    /// [`OperationLog::finish`] to record an outcome; dropping it emits nothing.
     pub fn operation(&self, event: &'static str, subject: &str) -> OperationLog {
         let operation = OperationLog {
             log: self.clone(),
@@ -360,6 +425,10 @@ impl EventLog {
         operation
     }
 
+    /// Close the writer for all clones and release its file lock.
+    ///
+    /// Each accepted record was already flushed. This idempotent operation
+    /// emits no final event, retains any prior error, and disables future writes.
     pub fn finish(&self) {
         if let Some(inner) = &self.inner {
             let mut state = inner
@@ -371,6 +440,10 @@ impl EventLog {
     }
 }
 
+/// An operation's shared log, correlation ID, subject, and elapsed-time origin.
+///
+/// Only [`Self::finish`] emits an outcome; dropping this handle does not imply
+/// success or failure and does not disable other [`EventLog`] clones.
 pub struct OperationLog {
     log: EventLog,
     event: &'static str,
@@ -380,6 +453,12 @@ pub struct OperationLog {
 }
 
 impl OperationLog {
+    /// Consume the handle and record its outcome with elapsed milliseconds.
+    ///
+    /// Error and warning levels mark the operation failed; info and debug mark
+    /// it completed. The event is still level-filtered (`Off` emits nothing).
+    /// `message` must be diagnostic text under [`EventLog`]'s contract, and I/O
+    /// failures are retained by the shared log's [`EventLog::error`] method.
     pub fn finish(self, level: LogLevel, message: &str) {
         self.log.record_context(
             level,

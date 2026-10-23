@@ -142,11 +142,15 @@ impl RemoteSyncScheduleSeed {
         }
     }
 
+    /// Sets the remaining activity window; a zero duration clears the window.
+    #[must_use]
     pub fn with_active_until_in(mut self, active_until_in: Option<Duration>) -> Self {
         self.active_until_in = active_until_in.filter(|delay| !delay.is_zero());
         self
     }
 
+    /// Sets whether process-containment uncertainty prevents ordinary polling.
+    #[must_use]
     pub fn with_process_containment_paused(mut self, paused: bool) -> Self {
         self.process_containment_paused = paused;
         self

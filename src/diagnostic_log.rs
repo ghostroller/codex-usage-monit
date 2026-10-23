@@ -1,3 +1,5 @@
+//! Bounded JSONL files with exclusive writers and explicit flush/error handling.
+
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
@@ -13,6 +15,10 @@ use serde_json::Value;
 /// it also works with Windows handles that cannot be renamed while open.
 pub(crate) const DIAGNOSTIC_LOG_MAX_BYTES: u64 = 8 * 1024 * 1024;
 
+/// A locked writer that rotates to one backup before exceeding its byte limit.
+///
+/// Writes are buffered. Call [`Self::flush`] to observe flush failures; dropping
+/// the writer releases its lock but cannot report a final flush failure.
 pub(crate) struct JsonlWriter {
     sink: JsonlSink,
 }
@@ -78,6 +84,11 @@ impl Drop for LockedPrivateFile {
 }
 
 impl JsonlWriter {
+    /// Create parents, exclusively open a regular file, and truncate its contents.
+    ///
+    /// Used for per-run trace/performance output. Rejects a zero byte limit,
+    /// unsafe file types, or an unavailable file lock and propagates I/O errors.
+    /// An existing backup is replaced only when a later write rotates the log.
     pub(crate) fn open_private(
         path: &Path,
         description: &'static str,
@@ -86,7 +97,12 @@ impl JsonlWriter {
         Self::open_with_policy(path, description, max_bytes, false)
     }
 
-    /// Event logs retain previous runs and may contain sanitized error details.
+    /// Open a private event log for append, retaining previous runs.
+    ///
+    /// Creates missing parents, rejects unsafe files or competing writers, and
+    /// terminates an unfinished last line before appending. The caller must
+    /// sanitize error details before writing; this layer does not redact JSON.
+    /// Rejects a zero byte limit and propagates filesystem/permission failures.
     pub(crate) fn open_events(path: &Path, max_bytes: u64) -> io::Result<Self> {
         Self::open_with_policy(path, "event log", max_bytes, true)
     }
@@ -166,6 +182,11 @@ impl JsonlWriter {
         }
     }
 
+    /// Buffer one serialized JSON record and newline, rotating when necessary.
+    ///
+    /// Rejects an individual record larger than the byte limit. Serialization,
+    /// rotation, and write failures are returned; a write failure may have left
+    /// a partial record, so callers must stop using the writer after failure.
     pub(crate) fn write_json_line(&mut self, value: &Value) -> io::Result<()> {
         let mut line = serde_json::to_vec(value).map_err(io::Error::other)?;
         line.push(b'\n');
@@ -176,6 +197,7 @@ impl JsonlWriter {
         }
     }
 
+    /// Flush buffered bytes to the file, reporting I/O errors without `fsync`.
     pub(crate) fn flush(&mut self) -> io::Result<()> {
         match &mut self.sink {
             JsonlSink::File(file) => file.writer.flush(),
@@ -253,7 +275,12 @@ fn open_confidential_file(path: &Path, description: &str) -> io::Result<File> {
     Ok(file)
 }
 
-/// Only remove our generated session names, and skip files held by live TUIs.
+/// Best-effort removal of old generated, managed session logs and their backups.
+///
+/// Keeps the lexicographically newest `keep` candidate names and skips files
+/// that cannot be privately opened or whose first record is not managed session
+/// metadata. Busy files and individual read/removal failures are ignored, so
+/// more than `keep` files can remain. Opening the directory itself can fail.
 pub(crate) fn prune_event_sessions(directory: &Path, keep: usize) -> io::Result<()> {
     let mut paths = fs::read_dir(directory)?
         .filter_map(Result::ok)

@@ -1,33 +1,33 @@
 //! Explicit administrator-managed SCM services. This store never shares the
 //! current-user install receipt, launcher pointer, or Task Scheduler trust.
 #![deny(clippy::undocumented_unsafe_blocks)]
+
+use std::fs;
+use std::io::{self, BufRead, Read};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::ptr;
+use std::time::{Duration, Instant};
+
 use anyhow::{Context, Result, bail, ensure};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{
-    fs,
-    io::{self, BufRead, Read},
-    path::{Path, PathBuf},
-    process::Command,
-    ptr,
-    time::{Duration, Instant},
+use windows_service::service::{
+    Service, ServiceAccess, ServiceAction, ServiceActionType, ServiceExitCode,
+    ServiceFailureActions, ServiceFailureResetPeriod, ServiceStartType, ServiceState,
+    ServiceStatus, ServiceType,
 };
-use windows_service::{
-    service::{
-        Service, ServiceAccess, ServiceAction, ServiceActionType, ServiceExitCode,
-        ServiceFailureActions, ServiceFailureResetPeriod, ServiceStartType, ServiceState,
-        ServiceStatus, ServiceType,
-    },
-    service_manager::{ServiceManager, ServiceManagerAccess},
+use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+use windows_sys::Win32::Foundation::{
+    ERROR_SERVICE_ALREADY_RUNNING, ERROR_SERVICE_CANNOT_ACCEPT_CTRL, ERROR_SERVICE_DOES_NOT_EXIST,
+    ERROR_SERVICE_MARKED_FOR_DELETE, ERROR_SERVICE_NOT_ACTIVE, ERROR_SERVICE_SPECIFIC_ERROR,
 };
-use windows_sys::Win32::{
-    Foundation::{
-        ERROR_SERVICE_ALREADY_RUNNING, ERROR_SERVICE_CANNOT_ACCEPT_CTRL,
-        ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_MARKED_FOR_DELETE, ERROR_SERVICE_NOT_ACTIVE,
-        ERROR_SERVICE_SPECIFIC_ERROR,
-    },
-    System::Services::*,
+use windows_sys::Win32::System::Services::{
+    ChangeServiceConfigW, CloseServiceHandle, CreateServiceW, OpenSCManagerW, SC_HANDLE,
+    SC_MANAGER_CONNECT, SC_MANAGER_CREATE_SERVICE, SERVICE_ALL_ACCESS, SERVICE_AUTO_START,
+    SERVICE_DEMAND_START, SERVICE_DISABLED, SERVICE_ERROR_NORMAL, SERVICE_NO_CHANGE,
+    SERVICE_WIN32_OWN_PROCESS,
 };
 use zeroize::Zeroizing;
 

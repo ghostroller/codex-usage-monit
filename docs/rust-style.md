@@ -64,15 +64,19 @@ manually where the stable formatter cannot enforce it.
 
 Enable additional lints in a module only after auditing and fixing that module.
 The Windows SCM module family enables `clippy::undocumented_unsafe_blocks`.
+The collection configuration and event-log modules enforce `missing_docs` after
+review of their defaults, I/O, failure reporting, and shared-handle contracts.
 Do not enable all restriction/pedantic lints across the crate or suppress a new
 lint globally to hide existing debt. Introduce `missing_docs` module by module
 after documenting meaningful API contracts. Explain any narrow suppression at
 its use site.
 
-The first maintenance batch covers this policy, TUI poison handling, and the
-Windows SCM safety audit. Named collection strategies/grouping keys, broader
-API documentation/import cleanup, and TUI decomposition remain separate batches;
-do not fold them into a recovery fix.
+Keep migration batches scoped: recovery and Windows SCM safety; named collection
+strategies and grouping keys; API contracts and imports; then individual TUI
+responsibilities. The first TUI extraction moves terminal input, console
+termination, clipboard output, and restoration into `tui::terminal`. The run loop
+retains ownership and drop ordering of terminal resources. Other views and state
+remain candidates for later extraction; this is not a crate-wide module rewrite.
 
 ## Verification
 

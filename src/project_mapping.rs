@@ -143,6 +143,8 @@ impl ProjectObservation {
         self.git_evidence.repository_relative_workspace_root()
     }
 
+    /// Replaces the display label without changing the source-scoped identity.
+    #[must_use]
     pub fn with_display_label(mut self, display_label: Option<ProjectDisplayLabel>) -> Self {
         self.display_label = display_label;
         self

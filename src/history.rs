@@ -1371,7 +1371,15 @@ struct BucketAccumulator {
     partial_reasons: BTreeSet<String>,
 }
 
-type ProjectGroupKey = (String, Option<String>, Option<String>, Option<String>);
+// Field order preserves the project-group ordering used by stored observations.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ProjectGroupKey {
+    thread_id: String,
+    turn_id: Option<String>,
+    session_thread_id: Option<String>,
+    session_turn_id: Option<String>,
+}
+
 type SpawnEdge = (String, String);
 
 #[derive(Default)]
@@ -1640,12 +1648,12 @@ fn insert_project_lineage(
     templates: &HashMap<String, LocalProjectUsageGroup>,
 ) {
     for candidate_id in lineage.iter().skip(1) {
-        let key = (
-            candidate_id.clone(),
-            None,
-            Some(session_thread_id.to_string()),
-            None,
-        );
+        let key = ProjectGroupKey {
+            thread_id: candidate_id.clone(),
+            turn_id: None,
+            session_thread_id: Some(session_thread_id.to_string()),
+            session_turn_id: None,
+        };
         groups.entry(key).or_insert_with(|| {
             let mut group = project_group_template(candidate_id, templates);
             group.session_thread_id = Some(session_thread_id.to_string());
@@ -1797,12 +1805,12 @@ fn project_call_attribution(
         .map(|message| bounded_chars(message, PROJECT_TITLE_MAX_CHARS));
     let turn_started_at = turn.and_then(|turn| turn.started_at);
     let turn_id = normalized_optional(&call.turn_id);
-    let key = (
-        call.thread_id.clone(),
+    let key = ProjectGroupKey {
+        thread_id: call.thread_id.clone(),
         turn_id,
-        Some(session_thread_id.clone()),
-        session_turn_id.clone(),
-    );
+        session_thread_id: Some(session_thread_id.clone()),
+        session_turn_id: session_turn_id.clone(),
+    };
 
     ProjectCallAttribution {
         key,
@@ -4193,6 +4201,77 @@ mod tests {
                 ("turn-a", "turn-a", "First request", 100, 1),
                 ("turn-b", "turn-b", "Second request", 200, 1),
             ])
+        );
+    }
+
+    #[test]
+    fn project_groups_order_missing_and_shared_turn_ids_without_merging_threads() {
+        let now = at(2026, 7, 28, 12, 7, 0);
+        let timestamp = at(2026, 7, 28, 12, 1, 0);
+        let tasks = [
+            task("alpha", None, Some("/work/project"), "Alpha", timestamp),
+            task("beta", None, Some("/work/project"), "Beta", timestamp),
+        ];
+        let calls = [
+            ("beta", Some("turn-a"), 400),
+            ("alpha", Some("turn-b"), 300),
+            ("alpha", None, 100),
+            ("alpha", Some("turn-a"), 200),
+            ("alpha", Some("turn-a"), 50),
+        ]
+        .map(|(thread_id, turn_id, tokens)| {
+            let mut usage_call = call(timestamp, "gpt-5.6-luna", Some("standard"), tokens);
+            usage_call.thread_id = thread_id.to_string();
+            usage_call.turn_id = turn_id.map(str::to_string);
+            usage_call
+        });
+        let observation = HistoryObservation::from_sources_with_tasks_and_coverage(
+            now,
+            &calls,
+            &tasks,
+            &[],
+            &[],
+            None,
+        );
+        let bucket = &observation.half_hour_buckets[0];
+        assert_eq!(bucket.token_usage.total_tokens, 1_050);
+        assert_eq!(bucket.call_count, 5);
+        let groups = bucket
+            .project_groups
+            .iter()
+            .map(|group| {
+                (
+                    group.thread_id.as_str(),
+                    group.turn_id.as_deref(),
+                    group.session_thread_id.as_deref(),
+                    group.session_turn_id.as_deref(),
+                    group.token_usage.total_tokens,
+                    group.call_count,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            groups,
+            vec![
+                ("alpha", None, Some("alpha"), None, 100, 1),
+                (
+                    "alpha",
+                    Some("turn-a"),
+                    Some("alpha"),
+                    Some("turn-a"),
+                    250,
+                    2,
+                ),
+                (
+                    "alpha",
+                    Some("turn-b"),
+                    Some("alpha"),
+                    Some("turn-b"),
+                    300,
+                    1,
+                ),
+                ("beta", Some("turn-a"), Some("beta"), Some("turn-a"), 400, 1,),
+            ]
         );
     }
 
