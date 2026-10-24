@@ -5,6 +5,8 @@
 //! in one read snapshot or one multi-family transaction without owning a
 //! process-wide connection or extending a write transaction across SSH.
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::cell::RefCell;
 use std::fs;
 #[cfg(any(unix, windows))]
@@ -36,6 +38,52 @@ static SAVEPOINT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
     static SCOPES: RefCell<Vec<Scope>> = const { RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+thread_local! {
+    static IO_MEASUREMENT: RefCell<Option<IoMeasurement>> = const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct DatabaseIoStats {
+    pub calls: usize,
+    pub connection_opens: usize,
+    pub write_connection_opens: usize,
+    pub existence_checks: usize,
+}
+
+#[cfg(test)]
+struct IoMeasurement {
+    path: PathBuf,
+    stats: Rc<Cell<DatabaseIoStats>>,
+}
+
+#[cfg(test)]
+struct IoMeasurementGuard {
+    previous: Option<IoMeasurement>,
+}
+
+#[cfg(test)]
+impl Drop for IoMeasurementGuard {
+    fn drop(&mut self) {
+        IO_MEASUREMENT.with(|slot| {
+            *slot.borrow_mut() = self.previous.take();
+        });
+    }
+}
+
+#[cfg(test)]
+fn record_io_measurement(path: &Path, update: impl FnOnce(&mut DatabaseIoStats)) {
+    IO_MEASUREMENT.with(|slot| {
+        let slot = slot.borrow();
+        if let Some(measurement) = slot.as_ref().filter(|measurement| measurement.path == path) {
+            let mut stats = measurement.stats.get();
+            update(&mut stats);
+            measurement.stats.set(stats);
+        }
+    });
 }
 
 struct Scope {
@@ -86,11 +134,30 @@ impl HistoryDatabase {
         &self.path
     }
 
+    /// Counts real database reads, connection opens and existence checks on
+    /// this thread, excluding other databases and nested measurements. Restores
+    /// the preceding measurement even when the observed operation unwinds.
+    #[cfg(test)]
+    pub(crate) fn measure_io<T>(&self, operation: impl FnOnce() -> T) -> (T, DatabaseIoStats) {
+        let stats = Rc::new(Cell::new(DatabaseIoStats::default()));
+        let previous = IO_MEASUREMENT.with(|slot| {
+            slot.replace(Some(IoMeasurement {
+                path: self.path.clone(),
+                stats: Rc::clone(&stats),
+            }))
+        });
+        let _measurement = IoMeasurementGuard { previous };
+        let value = operation();
+        (value, stats.get())
+    }
+
     pub(crate) fn is_transaction_active(&self) -> bool {
         SCOPES.with(|scopes| scopes.borrow().iter().any(|scope| scope.path == self.path))
     }
 
     pub(crate) fn exists(&self) -> io::Result<bool> {
+        #[cfg(test)]
+        record_io_measurement(&self.path, |stats| stats.existence_checks += 1);
         if !super::private_directory_exists_beneath(&self.state_root, &self.profile_root)? {
             return Ok(false);
         }
@@ -139,7 +206,33 @@ impl HistoryDatabase {
         &self,
         operation: impl FnOnce(&Connection) -> io::Result<T>,
     ) -> io::Result<T> {
+        #[cfg(test)]
+        record_io_measurement(&self.path, |stats| stats.calls += 1);
         self.transact(false, false, operation)
+    }
+
+    /// Returns no value for an absent database without creating its namespace.
+    /// An existing scope can replace the preliminary existence check only when
+    /// it validates these same paths. Noncanonical roots retain that check of
+    /// their original paths; every actual read still validates the open objects.
+    pub(crate) fn read_if_exists<T>(
+        &self,
+        operation: impl FnOnce(&Connection) -> io::Result<T>,
+    ) -> io::Result<Option<T>> {
+        let validates_same_paths = SCOPES.with(|scopes| {
+            scopes
+                .borrow()
+                .iter()
+                .rev()
+                .find(|scope| scope.path == self.path)
+                .is_some_and(|scope| {
+                    scope.opened.state_root == self.state_root && scope.opened.path == self.path
+                })
+        });
+        if !validates_same_paths && !self.exists()? {
+            return Ok(None);
+        }
+        self.read(operation).map(Some)
     }
 
     pub(crate) fn write<T>(
@@ -202,6 +295,14 @@ impl HistoryDatabase {
         }
 
         let opened = Rc::new(self.open(writable, nowait)?);
+        #[cfg(test)]
+        record_io_measurement(&self.path, |stats| {
+            if writable {
+                stats.write_connection_opens += 1;
+            } else {
+                stats.connection_opens += 1;
+            }
+        });
         opened
             .connection
             .busy_timeout(if nowait { Duration::ZERO } else { BUSY_WAIT })
@@ -1206,6 +1307,7 @@ mod windows_security_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::source_history::SourceHistoryStore;
 
     fn database(directory: &Path) -> HistoryDatabase {
         HistoryDatabase::new(
@@ -1224,6 +1326,101 @@ mod tests {
         );
         assert!(!database.path().exists());
         assert!(!database.profile_root.exists());
+    }
+
+    #[test]
+    fn read_if_exists_facade_does_not_create_a_missing_database() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = database(directory.path());
+        let store =
+            SourceHistoryStore::new_sqlite(database.state_root.clone(), database.profile.clone());
+        let (revision, stats) = database.measure_io(|| store.load_facts_projection_revision());
+        assert_eq!(revision.unwrap(), 0);
+        assert_eq!(stats.existence_checks, 1);
+        assert_eq!(stats.calls, 0);
+        assert_eq!(stats.connection_opens, 0);
+        assert_eq!(stats.write_connection_opens, 0);
+        assert!(!database.state_root.exists());
+    }
+
+    #[test]
+    fn read_if_exists_facade_reuses_only_the_same_canonical_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let initial = database(directory.path());
+        initial.write(|_| Ok(())).unwrap();
+        let canonical_root = fs::canonicalize(&initial.state_root).unwrap();
+        let canonical_store =
+            SourceHistoryStore::new_sqlite(canonical_root.clone(), initial.profile.clone());
+        initial
+            .write(|connection| canonical_store.advance_facts_projection_revision(connection))
+            .unwrap();
+
+        for (root, expected_existence_checks) in [
+            (canonical_root, 0),
+            (initial.state_root.join("..").join("state"), 1),
+        ] {
+            let database = HistoryDatabase::new(&root, &initial.profile);
+            let store = SourceHistoryStore::new_sqlite(root, initial.profile.clone());
+            let (revision, stats) =
+                database.measure_io(|| database.read(|_| store.load_facts_projection_revision()));
+            assert_eq!(revision.unwrap(), 1);
+            assert_eq!(stats.existence_checks, expected_existence_checks);
+            assert_eq!(stats.calls, 2);
+            assert_eq!(stats.connection_opens, 1);
+            assert_eq!(stats.write_connection_opens, 0);
+
+            // Outside an active scope, even a canonical facade must probe the
+            // namespace before deciding whether a missing database is empty.
+            let (revision, stats) = database.measure_io(|| store.load_facts_projection_revision());
+            assert_eq!(revision.unwrap(), 1);
+            assert_eq!(stats.existence_checks, 1);
+            assert_eq!(stats.connection_opens, 1);
+        }
+    }
+
+    #[test]
+    fn io_measurement_is_scoped_to_thread_and_database_and_restored_after_unwind() {
+        let directory = tempfile::tempdir().unwrap();
+        let other_directory = tempfile::tempdir().unwrap();
+        let measured = database(directory.path());
+        let other = database(other_directory.path());
+        measured.write(|_| Ok(())).unwrap();
+        other.write(|_| Ok(())).unwrap();
+
+        let (_, stats) = measured.measure_io(|| {
+            measured
+                .read(|_| {
+                    measured.read(|_| Ok(()))?;
+                    other.read(|_| Ok(()))
+                })
+                .unwrap();
+            let worker_database = measured.clone();
+            std::thread::spawn(move || worker_database.read(|_| Ok(())))
+                .join()
+                .unwrap()
+                .unwrap();
+            let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                measured.measure_io(|| {
+                    measured.read(|_| Ok(())).unwrap();
+                    panic!("interrupt a nested database read measurement");
+                });
+            }));
+            assert!(interrupted.is_err());
+            measured.read(|_| Ok(())).unwrap();
+            measured.write(|_| measured.write(|_| Ok(()))).unwrap();
+            assert!(measured.exists().unwrap());
+            assert!(other.exists().unwrap());
+        });
+        assert_eq!(
+            stats,
+            DatabaseIoStats {
+                calls: 3,
+                connection_opens: 2,
+                write_connection_opens: 1,
+                existence_checks: 1,
+            }
+        );
+        assert!(IO_MEASUREMENT.with(|slot| slot.borrow().is_none()));
     }
 
     #[cfg(unix)]
@@ -1552,12 +1749,23 @@ mod tests {
             database
                 .write(|connection| set_state(connection, "committed", &true))
                 .unwrap();
+            let database = HistoryDatabase::new(
+                &fs::canonicalize(&database.state_root).unwrap(),
+                &database.profile,
+            );
+            let store = SourceHistoryStore::new_sqlite(
+                database.state_root.clone(),
+                database.profile.clone(),
+            );
             let alias = database.profile_root.join("untrusted-alias");
             let result = database.write(|connection| {
                 set_state(connection, "uncommitted", &true)?;
                 let path = side_file_path(database.path(), suffix);
                 fs::hard_link(path, &alias)?;
-                database.read::<()>(|_| panic!("an aliased database object must not be used"))
+                let (fenced, stats) =
+                    database.measure_io(|| store.load_facts_projection_revision());
+                assert_eq!(stats.existence_checks, 0);
+                fenced
             });
             let error = result.unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::InvalidData);
@@ -1618,6 +1826,61 @@ mod tests {
             })
             .unwrap_err();
         assert!(database.read(|_| Ok(())).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_if_exists_facade_refuses_database_loss_or_replacement_in_an_active_scope() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for replace in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let initial = database(directory.path());
+            initial
+                .write(|connection| set_state(connection, "committed", &true))
+                .unwrap();
+            let database = HistoryDatabase::new(
+                &fs::canonicalize(&initial.state_root).unwrap(),
+                &initial.profile,
+            );
+            let store = SourceHistoryStore::new_sqlite(
+                database.state_root.clone(),
+                database.profile.clone(),
+            );
+            let displaced = database.profile_root.join("displaced.sqlite3");
+            let result = database.write(|connection| {
+                set_state(connection, "uncommitted", &true)?;
+                fs::rename(database.path(), &displaced)?;
+                if replace {
+                    fs::write(database.path(), [])?;
+                    fs::set_permissions(database.path(), fs::Permissions::from_mode(0o600))?;
+                }
+                let (fenced, stats) =
+                    database.measure_io(|| store.load_facts_projection_revision());
+                // Restore the bound inode before SQLite rolls back and closes.
+                if replace {
+                    fs::remove_file(database.path())?;
+                }
+                fs::rename(&displaced, database.path())?;
+                assert_eq!(stats.existence_checks, 0);
+                fenced
+            });
+            assert_eq!(
+                result.unwrap_err().kind(),
+                if replace {
+                    io::ErrorKind::InvalidData
+                } else {
+                    io::ErrorKind::NotFound
+                }
+            );
+            database
+                .read(|connection| {
+                    assert_eq!(state::<bool>(connection, "committed")?, Some(true));
+                    assert_eq!(state::<bool>(connection, "uncommitted")?, None);
+                    Ok(())
+                })
+                .unwrap();
+        }
     }
     #[test]
     fn sqlite_preview_schema_is_rejected_without_upgrading_or_adopting_rows() {

@@ -1293,6 +1293,122 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_observation_without_prepared_digests_avoids_empty_family_reads() {
+        with_writer(|identity, history, writer| {
+            let starts_at = at(30, 12, 0);
+            let observation = HistoryObservation {
+                observed_at: at(30, 12, 15),
+                half_hour_buckets: vec![bucket(starts_at, 10)],
+                ..HistoryObservation::default()
+            };
+            let database = history.sqlite_database().unwrap();
+            let (result, io) = database.measure_io(|| {
+                writer.record_local_observation(
+                    identity,
+                    "local",
+                    RedactionProfile::Redacted,
+                    &observation,
+                    LocalObservationMode::Incremental,
+                )
+            });
+            let report = result.unwrap();
+            assert_eq!(report.revision, 1);
+            assert_eq!(report.session_digest_records, 0);
+            assert_eq!(report.session_digest_tombstones, 0);
+            assert_eq!(
+                history
+                    .load_source_metadata(identity.node_id())
+                    .unwrap()
+                    .kind(),
+                SourceKind::Local,
+            );
+            let records = history
+                .load_source_records_since(
+                    identity.node_id(),
+                    RedactionProfile::Redacted,
+                    starts_at,
+                )
+                .unwrap();
+            assert_eq!(records.records.len(), 1);
+            assert_eq!(records.records[0].revision(), report.revision);
+            assert_eq!(
+                history
+                    .load_local_observation_projection_revision(
+                        identity,
+                        RedactionProfile::Redacted
+                    )
+                    .unwrap(),
+                report.revision,
+            );
+            assert_eq!(
+                io.write_connection_opens, 2,
+                "reservation must remain a separate commit"
+            );
+            assert_eq!(
+                io.connection_opens, 1,
+                "record preparation stays outside the data writer"
+            );
+            assert!(
+                io.calls <= 6,
+                "an empty prepared digest family must not reload metadata: {io:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn sqlite_empty_incoming_digests_still_publish_prepared_reconcile_tombstones() {
+        with_writer(|identity, history, writer| {
+            let range_start = at(29, 0, 0);
+            let observation = HistoryObservation {
+                observed_at: at(30, 12, 0),
+                ..HistoryObservation::default()
+            };
+            writer
+                .record_local_observation_with_session_digests(
+                    identity,
+                    "local",
+                    RedactionProfile::Redacted,
+                    &observation,
+                    LocalObservationMode::Incremental,
+                    &[session_digest(identity, "thread-a", range_start, 'a', 10)],
+                    true,
+                )
+                .unwrap();
+            let report = writer
+                .record_local_observation_with_session_digests(
+                    identity,
+                    "local",
+                    RedactionProfile::Redacted,
+                    &observation,
+                    LocalObservationMode::Reconcile {
+                        from: range_start,
+                        to: observation.observed_at,
+                    },
+                    &[],
+                    true,
+                )
+                .unwrap();
+            assert_eq!(report.revision, 2);
+            assert_eq!(report.session_digest_records, 1);
+            assert_eq!(report.session_digest_tombstones, 1);
+            let records = history
+                .load_source_session_digest_records_since(
+                    identity.node_id(),
+                    RedactionProfile::Redacted,
+                    range_start,
+                )
+                .unwrap()
+                .records;
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].revision(), report.revision);
+            assert!(matches!(
+                records[0].change(),
+                SourceSessionDigestChange::Tombstone
+            ));
+        });
+    }
+
+    #[test]
     fn reserved_revision_survives_a_crash_as_a_gap_and_is_never_reused() {
         with_writer(|identity, history, writer| {
             let observation = HistoryObservation {

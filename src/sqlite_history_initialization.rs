@@ -107,7 +107,7 @@ fn activate_sqlite_history_with_hook(
     // creation link) before schema initialization. Both participant leases
     // are held here. A writable open can finish that pending initialization;
     // the database's active-owner guard still forbids recreating lost data.
-    let receipts_complete = db.write(|connection| {
+    db.write(|connection| {
         let mut complete = true;
         for manifest in &participants {
             let receipt = database::state::<SqliteInitializationReceipt>(
@@ -125,66 +125,65 @@ fn activate_sqlite_history_with_hook(
             }
             complete &= matches;
         }
-        Ok(complete)
-    })?;
-
-    if !receipts_complete {
-        db.write(|connection| {
-            let retained_key = "database/retained-state-completed";
-            match database::state::<bool>(connection, retained_key)? {
-                None => {
-                    crate::sqlite_retained_state::retain_required_state(&target)?;
-                    database::set_state(connection, retained_key, &true)?;
-                }
-                Some(true) => {}
-                Some(false) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "invalid SQLite retention completion marker",
-                    ));
-                }
+        if complete {
+            return Ok(());
+        }
+        // Inspect receipts and publish the retained state in one transaction.
+        // Manifest activation remains outside this committed receipt boundary.
+        let retained_key = "database/retained-state-completed";
+        match database::state::<bool>(connection, retained_key)? {
+            None => {
+                crate::sqlite_retained_state::retain_required_state(&target)?;
+                database::set_state(connection, retained_key, &true)?;
             }
-            validate_participants(
-                ownership,
-                lease,
-                &current,
-                &other_store,
-                other_lease.as_ref(),
-                other.as_ref(),
+            Some(true) => {}
+            Some(false) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid SQLite retention completion marker",
+                ));
+            }
+        }
+        validate_participants(
+            ownership,
+            lease,
+            &current,
+            &other_store,
+            other_lease.as_ref(),
+            other.as_ref(),
+        )?;
+        let sqlite_version: String = connection
+            .query_row("SELECT sqlite_version()", [], |row| row.get(0))
+            .map_err(database::sql_error)?;
+        let sqlite_source_id: String = connection
+            .query_row("SELECT sqlite_source_id()", [], |row| row.get(0))
+            .map_err(database::sql_error)?;
+        for manifest in &participants {
+            let receipt = SqliteInitializationReceipt {
+                format_version: 1,
+                profile_id: store.profile_id().clone(),
+                redaction_profile: manifest.redaction_profile(),
+                ownership_epoch: manifest.epoch(),
+                derived_history_imported: false,
+                sqlite_version: sqlite_version.clone(),
+                sqlite_source_id: sqlite_source_id.clone(),
+                completed_at: Utc::now(),
+            };
+            database::set_state(
+                connection,
+                &receipt_key(manifest.redaction_profile()),
+                &receipt,
             )?;
-            let sqlite_version: String = connection
-                .query_row("SELECT sqlite_version()", [], |row| row.get(0))
-                .map_err(database::sql_error)?;
-            let sqlite_source_id: String = connection
-                .query_row("SELECT sqlite_source_id()", [], |row| row.get(0))
-                .map_err(database::sql_error)?;
-            for manifest in &participants {
-                let receipt = SqliteInitializationReceipt {
-                    format_version: 1,
-                    profile_id: store.profile_id().clone(),
-                    redaction_profile: manifest.redaction_profile(),
-                    ownership_epoch: manifest.epoch(),
-                    derived_history_imported: false,
-                    sqlite_version: sqlite_version.clone(),
-                    sqlite_source_id: sqlite_source_id.clone(),
-                    completed_at: Utc::now(),
-                };
-                database::set_state(
-                    connection,
-                    &receipt_key(manifest.redaction_profile()),
-                    &receipt,
-                )?;
-            }
-            validate_participants(
-                ownership,
-                lease,
-                &current,
-                &other_store,
-                other_lease.as_ref(),
-                other.as_ref(),
-            )
-        })?;
-    }
+        }
+        validate_participants(
+            ownership,
+            lease,
+            &current,
+            &other_store,
+            other_lease.as_ref(),
+            other.as_ref(),
+        )
+    })?;
     before_activation()?;
     validate_participants(
         ownership,
@@ -439,6 +438,40 @@ mod tests {
             crate::history_ownership::InitializeV1Outcome::Initialized(manifest)
             | crate::history_ownership::InitializeV1Outcome::Existing(manifest) => manifest,
         }
+    }
+
+    #[test]
+    fn initialization_checks_and_publishes_receipts_in_one_write_connection() {
+        let (_temp, ownership, store, _identity) = fixture();
+        old_v1_quota(&store);
+        let lease = ownership.acquire_writer_lease().unwrap();
+        let expected = begin(&ownership, &lease);
+        let database = store.sqlite_database().unwrap();
+
+        let (result, io) =
+            database.measure_io(|| activate_sqlite_history(&ownership, &lease, &expected, &store));
+        let (active, initialized) = result.unwrap();
+        assert_eq!(active.state(), HistoryOwnershipState::V2Active);
+        validate_receipt(&database, &active).unwrap();
+        let other = HistoryOwnershipStore::new(
+            store.state_root().to_owned(),
+            store.profile_id().clone(),
+            RedactionProfile::Redacted,
+        );
+        let OwnershipManifestStatus::Initialized(other_active) = other.load_manifest().unwrap()
+        else {
+            panic!("initialization must activate both privacy namespaces");
+        };
+        assert_eq!(other_active.state(), HistoryOwnershipState::V2Active);
+        validate_receipt(&database, &other_active).unwrap();
+        assert_eq!(
+            initialized.load_account_since(at()).unwrap().quota_points,
+            vec![point()],
+        );
+        assert_eq!(
+            io.write_connection_opens, 1,
+            "receipt inspection and retained-state publication need one write transaction",
+        );
     }
 
     #[test]

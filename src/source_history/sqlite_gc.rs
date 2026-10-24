@@ -366,18 +366,20 @@ fn collect_prepared_unit(
     budget: &mut Budget,
     fence: &impl Fn() -> io::Result<()>,
 ) -> io::Result<SourceHistoryGcReport> {
-    let sources = store.list_source_metadata()?;
-    let expected = database.read(|connection| {
-        sqlite_state_bounded::<Progress>(connection, key, MAX_METADATA_FILE_BYTES, None)
-    })?;
     let clock_key = database.namespace(&store.profile_directory().join(RETENTION_CLOCK_FILE))?;
-    let expected_clock = database.read(|connection| {
-        sqlite_state_bounded::<RetentionClockEnvelope>(
+    // Preparation metadata shares one read snapshot. Scanning and publication
+    // keep their separate boundaries, including the commit-time state CAS.
+    let (sources, expected, expected_clock) = database.read(|connection| {
+        let sources = store.list_source_metadata()?;
+        let expected =
+            sqlite_state_bounded::<Progress>(connection, key, MAX_METADATA_FILE_BYTES, None)?;
+        let expected_clock = sqlite_state_bounded::<RetentionClockEnvelope>(
             connection,
             &clock_key,
             MAX_METADATA_FILE_BYTES,
             None,
-        )
+        )?;
+        Ok((sources, expected, expected_clock))
     })?;
     if let Some(clock) = &expected_clock {
         if clock.format_version != RETENTION_CLOCK_FORMAT_VERSION
@@ -653,4 +655,93 @@ fn collect_prepared_unit(
         fence()?;
         Ok(SourceHistoryGcReport { shards_pruned: pruned, pruning_deferred: progress.pruning_deferred, trusted_at: progress.anchor.is_none().then_some(progress.trusted_at), work_pending: !finished, records_examined: budget.rows, decoded_bytes: budget.bytes, pruning_statistics_partial: statistics_partial })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::{Duration, TimeZone, Utc};
+
+    use super::collect_unit;
+    use crate::domain::Provenance;
+    use crate::history::QuotaPoint;
+    use crate::source_history::{RedactionProfile, SourceHistoryStore, SourceKind, SourceMetadata};
+
+    #[test]
+    fn first_gc_preparation_uses_two_read_connections_and_resumes() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = SourceHistoryStore::new_sqlite(
+            temporary.path().join("state"),
+            "0123456789abcdef".parse().unwrap(),
+        );
+        store
+            .save_source_metadata(
+                &SourceMetadata::new(
+                    "node-0123456789abcdef0123456789abcdef".parse().unwrap(),
+                    SourceKind::Local,
+                    "local",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let observed_at = Utc.with_ymd_and_hms(2026, 10, 2, 0, 0, 0).unwrap();
+        let point = QuotaPoint {
+            observed_at,
+            limit_id: "codex".to_owned(),
+            duration_mins: 300,
+            resets_at: observed_at + Duration::hours(5),
+            used_percent: 25.0,
+            remaining_percent: 75.0,
+            provenance: Provenance::ServerSnapshot,
+        };
+        store
+            .record_account_points(std::slice::from_ref(&point))
+            .unwrap();
+        let database = store.sqlite_database().unwrap();
+        let (result, io) = database.measure_io(|| {
+            collect_unit(
+                &store,
+                observed_at,
+                &[RedactionProfile::Redacted],
+                || Ok(()),
+            )
+        });
+        let first = result.unwrap();
+        assert!(first.work_pending);
+        assert_eq!(first.trusted_at, Some(observed_at));
+        assert_eq!(first.shards_pruned, 0);
+
+        let reopened = SourceHistoryStore::new_sqlite(
+            store.state_root().to_owned(),
+            store.profile_id().clone(),
+        );
+        let mut completed = false;
+        for _ in 0..16 {
+            let report = collect_unit(
+                &reopened,
+                observed_at,
+                &[RedactionProfile::Redacted],
+                || Ok(()),
+            )
+            .unwrap();
+            if !report.work_pending {
+                completed = true;
+                break;
+            }
+        }
+        assert!(
+            completed,
+            "the prepared GC page must resume after reopening"
+        );
+        assert_eq!(
+            reopened
+                .load_account_since(observed_at)
+                .unwrap()
+                .quota_points,
+            vec![point],
+        );
+        assert_eq!(
+            io.connection_opens, 2,
+            "one preparation snapshot plus one initial retention-anchor scan",
+        );
+    }
 }

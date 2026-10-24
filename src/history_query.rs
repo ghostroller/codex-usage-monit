@@ -579,8 +579,15 @@ fn query_with_context_attempt(
         ),
         Err(error) => Err(io::Error::new(error.kind(), error.to_string())),
     };
-    let after = query_inputs(ownership, source_history, mapping(), local_identity)?;
-    if before != after || matches!(&usage, Ok(None)) {
+    // Metadata and revision probes cannot change within this attempt's SQL
+    // snapshot. Ownership and mappings live outside SQL, so read both again
+    // before delivery. The caller releases this snapshot before any retry.
+    let after_mapping = mapping();
+    let after_ownership = sqlite_active_manifest(ownership)?;
+    if before.ownership != after_ownership
+        || before.mapping != after_mapping
+        || matches!(&usage, Ok(None))
+    {
         context.quota = None;
         return Ok(None);
     }
@@ -1319,6 +1326,212 @@ mod tests {
     const SOURCE_A: &str = "node-0123456789abcdef0123456789abcdef";
     const SOURCE_B: &str = "node-fedcba9876543210fedcba9876543210";
     const SOURCE_C: &str = "node-11111111111111111111111111111111";
+
+    fn query_observation(version: u32) -> HistoryObservation {
+        // Keep the persisted quota key fixed: each publication replaces one
+        // sample, so this snapshot test does not depend on sampling windows.
+        let mut point = quota(at(2, 9, 0), at(8, 0, 0));
+        point.used_percent = 20.0 * f64::from(version);
+        point.remaining_percent = 100.0 - point.used_percent;
+        HistoryObservation {
+            observed_at: at(2, 10, 15) + Duration::minutes(i64::from(version)),
+            quota_points: vec![point],
+            half_hour_buckets: vec![bucket(at(2, 10, 0), 10 * u64::from(version), "local")],
+            ..HistoryObservation::default()
+        }
+    }
+
+    fn commit_query_observation(
+        ownership: &HistoryOwnershipStore,
+        store: &SourceHistoryStore,
+        identity: &SourceIdentity,
+        version: u32,
+    ) {
+        let lease = ownership.acquire_writer_lease().unwrap();
+        let active = initialized_manifest(ownership).unwrap();
+        let authority = ownership.authorize_v2_write(&lease, &active).unwrap();
+        let report = store
+            .writer(&authority)
+            .unwrap()
+            .record_local_observation(
+                identity,
+                "local",
+                ownership.redaction_profile(),
+                &query_observation(version),
+                crate::source_history::LocalObservationMode::Incremental,
+            )
+            .unwrap();
+        assert_eq!(report.revision, u64::from(version));
+    }
+
+    fn query_observation_fixture() -> (
+        tempfile::TempDir,
+        HistoryOwnershipStore,
+        SourceHistoryStore,
+        SourceIdentity,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let canonical_directory = fs::canonicalize(directory.path()).unwrap();
+        let root = canonical_directory.join("state");
+        let (ownership, store) = stores(
+            &root,
+            &canonical_directory.join("codex"),
+            RedactionProfile::Redacted,
+        );
+        let identity =
+            crate::source_identity::SourceIdentityStore::at_path(root.join("source-identity.json"))
+                .load()
+                .unwrap();
+        commit_query_observation(&ownership, &store, &identity, 1);
+        (directory, ownership, store, identity)
+    }
+
+    #[test]
+    fn request_context_reads_sql_inputs_once_within_a_bounded_read_budget() {
+        let (_directory, ownership, store, identity) = query_observation_fixture();
+        let database = store.sqlite_database().unwrap();
+        let mut context = HistoryQueryContext::new(at(2, 0, 0));
+        let (result, stats) = database.measure_io(|| {
+            query_with_context(
+                &ownership,
+                &store,
+                LoadedProjectMappingProjection::default,
+                Some(&identity),
+                Some(identity.node_id()),
+                &HistorySourceSelection::Local(identity.node_id().clone()),
+                &mut context,
+            )
+        });
+        let snapshot = result.unwrap().into_snapshot().unwrap();
+        assert_eq!(
+            snapshot.history.quota_points,
+            query_observation(1).quota_points
+        );
+        assert_eq!(
+            snapshot.history.half_hour_buckets[0]
+                .token_usage
+                .total_tokens,
+            10
+        );
+        assert_eq!(context.quota_loads, 1);
+        assert_eq!(stats.connection_opens, 1, "{stats:?}");
+        assert_eq!(stats.write_connection_opens, 0, "{stats:?}");
+        assert_eq!(stats.existence_checks, 0, "{stats:?}");
+        // One outer read, four SQL input probes, quota, four local family
+        // reads, the existing metadata recheck and the backfill marker.
+        assert!(
+            stats.calls <= 12,
+            "query exceeded its read budget: {stats:?}"
+        );
+        assert!(!database.is_transaction_active());
+    }
+
+    #[test]
+    fn request_context_keeps_sql_snapshot_and_retries_with_new_external_mapping() {
+        use std::cell::Cell;
+
+        for change_mapping in [false, true] {
+            let (directory, ownership, store, identity) = query_observation_fixture();
+            let mapping_store =
+                ProjectMappingStore::new(directory.path().join("config/project-mappings.json"));
+            let calls = Cell::new(0);
+            let database = store.sqlite_database().unwrap();
+            let selection = HistorySourceSelection::Local(identity.node_id().clone());
+            let mut context = HistoryQueryContext::new(at(2, 0, 0));
+            let (result, stats) = database.measure_io(|| {
+                query_with_context(
+                    &ownership,
+                    &store,
+                    || {
+                        let call = calls.get();
+                        calls.set(call + 1);
+                        if call == 1 {
+                            // The first attempt has already read quota and usage.
+                            // Commit on another thread so it cannot inherit this
+                            // thread's SQL read scope; joining proves publication
+                            // completed before the external after fence proceeds.
+                            let writer_ownership = ownership.clone();
+                            let writer_store = store.clone();
+                            let writer_identity = identity.clone();
+                            std::thread::spawn(move || {
+                                commit_query_observation(
+                                    &writer_ownership,
+                                    &writer_store,
+                                    &writer_identity,
+                                    2,
+                                );
+                            })
+                            .join()
+                            .unwrap();
+                            if change_mapping {
+                                mapping_store
+                                    .resolve_or_create_batch(
+                                        0,
+                                        vec![mapping_observation(
+                                            identity.node_id().as_str(),
+                                            observed('a'),
+                                            "local",
+                                        )],
+                                    )
+                                    .unwrap();
+                            }
+                        }
+                        load_project_mapping_projection(&mapping_store)
+                    },
+                    Some(&identity),
+                    Some(identity.node_id()),
+                    &selection,
+                    &mut context,
+                )
+            });
+            let snapshot = result.unwrap().into_snapshot().unwrap();
+            let expected_version = if change_mapping { 2 } else { 1 };
+            assert_eq!(
+                snapshot.history.quota_points,
+                query_observation(expected_version).quota_points
+            );
+            assert_eq!(
+                snapshot.history.half_hour_buckets[0]
+                    .token_usage
+                    .total_tokens,
+                10 * u64::from(expected_version)
+            );
+            assert_eq!(context.quota_loads, expected_version as usize);
+            assert_eq!(calls.get(), 2 * expected_version as usize);
+            assert_eq!(
+                stats.connection_opens, expected_version as usize,
+                "{stats:?}"
+            );
+            assert_eq!(stats.write_connection_opens, 0, "{stats:?}");
+            assert!(!database.is_transaction_active());
+
+            // A subsequent request must observe the completed SQL publication
+            // even when the first request correctly retained its old snapshot.
+            let current = query_with_context(
+                &ownership,
+                &store,
+                || load_project_mapping_projection(&mapping_store),
+                Some(&identity),
+                Some(identity.node_id()),
+                &selection,
+                &mut context,
+            )
+            .unwrap()
+            .into_snapshot()
+            .unwrap();
+            assert_eq!(
+                current.history.quota_points,
+                query_observation(2).quota_points
+            );
+            assert_eq!(
+                current.history.half_hour_buckets[0]
+                    .token_usage
+                    .total_tokens,
+                20
+            );
+            assert_eq!(context.quota_loads, 2);
+        }
+    }
 
     #[test]
     fn request_context_reuses_quota_and_invalidates_source_policy() {

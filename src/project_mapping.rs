@@ -1959,33 +1959,57 @@ fn validate_published_private_file(path: &Path, subject: &str) -> io::Result<()>
 /// stable lock, so file identity is the publication CAS and does not require
 /// reparsing the bounded-but-potentially-large JSON document.
 fn ensure_expected_mapping_file(path: &Path, expected_file: &File) -> io::Result<()> {
-    let path_metadata = fs::symlink_metadata(path)?;
-    validate_mapping_file_metadata(&path_metadata, "project mapping path")?;
     let expected_metadata = expected_file.metadata()?;
     validate_mapping_file_metadata(&expected_metadata, "prepared project mapping file")?;
+    // A Windows POSIX replacement can leave the retained file readable while
+    // querying its ACL fails because it is no longer linked at this path. Prove
+    // an identity conflict before validating that old object's permissions.
+    // Only a confirmed mismatch is retryable; path and I/O errors stay errors.
+    ensure_expected_mapping_file_identity(path, expected_file, &expected_metadata)?;
     ensure_private_file(
         path,
         expected_file,
         &expected_metadata,
         "prepared project mapping file",
     )?;
-    ensure_opened_file_matches_path(
+    #[cfg(test)]
+    {
+        let hook = EXPECTED_MAPPING_AFTER_ACL_HOOK.with(|hook| hook.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+    // Keep the final fence after ACL validation: a non-cooperating writer can
+    // replace the directory entry while permissions are being inspected.
+    ensure_expected_mapping_file_identity(path, expected_file, &expected_metadata)
+}
+
+#[cfg(test)]
+thread_local! {
+    static EXPECTED_MAPPING_AFTER_ACL_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn ensure_expected_mapping_file_identity(
+    path: &Path,
+    expected_file: &File,
+    expected_metadata: &fs::Metadata,
+) -> io::Result<()> {
+    let path_metadata = fs::symlink_metadata(path)?;
+    validate_mapping_file_metadata(&path_metadata, "project mapping path")?;
+    if !opened_file_matches_path(
         path,
         expected_file,
         &path_metadata,
-        &expected_metadata,
+        expected_metadata,
         "project mapping file",
-    )
-    .map_err(|error| {
-        if error.kind() == io::ErrorKind::InvalidData {
-            io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "project mapping changed after remote page staging",
-            )
-        } else {
-            error
-        }
-    })
+    )? {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "project mapping changed after remote page staging",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -2229,17 +2253,14 @@ fn ensure_private_path(_metadata: &fs::Metadata, _subject: &str) -> io::Result<(
     Ok(())
 }
 
-#[cfg(unix)]
 fn ensure_opened_file_matches_path(
-    _path: &Path,
-    _opened_file: &File,
+    path: &Path,
+    opened_file: &File,
     path_metadata: &fs::Metadata,
     opened_metadata: &fs::Metadata,
     subject: &str,
 ) -> io::Result<()> {
-    use std::os::unix::fs::MetadataExt;
-    if path_metadata.dev() == opened_metadata.dev() && path_metadata.ino() == opened_metadata.ino()
-    {
+    if opened_file_matches_path(path, opened_file, path_metadata, opened_metadata, subject)? {
         Ok(())
     } else {
         Err(invalid_mapping(format!(
@@ -2248,27 +2269,36 @@ fn ensure_opened_file_matches_path(
     }
 }
 
+#[cfg(unix)]
+fn opened_file_matches_path(
+    _path: &Path,
+    _opened_file: &File,
+    path_metadata: &fs::Metadata,
+    opened_metadata: &fs::Metadata,
+    _subject: &str,
+) -> io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    Ok(
+        path_metadata.dev() == opened_metadata.dev()
+            && path_metadata.ino() == opened_metadata.ino(),
+    )
+}
+
 #[cfg(windows)]
-fn ensure_opened_file_matches_path(
+fn opened_file_matches_path(
     path: &Path,
     opened_file: &File,
     _path_metadata: &fs::Metadata,
     _opened_metadata: &fs::Metadata,
     subject: &str,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     let mut options = OpenOptions::new();
     options.read(true);
     add_nofollow_flags(&mut options);
     let current = options
         .open(path)
         .map_err(|error| map_nofollow_error(error, subject))?;
-    if windows_file_identity(&current)? == windows_file_identity(opened_file)? {
-        Ok(())
-    } else {
-        Err(invalid_mapping(format!(
-            "{subject} changed while it was being opened"
-        )))
-    }
+    Ok(windows_file_identity(&current)? == windows_file_identity(opened_file)?)
 }
 
 #[cfg(windows)]
@@ -2290,14 +2320,14 @@ fn windows_file_identity(file: &File) -> io::Result<(u32, u64)> {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn ensure_opened_file_matches_path(
+fn opened_file_matches_path(
     _path: &Path,
     _opened_file: &File,
     _path_metadata: &fs::Metadata,
     _opened_metadata: &fs::Metadata,
     _subject: &str,
-) -> io::Result<()> {
-    Ok(())
+) -> io::Result<bool> {
+    Ok(true)
 }
 
 #[cfg(unix)]
@@ -2548,13 +2578,17 @@ mod tests {
         let prepared = store
             .prepare_resolve_or_create_batch(vec![observation(NODE_ONE, 'a', "staged")])
             .unwrap();
+        let temporary = prepared.temporary.clone().unwrap();
         let concurrent = store
             .resolve_or_create(0, observation(NODE_ONE, 'b', "concurrent"))
             .unwrap();
 
         let error = prepared.publish().unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
-        let projection = store.load().unwrap().projection();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock, "{error:?}");
+        assert!(!temporary.exists());
+        let stored = store.load().unwrap();
+        assert_eq!(stored, *concurrent.mappings());
+        let projection = stored.projection();
         assert_eq!(projection.len(), 1);
         assert!(
             projection
@@ -2574,7 +2608,7 @@ mod tests {
         let prepared = store
             .prepare_resolve_or_create_batch(vec![observation(NODE_ONE, 'a', "stable")])
             .unwrap();
-        store
+        let concurrent = store
             .resolve_or_create(
                 seeded.mappings().revision(),
                 observation(NODE_ONE, 'b', "concurrent"),
@@ -2582,8 +2616,173 @@ mod tests {
             .unwrap();
 
         let error = prepared.publish().unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
-        assert_eq!(store.load().unwrap().projection().len(), 2);
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock, "{error:?}");
+        assert_eq!(store.load().unwrap(), *concurrent.mappings());
+    }
+
+    #[test]
+    fn prepared_batch_rejects_a_directory_replacement_without_retry_classification() {
+        for changed in [false, true] {
+            let directory = tempdir().unwrap();
+            let store = store(&directory);
+            store
+                .resolve_or_create(0, observation(NODE_ONE, 'a', "stable"))
+                .unwrap();
+            let prepared = store
+                .prepare_resolve_or_create_batch(vec![if changed {
+                    observation(NODE_ONE, 'b', "staged")
+                } else {
+                    observation(NODE_ONE, 'a', "stable")
+                }])
+                .unwrap();
+            let temporary = prepared.temporary.clone();
+            let path = store.path().unwrap();
+            let original = fs::read(path).unwrap();
+            let displaced = path.with_extension("previous.json");
+            fs::rename(path, &displaced).unwrap();
+            fs::create_dir(path).unwrap();
+
+            let error = prepared.publish().unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error:?}");
+            assert!(path.is_dir());
+            assert_eq!(fs::read(displaced).unwrap(), original);
+            if let Some(temporary) = temporary {
+                assert!(!temporary.exists());
+            }
+            assert!(
+                try_open_locked_lock_file(mapping_parent(path), LockMode::Exclusive)
+                    .unwrap()
+                    .is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_batch_rechecks_identity_after_acl_validation() {
+        for changed in [false, true] {
+            let directory = tempdir().unwrap();
+            let store = store(&directory);
+            store
+                .resolve_or_create(0, observation(NODE_ONE, 'a', "stable"))
+                .unwrap();
+            let prepared = store
+                .prepare_resolve_or_create_batch(vec![if changed {
+                    observation(NODE_ONE, 'b', "staged")
+                } else {
+                    observation(NODE_ONE, 'a', "stable")
+                }])
+                .unwrap();
+            let temporary = prepared.temporary.clone();
+            let path = store.path().unwrap();
+            let original = fs::read(path).unwrap();
+            // Even identical JSON in a new file must invalidate the retained
+            // identity. Bypass the cooperative lock at this precise race point.
+            let replacement = write_prepared_mappings(path, &original).unwrap();
+            let replacement_path = path.to_path_buf();
+            EXPECTED_MAPPING_AFTER_ACL_HOOK.with(|hook| {
+                assert!(
+                    hook.borrow_mut()
+                        .replace(Box::new(move || {
+                            replace_file(&replacement, &replacement_path).unwrap();
+                        }))
+                        .is_none()
+                );
+            });
+
+            let error = prepared.publish().unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::WouldBlock, "{error:?}");
+            EXPECTED_MAPPING_AFTER_ACL_HOOK.with(|hook| assert!(hook.borrow().is_none()));
+            assert_eq!(fs::read(path).unwrap(), original);
+            if let Some(temporary) = temporary {
+                assert!(!temporary.exists());
+            }
+            assert!(
+                try_open_locked_lock_file(mapping_parent(path), LockMode::Exclusive)
+                    .unwrap()
+                    .is_some()
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn prepared_batch_rejects_same_file_with_weakened_windows_permissions() {
+        use std::ptr;
+        use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+        };
+        use windows_sys::Win32::Security::{
+            DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, SetFileSecurityW,
+        };
+
+        for changed in [false, true] {
+            let directory = tempdir().unwrap();
+            let store = store(&directory);
+            store
+                .resolve_or_create(0, observation(NODE_ONE, 'a', "stable"))
+                .unwrap();
+            let prepared = store
+                .prepare_resolve_or_create_batch(vec![if changed {
+                    observation(NODE_ONE, 'b', "staged")
+                } else {
+                    observation(NODE_ONE, 'a', "stable")
+                }])
+                .unwrap();
+            let temporary = prepared.temporary.clone();
+            let path = store.path().unwrap();
+            let original = fs::read(path).unwrap();
+            let expected_identity =
+                windows_file_identity(prepared.expected_file.as_ref().unwrap()).unwrap();
+            let wide_path = crate::atomic_file::windows_wide_path(path).unwrap();
+            let sddl = "D:P(A;;FA;;;WD)"
+                .encode_utf16()
+                .chain(Some(0))
+                .collect::<Vec<_>>();
+            let mut descriptor = ptr::null_mut();
+            // SAFETY: the terminated SDDL and writable output pointer remain
+            // live; a successful allocation is freed after SetFileSecurityW.
+            let converted = unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    sddl.as_ptr(),
+                    SDDL_REVISION_1,
+                    &mut descriptor,
+                    ptr::null_mut(),
+                )
+            };
+            assert_ne!(converted, 0, "{}", io::Error::last_os_error());
+            // SAFETY: the private fixture path is terminated, descriptor owns
+            // a valid DACL, and both outlive this synchronous call. Only this
+            // test's file is changed; its object identity and owner are kept.
+            let updated = unsafe {
+                SetFileSecurityW(
+                    wide_path.as_ptr(),
+                    DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                    descriptor,
+                )
+            };
+            let update_error = (updated == 0).then(io::Error::last_os_error);
+            // SAFETY: the successful conversion returned this uniquely owned
+            // LocalAlloc descriptor, which SetFileSecurityW does not retain.
+            unsafe { LocalFree(descriptor) };
+            assert_ne!(updated, 0, "{update_error:?}");
+            assert_eq!(
+                windows_file_identity(&open_mapping_file(path).unwrap()).unwrap(),
+                expected_identity,
+            );
+
+            let error = prepared.publish().unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error:?}");
+            assert_eq!(fs::read(path).unwrap(), original);
+            if let Some(temporary) = temporary {
+                assert!(!temporary.exists());
+            }
+            assert!(
+                try_open_locked_lock_file(mapping_parent(path), LockMode::Exclusive)
+                    .unwrap()
+                    .is_some()
+            );
+        }
     }
 
     #[test]

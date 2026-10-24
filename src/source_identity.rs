@@ -1224,8 +1224,8 @@ pub(crate) fn validate_windows_private_file(
     subject: &str,
 ) -> io::Result<()> {
     reject_windows_reparse_components(path, subject)?;
-    let metadata = file.metadata()?;
-    if metadata_is_link_or_reparse(&metadata) {
+    let attributes = windows_handle_attributes(file)?;
+    if windows_attributes_are_reparse(attributes) {
         return Err(invalid_identity(format!(
             "{subject} must not be a reparse point"
         )));
@@ -1238,7 +1238,7 @@ pub(crate) fn validate_windows_private_file(
 pub(crate) fn validate_windows_private_directory(path: &Path, subject: &str) -> io::Result<()> {
     use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_ATTRIBUTE_DIRECTORY, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
     };
 
     reject_windows_reparse_components(path, subject)?;
@@ -1247,13 +1247,13 @@ pub(crate) fn validate_windows_private_directory(path: &Path, subject: &str) -> 
         .read(true)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
     let directory = options.open(path)?;
-    let metadata = directory.metadata()?;
-    if metadata_is_link_or_reparse(&metadata) {
+    let attributes = windows_handle_attributes(&directory)?;
+    if windows_attributes_are_reparse(attributes) {
         return Err(invalid_identity(format!(
             "{subject} must not be a reparse point"
         )));
     }
-    if !metadata.file_type().is_dir() {
+    if attributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
         return Err(invalid_identity(format!("{subject} must be a directory")));
     }
     validate_windows_private_handle(&directory, &format!("{subject} ({})", path.display()))?;
@@ -1261,9 +1261,111 @@ pub(crate) fn validate_windows_private_directory(path: &Path, subject: &str) -> 
 }
 
 #[cfg(windows)]
-pub(crate) fn reject_windows_reparse_components(path: &Path, subject: &str) -> io::Result<()> {
+fn windows_handle_attributes(file: &File) -> io::Result<u32> {
     use std::os::windows::fs::MetadataExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_TAG_INFO, FileAttributeTagInfo, GetFileInformationByHandleEx,
+    };
 
+    // These validators need only reparse/directory attributes. Query the live
+    // object without requesting the size, timestamps or identity in Metadata.
+    let mut information = FILE_ATTRIBUTE_TAG_INFO {
+        FileAttributes: 0,
+        ReparseTag: 0,
+    };
+    let buffer_size = std::mem::size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32;
+    #[cfg(test)]
+    let buffer_size = if FORCE_HANDLE_ATTRIBUTE_QUERY_FAILURE.with(|force| force.replace(false)) {
+        0
+    } else {
+        buffer_size
+    };
+    // SAFETY: file owns the live handle and information is an aligned writable
+    // buffer of the required type. The test-only zero size requests a rejected
+    // query with the same valid buffer; no borrowed handle is closed here.
+    if unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileAttributeTagInfo,
+            (&mut information as *mut FILE_ATTRIBUTE_TAG_INFO).cast(),
+            buffer_size,
+        )
+    } != 0
+    {
+        return Ok(information.FileAttributes);
+    }
+
+    // Drivers may not support this information class. Preserve the old query
+    // and its errors, always against this same handle rather than its pathname.
+    #[cfg(test)]
+    WINDOWS_HANDLE_METADATA_PROBES.with(|count| count.set(count.get() + 1));
+    file.metadata().map(|metadata| metadata.file_attributes())
+}
+
+#[cfg(all(test, windows))]
+thread_local! {
+    static WINDOWS_HANDLE_METADATA_PROBES: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+    static FORCE_HANDLE_ATTRIBUTE_QUERY_FAILURE: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+}
+
+#[cfg(windows)]
+fn windows_path_attributes(path: &Path) -> io::Result<u32> {
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::{GetFileAttributesW, INVALID_FILE_ATTRIBUTES};
+
+    // This walk needs only reparse attributes. Unlike a complete metadata
+    // query, GetFileAttributesW does not open each ancestor for handle data,
+    // and it reports a final symbolic link or mounted directory itself.
+    if let Ok(wide) = crate::atomic_file::windows_wide_path(path) {
+        #[cfg(test)]
+        WINDOWS_REPARSE_PROBE_COUNTS.with(|counts| {
+            let mut current = counts.get();
+            current.attribute_probes += 1;
+            counts.set(current);
+        });
+        // SAFETY: windows_wide_path supplies a NUL-terminated UTF-16 path with
+        // no interior NUL, and the buffer remains alive for this read-only call.
+        let attributes = unsafe { GetFileAttributesW(wide.as_ptr()) };
+        if attributes != INVALID_FILE_ATTRIBUTES {
+            return Ok(attributes);
+        }
+    }
+    // Preserve std's behavior for UNC share roots and every conversion or API
+    // failure, including its error kinds. The caller still rejects every error
+    // except NotFound; handle, ACL and object-identity validation are separate.
+    #[cfg(test)]
+    WINDOWS_REPARSE_PROBE_COUNTS.with(|counts| {
+        let mut current = counts.get();
+        current.full_metadata_probes += 1;
+        counts.set(current);
+    });
+    fs::symlink_metadata(path).map(|metadata| metadata.file_attributes())
+}
+
+#[cfg(all(test, windows))]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct WindowsReparseProbeCounts {
+    attribute_probes: usize,
+    full_metadata_probes: usize,
+}
+
+#[cfg(all(test, windows))]
+thread_local! {
+    static WINDOWS_REPARSE_PROBE_COUNTS: std::cell::Cell<WindowsReparseProbeCounts> = const {
+        std::cell::Cell::new(WindowsReparseProbeCounts {
+            attribute_probes: 0,
+            full_metadata_probes: 0,
+        })
+    };
+}
+
+#[cfg(windows)]
+pub(crate) fn reject_windows_reparse_components(path: &Path, subject: &str) -> io::Result<()> {
     // Ancestors keep drive and UNC roots intact. Building a path one component
     // at a time would query incomplete verbatim prefixes such as \\?\C:, which
     // Windows rejects before the root separator has been appended.
@@ -1271,9 +1373,9 @@ pub(crate) fn reject_windows_reparse_components(path: &Path, subject: &str) -> i
         if component.as_os_str().is_empty() {
             continue;
         }
-        match fs::symlink_metadata(component) {
-            Ok(metadata) => {
-                if windows_attributes_are_reparse(metadata.file_attributes()) {
+        match windows_path_attributes(component) {
+            Ok(attributes) => {
+                if windows_attributes_are_reparse(attributes) {
                     return Err(invalid_identity(format!(
                         "{subject} path must not traverse a reparse point ({})",
                         component.display()
@@ -2388,6 +2490,275 @@ mod tests {
             !missing.exists(),
             "validation must not create the state root"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_handle_attribute_probe_avoids_full_metadata_for_live_objects() {
+        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN, FILE_FLAG_BACKUP_SEMANTICS,
+            FILE_FLAG_OPEN_REPARSE_POINT, SetFileAttributesW,
+        };
+
+        let temporary = tempdir().unwrap();
+        let private = temporary.path().join("private");
+        create_private_directory(&private).unwrap();
+        let path = private.join("held-file");
+        fs::write(&path, b"unchanged").unwrap();
+        let file = File::open(&path).unwrap();
+        let directory = OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&private)
+            .unwrap();
+        let before = WINDOWS_HANDLE_METADATA_PROBES.with(|count| count.get());
+        for (path, held, is_directory) in [(&path, &file, false), (&private, &directory, true)] {
+            let original = held.metadata().unwrap().file_attributes();
+            assert_eq!(windows_handle_attributes(held).unwrap(), original);
+            assert_eq!(original & FILE_ATTRIBUTE_DIRECTORY != 0, is_directory);
+            let wide = crate::atomic_file::windows_wide_path(path).unwrap();
+            // SAFETY: wide is NUL-terminated and names only this disposable fixture.
+            assert_ne!(
+                unsafe { SetFileAttributesW(wide.as_ptr(), original | FILE_ATTRIBUTE_HIDDEN) },
+                0
+            );
+            let changed = windows_handle_attributes(held);
+            let expected = held.metadata().unwrap().file_attributes();
+            // Restore before assertions so an unexpected result leaves no changed fixture.
+            // SAFETY: wide still names the same disposable file or directory.
+            assert_ne!(unsafe { SetFileAttributesW(wide.as_ptr(), original) }, 0);
+            assert_eq!(changed.unwrap(), expected);
+            assert_ne!(expected & FILE_ATTRIBUTE_HIDDEN, 0);
+        }
+        validate_windows_private_file(&path, &file, "test file").unwrap();
+        validate_windows_private_directory(&private, "test directory").unwrap();
+        let error = validate_windows_private_directory(&path, "test directory").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("must be a directory"));
+        assert_eq!(fs::read(&path).unwrap(), b"unchanged");
+        let after = WINDOWS_HANDLE_METADATA_PROBES.with(|count| count.get());
+        assert_eq!(
+            after - before,
+            0,
+            "live handle attribute validation must not request complete metadata"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_handle_attribute_probe_falls_back_on_a_real_api_failure() {
+        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        };
+
+        let temporary = tempdir().unwrap();
+        let path = temporary.path().join("held-file");
+        fs::write(&path, b"unchanged").unwrap();
+        let file = File::open(&path).unwrap();
+        let directory = OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(temporary.path())
+            .unwrap();
+        for held in [&file, &directory] {
+            let expected = held.metadata().unwrap().file_attributes();
+            let before = WINDOWS_HANDLE_METADATA_PROBES.with(|count| count.get());
+            FORCE_HANDLE_ATTRIBUTE_QUERY_FAILURE.with(|force| force.set(true));
+            let observed = windows_handle_attributes(held);
+            assert!(!FORCE_HANDLE_ATTRIBUTE_QUERY_FAILURE.with(|force| force.get()));
+            assert_eq!(observed.unwrap(), expected);
+            let after = WINDOWS_HANDLE_METADATA_PROBES.with(|count| count.get());
+            assert_eq!(
+                after - before,
+                1,
+                "the rejected native query must fall back"
+            );
+            // The successful next probe must not inherit the injected failure.
+            assert_eq!(windows_handle_attributes(held).unwrap(), expected);
+            assert_eq!(
+                WINDOWS_HANDLE_METADATA_PROBES.with(|count| count.get()),
+                after
+            );
+        }
+        assert_eq!(fs::read(path).unwrap(), b"unchanged");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_handle_attribute_probe_keeps_nofollow_junction_attributes() {
+        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        };
+
+        let temporary = tempdir().unwrap();
+        let target = temporary.path().join("target");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("sentinel"), b"unchanged").unwrap();
+        let junction = temporary.path().join("junction");
+        let output = std::process::Command::new("cmd.exe")
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&target)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let held = OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&junction)
+            .unwrap();
+        let before = WINDOWS_HANDLE_METADATA_PROBES.with(|count| count.get());
+        let observed = windows_handle_attributes(&held);
+        let expected = held.metadata().unwrap().file_attributes();
+        let file_check = validate_windows_private_file(&junction, &held, "test junction");
+        let directory_check = validate_windows_private_directory(&junction, "test junction");
+        drop(held);
+        // Remove only the fixture junction, never recursively traverse its target.
+        fs::remove_dir(&junction).unwrap();
+        assert_eq!(observed.unwrap(), expected);
+        assert!(windows_attributes_are_reparse(expected));
+        assert_eq!(file_check.unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            directory_check.unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            WINDOWS_HANDLE_METADATA_PROBES.with(|count| count.get()),
+            before
+        );
+        assert_eq!(fs::read(target.join("sentinel")).unwrap(), b"unchanged");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_reparse_attribute_probe_avoids_full_metadata_for_deep_paths() {
+        use std::os::windows::ffi::OsStrExt;
+        use std::os::windows::fs::MetadataExt;
+
+        let directory = tempdir().unwrap();
+        let mut deep = directory.path().to_path_buf();
+        for _ in 0..6 {
+            deep.push("deep-usage-state-\u{7528}\u{6237}-01234567890123456789");
+        }
+        fs::create_dir_all(&deep).unwrap();
+        assert!(deep.as_os_str().encode_wide().count() > 260);
+        let canonical = fs::canonicalize(&deep).unwrap();
+        let slash_spelling = PathBuf::from(deep.to_str().unwrap().replace('\\', "/"));
+        let dot_spelling = deep.join(".");
+
+        for path in [&deep, &canonical, &slash_spelling, &dot_spelling] {
+            assert_eq!(
+                windows_path_attributes(path).unwrap(),
+                fs::symlink_metadata(path).unwrap().file_attributes(),
+            );
+            let before = WINDOWS_REPARSE_PROBE_COUNTS.with(|counts| counts.get());
+            reject_windows_reparse_components(path, "deep test directory").unwrap();
+            let after = WINDOWS_REPARSE_PROBE_COUNTS.with(|counts| counts.get());
+            let ancestor_count = path
+                .ancestors()
+                .filter(|component| !component.as_os_str().is_empty())
+                .count();
+            assert_eq!(
+                after.full_metadata_probes - before.full_metadata_probes,
+                0,
+                "an existing directory walk must not open every ancestor for full metadata",
+            );
+            assert_eq!(
+                after.attribute_probes - before.attribute_probes,
+                ancestor_count,
+                "each ancestor still needs a fresh reparse attribute check",
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_reparse_attribute_probe_preserves_missing_and_invalid_paths() {
+        let directory = tempdir().unwrap();
+        let missing = directory.path().join("missing").join("nested");
+        assert_eq!(
+            windows_path_attributes(&missing).unwrap_err().kind(),
+            fs::symlink_metadata(&missing).unwrap_err().kind(),
+        );
+        reject_windows_reparse_components(&missing, "missing test directory").unwrap();
+        assert!(!missing.exists());
+
+        for name in ["invalid\0name", "invalid<name"] {
+            let invalid = directory.path().join(name);
+            let expected = fs::symlink_metadata(&invalid).unwrap_err().kind();
+            assert_ne!(expected, io::ErrorKind::NotFound);
+            assert_eq!(
+                windows_path_attributes(&invalid).unwrap_err().kind(),
+                expected,
+            );
+            assert_eq!(
+                reject_windows_reparse_components(&invalid, "invalid test directory")
+                    .unwrap_err()
+                    .kind(),
+                expected,
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_reparse_attribute_probe_rejects_junction_and_missing_descendant() {
+        use std::os::windows::fs::MetadataExt;
+
+        let directory = tempdir().unwrap();
+        let outside = directory.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("sentinel"), b"unchanged").unwrap();
+        let junction = directory.path().join("junction");
+        let output = std::process::Command::new("cmd.exe")
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&outside)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+
+        let attributes = windows_path_attributes(&junction);
+        let paths = [
+            junction.clone(),
+            PathBuf::from(format!("{}\\", junction.display())),
+            PathBuf::from(format!("{}/", junction.display())),
+            junction.join("missing").join("nested"),
+            junction.join("..").join("outside"),
+            junction.join(".").join("missing"),
+        ];
+        let results = paths.map(|path| {
+            let observed = windows_path_attributes(&path).map_err(|error| error.kind());
+            let original = fs::symlink_metadata(&path)
+                .map(|metadata| metadata.file_attributes())
+                .map_err(|error| error.kind());
+            let rejected = reject_windows_reparse_components(&path, "test junction descendant");
+            (path, observed, original, rejected)
+        });
+        // Remove only the junction, never recurse into its target.
+        fs::remove_dir(&junction).unwrap();
+
+        assert!(windows_attributes_are_reparse(attributes.unwrap()));
+        for (path, observed, original, result) in results {
+            assert_eq!(observed, original, "{}", path.display());
+            let error = result.unwrap_err();
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::InvalidData,
+                "{}",
+                path.display()
+            );
+            assert!(
+                error
+                    .to_string()
+                    .contains("must not traverse a reparse point")
+            );
+        }
+        assert_eq!(fs::read(outside.join("sentinel")).unwrap(), b"unchanged");
+        assert!(!outside.join("missing").exists());
     }
 
     #[test]

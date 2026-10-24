@@ -385,18 +385,18 @@ impl SourceHistoryStore {
         redaction: RedactionProfile,
     ) -> io::Result<u64> {
         let database = self.sqlite_database().expect("SQLite history backend");
-        if !database.exists()? {
-            return Ok(0);
-        }
-        database.read(|connection| {
-            let key = database.namespace(
-                &self
-                    .source_directory(source)
-                    .join(redaction.directory_name())
-                    .join(REMOTE_PUBLICATION_REVISION_FILE),
-            )?;
-            Ok(database::state::<u64>(connection, &key)?.unwrap_or(0))
-        })
+
+        database
+            .read_if_exists(|connection| {
+                let key = database.namespace(
+                    &self
+                        .source_directory(source)
+                        .join(redaction.directory_name())
+                        .join(REMOTE_PUBLICATION_REVISION_FILE),
+                )?;
+                Ok(database::state::<u64>(connection, &key)?.unwrap_or(0))
+            })
+            .map(|value| value.unwrap_or_default())
     }
 
     pub(super) fn advance_remote_history_projection_revision(

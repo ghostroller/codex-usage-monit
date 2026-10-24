@@ -959,14 +959,14 @@ impl SourceHistoryStore {
     /// without publishing another local observation or remote aggregate page.
     pub(crate) fn load_facts_projection_revision(&self) -> io::Result<u64> {
         let database = self.sqlite_database().expect("SQLite history backend");
-        if !database.exists()? {
-            return Ok(0);
-        }
-        database.read(|connection| {
-            let key =
-                database.namespace(&self.profile_directory().join(FACTS_QUERY_PUBLICATION_FILE))?;
-            Ok(database::state::<u64>(connection, &key)?.unwrap_or(0))
-        })
+
+        database
+            .read_if_exists(|connection| {
+                let key = database
+                    .namespace(&self.profile_directory().join(FACTS_QUERY_PUBLICATION_FILE))?;
+                Ok(database::state::<u64>(connection, &key)?.unwrap_or(0))
+            })
+            .map(|value| value.unwrap_or_default())
     }
 
     /// Called in the same transaction that changes query-visible facts/proof.
@@ -988,17 +988,17 @@ impl SourceHistoryStore {
     /// Unlike observation and remote-page stamps this also covers independent GC.
     pub(crate) fn load_history_gc_projection_revision(&self) -> io::Result<u64> {
         let database = self.sqlite_database().expect("SQLite history backend");
-        if !database.exists()? {
-            return Ok(0);
-        }
-        database.read(|connection| {
-            let key = database.namespace(
-                &self
-                    .profile_directory()
-                    .join(GARBAGE_COLLECTION_PUBLICATION_FILE),
-            )?;
-            Ok(database::state::<u64>(connection, &key)?.unwrap_or(0))
-        })
+
+        database
+            .read_if_exists(|connection| {
+                let key = database.namespace(
+                    &self
+                        .profile_directory()
+                        .join(GARBAGE_COLLECTION_PUBLICATION_FILE),
+                )?;
+                Ok(database::state::<u64>(connection, &key)?.unwrap_or(0))
+            })
+            .map(|value| value.unwrap_or_default())
     }
 
     pub fn new(state_root: PathBuf, profile_id: HistoryProfileId) -> Self {
@@ -1321,10 +1321,7 @@ impl SourceHistoryStore {
     pub fn list_source_metadata(&self) -> io::Result<Vec<SourceMetadata>> {
         let database = self.sqlite_database().expect("SQLite history backend");
 
-        if !database.exists()? {
-            return Ok(Vec::new());
-        }
-        database.read(|connection| {
+        database.read_if_exists(|connection| {
                 let prefix = format!("{}/", database.namespace(&self.sources_directory())?);
                 let mut sources = Vec::new();
                 let mut statement = connection.prepare("SELECT state_key,payload FROM history_state WHERE substr(state_key,1,length(?1))=?1 AND substr(state_key,-12)='/source.json' ORDER BY state_key").map_err(database::sql_error)?;
@@ -1355,7 +1352,7 @@ impl SourceHistoryStore {
                     left.source_id().as_str().cmp(right.source_id().as_str())
                 });
                 Ok(sources)
-            })
+            }).map(|value| value.unwrap_or_default())
     }
 
     /// Loads each included source into a separate result. Detached sources
@@ -1499,35 +1496,34 @@ impl SourceHistoryStore {
     ) -> io::Result<AccountHistoryData> {
         let database = self.sqlite_database().expect("SQLite history backend");
 
-        if !database.exists()? {
-            return Ok(AccountHistoryData::default());
-        }
-        database.read(|connection| {
-            let namespace = database.namespace(&self.account_directory())?;
-            let values = database::records::<QuotaPoint>(
-                connection,
-                &namespace,
-                since.timestamp_millis(),
-                budget,
-            )?;
-            let mut points = Vec::new();
-            let mut index = HashMap::new();
-            for point in values {
-                validate_account_quota_point(&point)?;
-                if point.observed_at >= since {
-                    apply_account_quota_point(&mut points, &mut index, point)?;
+        database
+            .read_if_exists(|connection| {
+                let namespace = database.namespace(&self.account_directory())?;
+                let values = database::records::<QuotaPoint>(
+                    connection,
+                    &namespace,
+                    since.timestamp_millis(),
+                    budget,
+                )?;
+                let mut points = Vec::new();
+                let mut index = HashMap::new();
+                for point in values {
+                    validate_account_quota_point(&point)?;
+                    if point.observed_at >= since {
+                        apply_account_quota_point(&mut points, &mut index, point)?;
+                    }
                 }
-            }
-            points.sort_by(|left, right| {
-                left.observed_at
-                    .cmp(&right.observed_at)
-                    .then_with(|| left.duration_mins.cmp(&right.duration_mins))
-                    .then_with(|| left.resets_at.cmp(&right.resets_at))
-            });
-            Ok(AccountHistoryData {
-                quota_points: points,
+                points.sort_by(|left, right| {
+                    left.observed_at
+                        .cmp(&right.observed_at)
+                        .then_with(|| left.duration_mins.cmp(&right.duration_mins))
+                        .then_with(|| left.resets_at.cmp(&right.resets_at))
+                });
+                Ok(AccountHistoryData {
+                    quota_points: points,
+                })
             })
-        })
+            .map(|value| value.unwrap_or_default())
     }
 
     /// Loads exactly one source and redaction namespace. This deliberately
@@ -1616,34 +1612,33 @@ impl SourceHistoryStore {
     ) -> io::Result<Vec<SourceBucketRecord>> {
         let database = self.sqlite_database().expect("SQLite history backend");
 
-        if !database.exists()? {
-            return Ok(Vec::new());
-        }
-        database.read(|connection| {
-            let namespace = database.namespace(directory)?;
-            let floor = since
-                .checked_sub_signed(Duration::seconds(SOURCE_BUCKET_SECONDS))
-                .unwrap_or(DateTime::<Utc>::MIN_UTC);
-            let values = database::records::<SourceBucketRecord>(
-                connection,
-                &namespace,
-                floor.timestamp_millis(),
-                budget,
-            )?;
-            let mut records = Vec::new();
-            let mut index = HashMap::new();
-            for record in values {
-                record.validate()?;
-                if source_record_intersects_since(&record, since) {
-                    apply_source_bucket_record(&mut records, &mut index, record)?;
+        database
+            .read_if_exists(|connection| {
+                let namespace = database.namespace(directory)?;
+                let floor = since
+                    .checked_sub_signed(Duration::seconds(SOURCE_BUCKET_SECONDS))
+                    .unwrap_or(DateTime::<Utc>::MIN_UTC);
+                let values = database::records::<SourceBucketRecord>(
+                    connection,
+                    &namespace,
+                    floor.timestamp_millis(),
+                    budget,
+                )?;
+                let mut records = Vec::new();
+                let mut index = HashMap::new();
+                for record in values {
+                    record.validate()?;
+                    if source_record_intersects_since(&record, since) {
+                        apply_source_bucket_record(&mut records, &mut index, record)?;
+                    }
                 }
-            }
-            if redaction_profile == RedactionProfile::Redacted {
-                redact_source_records(&mut records);
-            }
-            records.sort_by_key(|record| record.starts_at);
-            Ok(records)
-        })
+                if redaction_profile == RedactionProfile::Redacted {
+                    redact_source_records(&mut records);
+                }
+                records.sort_by_key(|record| record.starts_at);
+                Ok(records)
+            })
+            .map(|value| value.unwrap_or_default())
     }
 
     fn load_source_weekly_records_since_with_budget(
@@ -1655,29 +1650,28 @@ impl SourceHistoryStore {
     ) -> io::Result<Vec<SourceWeeklyRecord>> {
         let database = self.sqlite_database().expect("SQLite history backend");
 
-        if !database.exists()? {
-            return Ok(Vec::new());
-        }
-        database.read(|connection| {
-            let namespace =
-                database.namespace(&self.source_weekly_directory(source_id, redaction_profile))?;
-            let values = database::records::<SourceWeeklyRecord>(
-                connection,
-                &namespace,
-                since.timestamp_millis(),
-                budget,
-            )?;
-            let mut records = Vec::new();
-            let mut index = HashMap::new();
-            for record in values {
-                record.validate()?;
-                if record.observed_at >= since {
-                    apply_source_weekly_record(&mut records, &mut index, record)?;
+        database
+            .read_if_exists(|connection| {
+                let namespace = database
+                    .namespace(&self.source_weekly_directory(source_id, redaction_profile))?;
+                let values = database::records::<SourceWeeklyRecord>(
+                    connection,
+                    &namespace,
+                    since.timestamp_millis(),
+                    budget,
+                )?;
+                let mut records = Vec::new();
+                let mut index = HashMap::new();
+                for record in values {
+                    record.validate()?;
+                    if record.observed_at >= since {
+                        apply_source_weekly_record(&mut records, &mut index, record)?;
+                    }
                 }
-            }
-            records.sort_by_key(|record| (record.observed_at, record.resets_at));
-            Ok(records)
-        })
+                records.sort_by_key(|record| (record.observed_at, record.resets_at));
+                Ok(records)
+            })
+            .map(|value| value.unwrap_or_default())
     }
 
     /// Projects source-scoped revision records into live buckets. Tombstones

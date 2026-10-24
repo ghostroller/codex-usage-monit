@@ -759,18 +759,20 @@ pub(crate) fn history_projection_revision(
     // All SQL stamps and source policy belong to one short read snapshot.
     // Facade reads retain their path/permission checks but share this open
     // connection instead of opening a database for every individual stamp.
-    // Ownership and project mappings live outside SQL, so still read both
-    // complete probes and reject changes to those inputs. Nothing writes or
-    // collects while this snapshot is held, and it ends before the caller's
-    // usage query, cache delivery or next observation commit.
+    // SQL inputs cannot change within this snapshot, so read them only once.
+    // Ownership and project mappings live outside SQL: read both before and
+    // after, validating the activation receipt against each manifest. Nothing
+    // writes or collects while this snapshot is held, and it ends before the
+    // caller's usage query, cache delivery or next observation commit.
     database.read(|_| {
-        let Some(before) = history_projection_revision_once(runtime, selection)? else {
+        let Some(before) = history_projection_external_inputs(runtime)? else {
             return Ok(None);
         };
-        let Some(after) = history_projection_revision_once(runtime, selection)? else {
+        let revision = history_projection_sql_revision(runtime, selection, &before)?;
+        let Some(after) = history_projection_external_inputs(runtime)? else {
             return Ok(None);
         };
-        Ok((before == after).then_some(after))
+        Ok((before == after).then_some(revision))
     })
 }
 
@@ -780,10 +782,15 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-fn history_projection_revision_once(
+#[derive(Debug, PartialEq, Eq)]
+struct HistoryProjectionExternalInputs {
+    ownership: OwnershipManifestStatus,
+    project_mapping_revision: u64,
+}
+
+fn history_projection_external_inputs(
     runtime: &HistoryRuntime,
-    selection: &HistorySourceSelection,
-) -> io::Result<Option<HistoryProjectionRevision>> {
+) -> io::Result<Option<HistoryProjectionExternalInputs>> {
     let ownership = runtime.ownership().load_manifest()?;
     if !matches!(
         &ownership,
@@ -806,6 +813,17 @@ fn history_projection_revision_once(
         Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
         Err(error) => return Err(error),
     };
+    Ok(Some(HistoryProjectionExternalInputs {
+        ownership,
+        project_mapping_revision,
+    }))
+}
+
+fn history_projection_sql_revision(
+    runtime: &HistoryRuntime,
+    selection: &HistorySourceSelection,
+    external_inputs: &HistoryProjectionExternalInputs,
+) -> io::Result<HistoryProjectionRevision> {
     let local_observation_revision = runtime
         .source_history()
         .load_local_observation_projection_revision(
@@ -870,15 +888,15 @@ fn history_projection_revision_once(
             Ok((source, active, publication_revision))
         })
         .collect::<io::Result<Vec<_>>>()?;
-    Ok(Some(HistoryProjectionRevision {
-        ownership,
-        project_mapping_revision,
+    Ok(HistoryProjectionRevision {
+        ownership: external_inputs.ownership.clone(),
+        project_mapping_revision: external_inputs.project_mapping_revision,
         local_observation_revision,
         other_local_observation_revision,
         garbage_collection_revision,
         facts_revision,
         sources,
-    }))
+    })
 }
 
 #[cfg(test)]
@@ -929,6 +947,96 @@ mod tests {
                 crate::source_history::LocalObservationMode::Incremental,
             )
             .unwrap();
+    }
+
+    #[test]
+    fn projection_revision_reads_sql_inputs_once_within_a_bounded_read_budget() {
+        let (_directory, mut runtime) = projection_runtime();
+        let active = runtime.ensure_v2_active().unwrap();
+        let observed_at = DateTime::parse_from_rfc3339("2026-10-03T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        record_projection_observation(&runtime, observed_at);
+        let database = runtime.source_history().sqlite_database().unwrap();
+        let (revision, reads) = database.measure_io(|| {
+            history_projection_revision(&runtime, &HistorySourceSelection::AllIncluded)
+        });
+        let revision = revision.unwrap().unwrap();
+        assert_eq!(
+            revision.ownership,
+            OwnershipManifestStatus::Initialized(active)
+        );
+        assert_eq!(revision.project_mapping_revision, 0);
+        assert!(revision.local_observation_revision > 0);
+        assert_eq!(revision.other_local_observation_revision, 0);
+        assert_eq!(revision.garbage_collection_revision, 0);
+        assert_eq!(revision.facts_revision, 0);
+        assert_eq!(revision.sources.len(), 1);
+        assert_eq!(
+            revision.sources[0].0.source_id(),
+            runtime.source_identity().node_id()
+        );
+        assert!(revision.sources[0].0.include_in_aggregates());
+        assert_eq!(revision.sources[0].1, None);
+        assert_eq!(revision.sources[0].2, 0);
+        assert_eq!(reads.connection_opens, 1, "{reads:?}");
+        // One outer read, both receipt fences, and five SQL input reads.
+        // Count actual database calls so another full probe cannot hide behind
+        // the same connection; elapsed time is not part of this contract.
+        assert!(
+            reads.calls <= 8,
+            "projection revision exceeded its read budget: {reads:?}"
+        );
+        assert_eq!(
+            reads.existence_checks, 0,
+            "an active canonical read snapshot must validate its opened database instead of probing existence again: {reads:?}"
+        );
+        assert!(!database.is_transaction_active());
+    }
+
+    #[test]
+    fn projection_revision_revalidates_receipt_after_external_ownership_change() {
+        let (_directory, mut runtime) = projection_runtime();
+        let active = runtime.ensure_v2_active().unwrap();
+        let observed_at = DateTime::parse_from_rfc3339("2026-10-03T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        record_projection_observation(&runtime, observed_at);
+        let manifest_path = runtime.ownership().manifest_path();
+        let original = std::fs::read(&manifest_path).unwrap();
+        let mut changed: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        changed["epoch"] = serde_json::json!(active.epoch() + 1);
+        let changed = serde_json::to_vec(&changed).unwrap();
+        let hook_manifest_path = manifest_path.clone();
+        PROJECTION_REVISION_READ_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                // Preserve the existing private file while simulating a valid
+                // external epoch change without its matching SQLite receipt.
+                std::fs::write(hook_manifest_path, changed).unwrap();
+            }));
+        });
+        let result = history_projection_revision(&runtime, &HistorySourceSelection::AllIncluded);
+        std::fs::write(manifest_path, original).unwrap();
+        let error = result.expect_err("an epoch change must still validate its activation receipt");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            error
+                .to_string()
+                .contains("SQLite history activation receipt does not match ownership"),
+            "{error}"
+        );
+        assert!(
+            !runtime
+                .source_history()
+                .sqlite_database()
+                .unwrap()
+                .is_transaction_active()
+        );
+        assert!(
+            history_projection_revision(&runtime, &HistorySourceSelection::AllIncluded)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]

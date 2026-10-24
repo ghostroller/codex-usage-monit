@@ -256,28 +256,28 @@ impl SourceHistoryStore {
         budget: &mut SourceHistoryReadBudget,
     ) -> io::Result<Vec<SourceSessionDigestRecord>> {
         let database = self.sqlite_database().expect("SQLite backend");
-        if !database.exists()? {
-            return Ok(Vec::new());
-        }
-        database.read(|connection| {
-            let namespace = database.namespace(directory)?;
-            let values = database::records::<SourceSessionDigestRecord>(
-                connection,
-                &namespace,
-                since.timestamp_millis(),
-                budget,
-            )?;
-            group_digest_records_by_day(source_id, &values)?;
-            let mut records = Vec::new();
-            let mut index = HashMap::new();
-            for record in values {
-                if digest_record_intersects_since(&record, since) {
-                    apply_digest_record(&mut records, &mut index, record)?;
+
+        database
+            .read_if_exists(|connection| {
+                let namespace = database.namespace(directory)?;
+                let values = database::records::<SourceSessionDigestRecord>(
+                    connection,
+                    &namespace,
+                    since.timestamp_millis(),
+                    budget,
+                )?;
+                group_digest_records_by_day(source_id, &values)?;
+                let mut records = Vec::new();
+                let mut index = HashMap::new();
+                for record in values {
+                    if digest_record_intersects_since(&record, since) {
+                        apply_digest_record(&mut records, &mut index, record)?;
+                    }
                 }
-            }
-            sort_digest_records(&mut records);
-            Ok(records)
-        })
+                sort_digest_records(&mut records);
+                Ok(records)
+            })
+            .map(|value| value.unwrap_or_default())
     }
 
     pub(super) fn sqlite_read_fact_manifest(
@@ -289,29 +289,29 @@ impl SourceHistoryStore {
         budget: Option<&mut SourceHistoryReadBudget>,
     ) -> io::Result<Option<ActiveFactManifest>> {
         let database = self.sqlite_database().expect("SQLite backend");
-        if !database.exists()? {
-            return Ok(None);
-        }
-        database.read(|connection| {
-            let key = manifest_key(self, &database, source_id, redaction, shard_key)?;
-            let manifest = sqlite_state_bounded::<ActiveFactManifest>(
-                connection,
-                &key,
-                MAX_FACT_MANIFEST_BYTES,
-                budget,
-            )?;
-            if let Some(manifest) = &manifest {
-                validate_active_manifest(
-                    manifest,
-                    &self.profile_id,
-                    source_id,
-                    redaction,
-                    replica,
-                    shard_key,
+
+        database
+            .read_if_exists(|connection| {
+                let key = manifest_key(self, &database, source_id, redaction, shard_key)?;
+                let manifest = sqlite_state_bounded::<ActiveFactManifest>(
+                    connection,
+                    &key,
+                    MAX_FACT_MANIFEST_BYTES,
+                    budget,
                 )?;
-            }
-            Ok(manifest)
-        })
+                if let Some(manifest) = &manifest {
+                    validate_active_manifest(
+                        manifest,
+                        &self.profile_id,
+                        source_id,
+                        redaction,
+                        replica,
+                        shard_key,
+                    )?;
+                }
+                Ok(manifest)
+            })
+            .map(|value| value.flatten())
     }
 
     pub(super) fn sqlite_read_fact_generation(

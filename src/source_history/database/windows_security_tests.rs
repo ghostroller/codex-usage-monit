@@ -1,6 +1,7 @@
 //! Exercise live permission changes on disposable SQLite objects with Win32.
 
 use super::*;
+use crate::source_history::SourceHistoryStore;
 use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::ptr;
 
@@ -185,15 +186,22 @@ fn live_db_wal_shm_dacl_broadening_refuses_nested_use_and_rolls_back() {
         database
             .write(|connection| set_state(connection, "committed", &true))
             .unwrap();
+        let database = HistoryDatabase::new(
+            &fs::canonicalize(&database.state_root).unwrap(),
+            &database.profile,
+        );
+        let store =
+            SourceHistoryStore::new_sqlite(database.state_root.clone(), database.profile.clone());
         let result = database.write(|connection| {
             set_state(connection, "uncommitted", &true)?;
             let object = side_file_path(database.path(), suffix);
             assert!(object.exists(), "SQLite must have opened object {suffix:?}");
-            let mut changed = FixtureDacl::allow_everyone_read(&object, directory.path())?;
+            let mut changed = FixtureDacl::allow_everyone_read(&object, &database.state_root)?;
             // The already-open database must inspect the live ACL again before
             // invoking application code, even though its identity is unchanged.
-            let fenced = database.read::<()>(|_| panic!("a public SQLite object was accepted"));
+            let (fenced, stats) = database.measure_io(|| store.load_facts_projection_revision());
             changed.restore()?;
+            assert_eq!(stats.existence_checks, 0);
             assert_eq!(
                 fenced.as_ref().unwrap_err().kind(),
                 io::ErrorKind::PermissionDenied,

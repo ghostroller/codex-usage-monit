@@ -220,11 +220,18 @@ pub(super) fn record_observation(
             store.record_source_weekly_changes_unfenced(identity.node_id(), redaction, &weekly)?;
         #[cfg(test)]
         fail_after_local_observation_stage("weekly")?;
-        let digest_history = store.record_source_session_digest_changes_unfenced(
-            identity.node_id(),
-            redaction,
-            &digests,
-        )?;
+        // Prepared records include reconciliation tombstones. Only a truly
+        // empty family can skip dispatch; metadata and publication fences
+        // still belong to this enclosing observation transaction.
+        let digest_history = if digests.is_empty() {
+            SourceHistoryWriteReport::default()
+        } else {
+            store.record_source_session_digest_changes_unfenced(
+                identity.node_id(),
+                redaction,
+                &digests,
+            )?
+        };
         #[cfg(test)]
         fail_after_local_observation_stage("session_digests")?;
         writer.validate()?;
@@ -323,21 +330,22 @@ pub(super) fn load_projection_revision(
     redaction: RedactionProfile,
 ) -> io::Result<u64> {
     let database = database(store)?;
-    if !database.exists()? {
-        return Ok(0);
-    }
-    let key = committed_key(&database, store, identity.node_id(), redaction)?;
-    let high_water_key = revision_key(&database, store, identity.node_id(), redaction)?;
-    database.read(|connection| {
-        let high_water = read_revision(connection, &high_water_key, store, identity, redaction)?;
-        let published = read_revision(connection, &key, store, identity, redaction)?;
-        if published > high_water {
-            return Err(invalid_data(
-                "local observation committed revision exceeds its high-water",
-            ));
-        }
-        Ok(published)
-    })
+
+    database
+        .read_if_exists(|connection| {
+            let key = committed_key(&database, store, identity.node_id(), redaction)?;
+            let high_water_key = revision_key(&database, store, identity.node_id(), redaction)?;
+            let high_water =
+                read_revision(connection, &high_water_key, store, identity, redaction)?;
+            let published = read_revision(connection, &key, store, identity, redaction)?;
+            if published > high_water {
+                return Err(invalid_data(
+                    "local observation committed revision exceeds its high-water",
+                ));
+            }
+            Ok(published)
+        })
+        .map(|value| value.unwrap_or_default())
 }
 
 pub(super) fn load_snapshot(
@@ -409,20 +417,20 @@ pub(super) fn load_backfill(
     epoch: u64,
 ) -> io::Result<Option<V2SummaryBackfillAttempt>> {
     let database = database(store)?;
-    if !database.exists()? {
-        return Ok(None);
-    }
-    let key = marker_key(&database, store, redaction)?;
-    database.read(|connection| {
-        let Some(marker) =
-            sqlite_state_bounded::<BackfillMarker>(connection, &key, MAX_STATE_BYTES, None)?
-        else {
-            return Ok(None);
-        };
-        validate_marker(store, redaction, epoch, &marker)?;
-        Ok(Some(V2SummaryBackfillAttempt {
-            completed_at: marker.completed_at,
-            complete: marker.complete,
-        }))
-    })
+
+    database
+        .read_if_exists(|connection| {
+            let key = marker_key(&database, store, redaction)?;
+            let Some(marker) =
+                sqlite_state_bounded::<BackfillMarker>(connection, &key, MAX_STATE_BYTES, None)?
+            else {
+                return Ok(None);
+            };
+            validate_marker(store, redaction, epoch, &marker)?;
+            Ok(Some(V2SummaryBackfillAttempt {
+                completed_at: marker.completed_at,
+                complete: marker.complete,
+            }))
+        })
+        .map(|value| value.flatten())
 }
