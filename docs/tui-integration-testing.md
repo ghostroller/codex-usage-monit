@@ -27,6 +27,13 @@ cargo test --locked --all-targets
   exit. The interaction test runs on Unix PTYs and Windows ConPTY through
   `portable-pty`; the SIGTERM/SIGHUP/SIGINT terminal-restoration test remains
   Unix-only.
+- `src/session_delete/protocol_tests.rs` uses an isolated, already-running
+  WebSocket App Server fixture and a mock of the official raw proxy. It verifies
+  durable usage capture, endpoint identity, deletion notifications and failures
+  without starting a fallback App Server or touching real sessions. Live desktop
+  acceptance is separate: create an explicitly identified disposable session,
+  observe its sidebar entry, delete it through monit, and confirm it disappears
+  without refreshing or restarting the desktop client.
 
 Follow [local-first testing](testing.md): use Docker Linux, the UTM Windows VM,
 and the macOS host before requesting a consolidated hosted checkpoint. Manual

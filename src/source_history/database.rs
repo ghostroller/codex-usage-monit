@@ -969,7 +969,10 @@ fn validate_windows_file_handle(
 }
 
 #[cfg(windows)]
-fn validate_windows_sqlite_handle(connection: &Connection, guard: &File) -> io::Result<()> {
+pub(crate) fn validate_windows_sqlite_handle(
+    connection: &Connection,
+    guard: &File,
+) -> io::Result<()> {
     use windows_sys::Win32::Foundation::HANDLE;
     let mut handle: HANDLE = std::ptr::null_mut();
     // Borrow the actual SQLite HANDLE; never transfer ownership or close it.

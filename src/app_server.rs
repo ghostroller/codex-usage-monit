@@ -525,6 +525,493 @@ pub fn fetch_account_snapshot(config: &CollectConfig) -> Result<AccountSnapshot>
     fetch_account_snapshot_inner(config, None, app_server_rpc_deadline)
 }
 
+/// Explicit local session management, separate from account collection. Only
+/// `delete_thread` mutates sessions; callers must persist their audit first.
+#[path = "app_server/shared_session_transport.rs"]
+mod shared_session_transport;
+
+pub(crate) mod session_management {
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+
+    use anyhow::ensure;
+
+    pub(crate) use super::shared_session_transport::SharedEndpointIdentity;
+    use super::shared_session_transport::SharedSessionTransport;
+    use super::*;
+
+    pub(crate) const MAX_DELETION_THREADS: usize = 512;
+    const MAX_LIST_PAGES: usize = 32;
+    // Persisted history can be much larger than the recent rollout window.
+    // Keep its absence check separately bounded from one deletion's descendants.
+    const MAX_INVENTORY_PAGES: usize = 128;
+    const ALL_SOURCE_KINDS: [&str; 10] = [
+        "cli",
+        "vscode",
+        "exec",
+        "appServer",
+        "subAgent",
+        "subAgentReview",
+        "subAgentCompact",
+        "subAgentThreadSpawn",
+        "subAgentOther",
+        "unknown",
+    ];
+    const MANAGEMENT_LIFETIME: Duration = Duration::from_secs(120);
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(crate) struct ManagedThread {
+        pub(crate) id: String,
+        pub(crate) parent_thread_id: Option<String>,
+        pub(crate) path: PathBuf,
+        pub(crate) name: Option<String>,
+        pub(crate) runtime_status: String,
+        pub(crate) ephemeral: bool,
+    }
+
+    #[derive(Debug)]
+    pub(crate) struct ManagementRpcError {
+        pub(crate) code: Option<i64>,
+        pub(crate) message: String,
+    }
+
+    impl std::fmt::Display for ManagementRpcError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{} (RPC code {:?})", self.message, self.code)
+        }
+    }
+
+    impl std::error::Error for ManagementRpcError {}
+
+    pub(crate) fn resolve_executable(config: &CollectConfig) -> Result<PathBuf> {
+        let command = codex_command(config)?;
+        let program = std::path::Path::new(command.get_program());
+        if program.components().count() > 1 || program.is_absolute() {
+            return std::fs::canonicalize(program).context("local Codex executable is unavailable");
+        }
+        let path = config
+            .app_server_path
+            .clone()
+            .or_else(|| std::env::var_os("PATH"))
+            .context("PATH is unavailable for local Codex resolution")?;
+        for directory in std::env::split_paths(&path) {
+            let candidate = directory.join(program);
+            if candidate.is_file() {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if std::fs::metadata(&candidate)?.permissions().mode() & 0o111 == 0 {
+                        continue;
+                    }
+                }
+                return std::fs::canonicalize(candidate)
+                    .context("local Codex executable is unavailable");
+            }
+        }
+        bail!("local Codex executable was not found in PATH")
+    }
+
+    pub(crate) fn is_missing_thread(error: &anyhow::Error, thread_id: &str) -> bool {
+        let Some(rpc) = error.downcast_ref::<ManagementRpcError>() else {
+            return false;
+        };
+        // Never turn a generic I/O/protocol failure into proof of deletion.
+        // These are the explicit local thread/read not-found diagnostics.
+        let message = rpc.message.to_ascii_lowercase();
+        matches!(rpc.code, Some(-32600 | -32602 | -32004))
+            && [
+                "thread not found",
+                "thread was not found",
+                "no rollout found for thread id",
+                "no session found for",
+                "thread does not exist",
+            ]
+            .iter()
+            .filter_map(|prefix| message.strip_prefix(*prefix))
+            .any(|suffix| {
+                suffix
+                    .trim_start_matches(|character: char| {
+                        character.is_whitespace() || matches!(character, ':' | '\'' | '"' | '`')
+                    })
+                    .split(|character: char| !character.is_ascii_hexdigit() && character != '-')
+                    .next()
+                    == Some(thread_id)
+            })
+    }
+
+    /// This is a runtime diagnostic, not proof that a persisted thread is gone.
+    /// Callers must independently prove deletion or persisted/file absence.
+    pub(crate) fn is_thread_not_loaded(error: &anyhow::Error, thread_id: &str) -> bool {
+        error
+            .downcast_ref::<ManagementRpcError>()
+            .is_some_and(|rpc| {
+                rpc.code == Some(-32600)
+                    && rpc
+                        .message
+                        .to_ascii_lowercase()
+                        .strip_prefix("thread not loaded:")
+                        .is_some_and(|suffix| suffix.trim() == thread_id)
+            })
+    }
+
+    pub(crate) struct SessionManagementClient {
+        transport: SharedSessionTransport,
+        timeout: Duration,
+        overall_deadline: Instant,
+        next_id: u64,
+    }
+
+    impl SessionManagementClient {
+        pub(crate) fn connect(config: &CollectConfig) -> Result<Self> {
+            if config.offline || config.app_server_timeout.is_zero() {
+                bail!("session management requires a local app-server with a nonzero timeout");
+            }
+            let overall_deadline = app_server_rpc_deadline(MANAGEMENT_LIFETIME)?;
+            let mut client = Self {
+                transport: SharedSessionTransport::connect(config, overall_deadline)?,
+                timeout: config.app_server_timeout,
+                overall_deadline,
+                next_id: 1,
+            };
+            client.rpc(
+                "initialize",
+                json!({
+                    "clientInfo": {"name":"codex-usage-monit-session-management","version":env!("CARGO_PKG_VERSION")},
+                    "capabilities": {"experimentalApi":true}
+                }),
+            )?;
+            client
+                .transport
+                .notify(json!({"method":"initialized"}), client.request_deadline()?)?;
+            Ok(client)
+        }
+
+        pub(crate) fn endpoint_identity(&self) -> &SharedEndpointIdentity {
+            self.transport.endpoint_identity()
+        }
+
+        fn request_deadline(&self) -> Result<Instant> {
+            Ok(app_server_rpc_deadline(self.timeout)?.min(self.overall_deadline))
+        }
+
+        fn rpc(&mut self, method: &str, params: Value) -> Result<Value> {
+            self.rpc_with_notifications(method, params, HashSet::new())
+        }
+
+        fn rpc_with_notifications(
+            &mut self,
+            method: &str,
+            params: Value,
+            expected_deleted: HashSet<String>,
+        ) -> Result<Value> {
+            let id = self.next_id;
+            self.next_id = self
+                .next_id
+                .checked_add(1)
+                .context("management request ID exhausted")?;
+            self.transport.rpc(
+                id,
+                method,
+                params,
+                expected_deleted,
+                self.request_deadline()?,
+            )
+        }
+
+        pub(crate) fn read_thread(&mut self, thread_id: &str) -> Result<ManagedThread> {
+            let result = self.rpc("thread/read", json!({"threadId":thread_id}))?;
+            let thread = parse_thread(result.get("thread").context("missing thread summary")?)?;
+            if thread.id != thread_id {
+                bail!("thread/read returned a different thread identity");
+            }
+            Ok(thread)
+        }
+
+        pub(crate) fn descendants(&mut self, root: &str) -> Result<Vec<ManagedThread>> {
+            let mut threads = Vec::new();
+            let mut ids = HashSet::new();
+            for archived in [false, true] {
+                let mut cursor: Option<String> = None;
+                let mut cursors = HashSet::new();
+                let mut complete = false;
+                for _ in 0..MAX_LIST_PAGES {
+                    let result = self.rpc("thread/list", json!({
+                        "ancestorThreadId":root,"archived":archived,"limit":100,"cursor":cursor,"useStateDbOnly":true,
+                        "sourceKinds":ALL_SOURCE_KINDS,"modelProviders":[]
+                    }))?;
+                    let data = result
+                        .get("data")
+                        .and_then(Value::as_array)
+                        .context("thread/list has no data array")?;
+                    for entry in data {
+                        let thread = parse_thread(entry)?;
+                        if thread.id == root || !ids.insert(thread.id.clone()) {
+                            bail!("descendant listing repeated a thread or returned its root");
+                        }
+                        if threads.len() + 1 >= MAX_DELETION_THREADS {
+                            bail!("session deletion descendant budget exceeded");
+                        }
+                        threads.push(thread);
+                    }
+                    match result.get("nextCursor") {
+                        None | Some(Value::Null) => {
+                            complete = true;
+                            break;
+                        }
+                        Some(Value::String(next))
+                            if !next.is_empty() && cursors.insert(next.clone()) =>
+                        {
+                            cursor = Some(next.clone())
+                        }
+                        _ => bail!("invalid or repeated descendant pagination cursor"),
+                    }
+                }
+                if !complete {
+                    bail!("session deletion descendant pagination budget exceeded");
+                }
+            }
+            Ok(threads)
+        }
+
+        /// Complete persisted inventory, without JSONL scan/repair or runtime
+        /// mutation. A truncated/failed listing never proves target absence.
+        pub(crate) fn persisted_threads(
+            &mut self,
+            targets: &HashSet<String>,
+        ) -> Result<HashSet<String>> {
+            ensure!(
+                !targets.is_empty() && targets.len() <= MAX_DELETION_THREADS,
+                "invalid persisted thread verification target set"
+            );
+            let mut present = HashSet::new();
+            let mut seen = HashSet::new();
+            for archived in [false, true] {
+                let mut cursor: Option<String> = None;
+                let mut cursors = HashSet::new();
+                let mut complete = false;
+                for _ in 0..MAX_INVENTORY_PAGES {
+                    let result = self.rpc(
+                        "thread/list",
+                        json!({
+                            "archived":archived,"limit":100,"cursor":cursor,
+                            "useStateDbOnly":true,"sourceKinds":ALL_SOURCE_KINDS,
+                            "modelProviders":[]
+                        }),
+                    )?;
+                    let data = result
+                        .get("data")
+                        .and_then(Value::as_array)
+                        .context("persisted thread/list has no data array")?;
+                    ensure!(
+                        data.len() <= 100,
+                        "persisted thread/list exceeded its requested page size"
+                    );
+                    for entry in data {
+                        let id = entry
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .filter(|id| !id.is_empty() && id.len() <= 256)
+                            .context("persisted thread/list has no valid thread identity")?;
+                        ensure!(
+                            seen.insert(id.to_owned()),
+                            "persisted thread/list repeated a thread identity"
+                        );
+                        if targets.contains(id) {
+                            present.insert(id.to_owned());
+                        }
+                    }
+                    match result.get("nextCursor") {
+                        None | Some(Value::Null) => {
+                            complete = true;
+                            break;
+                        }
+                        Some(Value::String(next))
+                            if !next.is_empty() && cursors.insert(next.clone()) =>
+                        {
+                            cursor = Some(next.clone());
+                        }
+                        _ => bail!("invalid or repeated persisted thread pagination cursor"),
+                    }
+                }
+                ensure!(
+                    complete,
+                    "persisted thread pagination budget exceeded; absence is unconfirmed"
+                );
+            }
+            Ok(present)
+        }
+
+        pub(crate) fn delete_thread_with_notifications(
+            &mut self,
+            thread_id: &str,
+            expected: &HashSet<String>,
+        ) -> Result<()> {
+            ensure!(
+                !expected.is_empty()
+                    && expected.len() <= MAX_DELETION_THREADS
+                    && expected.contains(thread_id),
+                "invalid expected deletion notification scope"
+            );
+            let result = self.rpc_with_notifications(
+                "thread/delete",
+                json!({"threadId":thread_id}),
+                expected.clone(),
+            )?;
+            if !result.as_object().is_some_and(Map::is_empty) {
+                bail!("unexpected thread/delete response; deletion outcome is unknown");
+            }
+            Ok(())
+        }
+    }
+
+    fn parse_thread(value: &Value) -> Result<ManagedThread> {
+        let id = value
+            .get("id")
+            .and_then(Value::as_str)
+            .context("thread identity missing")?
+            .to_owned();
+        let path = value
+            .get("path")
+            .and_then(Value::as_str)
+            .context("persisted thread path missing")?
+            .into();
+        let runtime_status = value
+            .pointer("/status/type")
+            .and_then(Value::as_str)
+            .context("thread runtime status unavailable")?
+            .to_owned();
+        let ephemeral = value
+            .get("ephemeral")
+            .and_then(Value::as_bool)
+            .context("thread persistence status unavailable")?;
+        Ok(ManagedThread {
+            id,
+            parent_thread_id: value
+                .get("parentThreadId")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            path,
+            name: value.get("name").and_then(Value::as_str).map(str::to_owned),
+            runtime_status,
+            ephemeral,
+        })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        const ID: &str = "11111111-1111-4111-8111-111111111111";
+
+        #[test]
+        fn management_summaries_require_explicit_persistence_and_runtime_state() {
+            let base = json!({
+                "id":ID,"path":"/tmp/isolated/sessions/rollout.jsonl",
+                "ephemeral":false,"status":{"type":"notLoaded"},
+                "parentThreadId":null,"source":"cli","name":"saved title"
+            });
+            let parsed = parse_thread(&base).unwrap();
+            assert_eq!(parsed.id, ID);
+            assert_eq!(parsed.runtime_status, "notLoaded");
+            assert!(!parsed.ephemeral);
+            for key in ["id", "path", "ephemeral", "status"] {
+                let mut missing = base.clone();
+                missing.as_object_mut().unwrap().remove(key);
+                assert!(parse_thread(&missing).is_err(), "missing {key}");
+            }
+            let mut active = base;
+            active["status"] = json!({"type":"active","activeFlags":["waitingOnApproval"]});
+            assert_eq!(parse_thread(&active).unwrap().runtime_status, "active");
+        }
+
+        #[test]
+        fn a_generic_failure_never_confirms_thread_absence() {
+            let missing = || ManagementRpcError {
+                code: Some(-32600),
+                message: format!("no rollout found for thread id {ID}"),
+            };
+            assert!(is_missing_thread(&anyhow::Error::new(missing()), ID));
+            assert!(!is_missing_thread(
+                &anyhow::Error::new(missing()),
+                "different-thread"
+            ));
+            assert!(!is_missing_thread(
+                &anyhow!("no rollout found for thread id {ID}"),
+                ID
+            ));
+            assert!(!is_missing_thread(
+                &anyhow::Error::new(ManagementRpcError {
+                    code: Some(-32001),
+                    message: format!("no rollout found for thread id {ID}")
+                }),
+                ID
+            ));
+            assert!(!is_missing_thread(
+                &anyhow::Error::new(ManagementRpcError {
+                    code: Some(-32600),
+                    message: format!("permission denied reading thread {ID}")
+                }),
+                ID
+            ));
+        }
+
+        #[test]
+        fn not_found_diagnostics_must_name_the_exact_missing_thread() {
+            for message in [
+                format!("no rollout found for thread id {ID}"),
+                format!("thread not found: {ID}"),
+                format!("thread not found: `{ID}`"),
+            ] {
+                assert!(is_missing_thread(
+                    &anyhow::Error::new(ManagementRpcError {
+                        code: Some(-32600),
+                        message
+                    }),
+                    ID
+                ));
+            }
+            let other = "22222222-2222-4222-8222-222222222222";
+            let error = anyhow::Error::new(ManagementRpcError {
+                code: Some(-32600),
+                message: format!("no rollout found for thread id {other} while reading {ID}"),
+            });
+            assert!(!is_missing_thread(&error, ID));
+        }
+
+        #[test]
+        fn runtime_not_loaded_is_exact_and_never_global_missing_evidence() {
+            let diagnostic =
+                |code, message| anyhow::Error::new(ManagementRpcError { code, message });
+            let message = format!("thread not loaded: {ID}");
+            assert!(is_thread_not_loaded(
+                &diagnostic(Some(-32600), message.clone()),
+                ID
+            ));
+            assert!(!is_missing_thread(
+                &diagnostic(Some(-32600), message.clone()),
+                ID
+            ));
+            assert!(!is_thread_not_loaded(
+                &diagnostic(Some(-32602), message),
+                ID
+            ));
+            for message in [
+                "thread not loaded".to_owned(),
+                format!(
+                    "thread not loaded: 22222222-2222-4222-8222-222222222222 while reading {ID}"
+                ),
+                format!("thread not loaded: {ID}-extra"),
+                format!("thread not loaded: {ID} permission denied"),
+            ] {
+                assert!(!is_thread_not_loaded(
+                    &diagnostic(Some(-32600), message),
+                    ID
+                ));
+            }
+        }
+    }
+}
+
 /// Collects account data while assigning the caller's logical snapshot time.
 ///
 /// Snapshot orchestration starts local and remote collection from one boundary;

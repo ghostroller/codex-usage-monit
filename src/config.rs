@@ -29,6 +29,9 @@ pub struct CollectConfig {
     /// Enable persistent parsed-rollout cache I/O at this directory when set.
     /// `None` still permits the collector's in-memory cache.
     pub rollout_cache_dir: Option<PathBuf>,
+    /// Independent user-data ledger; never part of the disposable rollout cache.
+    /// `None` uses the default user-data directory rather than disabling the ledger.
+    pub deleted_sessions_dir: Option<PathBuf>,
     /// Rollout discovery lookback in days; negative values are treated as zero.
     /// This bounds file discovery, not every timestamp inside selected files.
     pub lookback_days: i64,
@@ -62,6 +65,7 @@ impl Default for CollectConfig {
             codex_bin: None,
             app_server_path: None,
             rollout_cache_dir: None,
+            deleted_sessions_dir: None,
             lookback_days: 7,
             max_files: 500,
             active_grace: Duration::from_secs(5 * 60),

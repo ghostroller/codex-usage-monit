@@ -32,7 +32,7 @@ _此图由集成测试夹具确定性生成；本地与远程验证均会检查�
 - **交互式终端 UI** — 不离开终端即可筛选、搜索、切换用量范围、展开任务树、查看 turn/模型和恢复任务。
 - **可脚本化 CLI** — 以便于阅读的文本或稳定 camelCase JSON 导出与 TUI 相同的 Summary、Trends 和统一健康数据，也可选择 snapshot section 或按 thread 筛选 turn。
 - **适合服务器** — 支持 SSH、tmux 和 Zellij；Linux Release 是静态 musl 构建，不依赖宿主机 glibc。
-- **只读监控** — 读取本地 Codex 数据和账户用量指标，不读取 `auth.json`，也不会消耗重置机会。
+- **只读采集、显式删除会话** — 读取本地 Codex 数据和账户用量指标，不读取 `auth.json`，也不会消耗重置机会。在会话详情中确认删除时，先保存用量，再调用 Codex 删除。
 - **低开销刷新** — 使用持久化增量缓存和事件驱动的 TUI 更新，避免反复解析没有变化的 rollout。
 
 ## 安装
@@ -521,6 +521,14 @@ Token 用量包含 `inputTokens`、`cachedInputTokens`、`cacheWriteInputTokens`
 
 打开任务是显式操作：`o` 可以在 Zellij 中启动 `codex resume`；选择 Copy 时，只会把恢复命令写入终端剪贴板。详情见[终端任务恢复行为](docs/codex-terminal-resume.md)。
 
+会话详情还提供需要显式确认的本地会话删除操作。请求 Codex 删除会话及其生成的子代理会话前，monit 会持久保存各线程自身的用量事件，以及识别和项目归属计算所需的少量信息。用量账本不保存消息正文、工具参数和输出、Git 数据或会话配置。活动会话、目标身份不明确或用量采集不完整时，不能通过此入口删除。
+
+删除操作通过 Codex 官方 proxy 和 Unix socket 上的 WebSocket 协议，连接 `$CODEX_HOME/app-server-control/app-server-control.sock` 对应的已有 App Server。服务必须已经运行；monit 不会启动替代服务，也不会静默回退到独立实例。预备与确认绑定同一个端点，删除成功同时要求 RPC 成功响应和全部已确认会话对应的 `thread/deleted` 通知，让连接该服务的桌面端收到同一删除广播。端点不可用或缺少通知时明确报错，不重试删除。账本中的 Deleted 表示本地数据已确认删除，不能代替对已断开桌面客户端侧栏状态的确认。
+
+由 monit 确认删除的会话集中显示在 Overview 的 Tasks 列表 **由 monit 删除的会话** 根节点下，默认折叠，平铺和树形模式均保留该组。根节点按当前筛选所匹配子项中最近一次删除时间，与普通任务一起排序。回车或点击根节点展开；子项可查看已保存的用量详情。根节点只是展示分组，不算一条真实任务。原用量继续按发生时间参与当前窗口、模型和历史统计，并避免重复计数。在其他地方删除的会话不增加额外追踪。
+
+删除用量账本属于长期用户数据，独立于 rollout 缓存和可重建历史，备份应用状态时应一并保留；原日志删除后，它提供已保存的用量依据。删除失败或中断时，保留操作记录供核实，不自动重试结果不明的删除。在线刷新会通过只读检查 Codex 的完整持久化会话索引和本地会话日志，核实这些已有操作；复核不会再次发送删除请求。即使对话轮次已经完成，其他进程仍持有会话写入器时，Codex 也可能拒绝删除。用量完整性以记录的采集时刻为界，无法保证其他 Codex 进程不会在采集和删除之间继续写入。
+
 持久化缓存可能包含有限的任务标题和消息摘要。使用 `--redact-content` 可以把标题替换为 `[redacted]`、省略消息摘要，并把新数据写入独立的脱敏缓存；使用 `--no-rollout-cache` 可以禁用解析缓存。脱敏模式不会删除之前由非脱敏运行创建的缓存。
 
 默认缓存位置：
@@ -537,7 +545,7 @@ Token 用量包含 `inputTokens`、`cachedInputTokens`、`cacheWriteInputTokens`
 - Linux：`$XDG_STATE_HOME/codex-usage-monit`；未设置时为 `~/.local/state/codex-usage-monit`
 - Windows：`%LOCALAPPDATA%\codex-usage-monit`
 
-设置 `CODEX_USAGE_MONIT_STATE_DIR` 可以覆盖状态目录。历史按 Codex home 隔离，以 UTC 日 JSON 分片保存 90 天。`--no-rollout-cache` 不会禁用历史，删除后台服务也不会删除历史。
+设置 `CODEX_USAGE_MONIT_STATE_DIR` 可以覆盖状态目录。source-aware 历史使用 `history-v2` 下的 SQLite，保留期为 90 天。独立的 `deleted-sessions-v1` 用量账本按 Codex home 隔离，不随历史过期或重建而删除。`--no-rollout-cache` 不会禁用历史或此账本，删除后台服务也不会删除它们。
 
 ## 故障排查和诊断
 

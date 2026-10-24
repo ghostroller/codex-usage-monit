@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-use anyhow::Result;
+use anyhow::{Context, Result, ensure};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -661,6 +661,7 @@ pub struct RolloutCache {
     local_coverage_started_at: Option<DateTime<Utc>>,
     local_coverage_last_complete_at: Option<DateTime<Utc>>,
     materialization_pending: bool,
+    deleted_ledger_fingerprint: Option<String>,
     startup_progress: Option<StartupLoadProgressTracker>,
 }
 
@@ -983,6 +984,918 @@ pub fn scan_rollouts(config: &CollectConfig, now: DateTime<Utc>) -> Result<Rollo
     RolloutCache::default().scan(config, now)
 }
 
+/// Configured root links are allowed, but their resolved targets and directory
+/// identities stay fixed throughout an explicit deletion operation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SessionCaptureRoots {
+    home: PathBuf,
+    roots: Vec<SessionCaptureRoot>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SessionCaptureRoot {
+    configured: PathBuf,
+    canonical: Option<PathBuf>,
+    #[cfg(unix)]
+    identity: Option<(u64, u64)>,
+    #[cfg(windows)]
+    identity: Option<(u64, [u8; 16])>,
+}
+
+impl SessionCaptureRoots {
+    #[cfg(test)]
+    pub(crate) fn empty_for_test() -> Self {
+        Self {
+            home: PathBuf::new(),
+            roots: Vec::new(),
+        }
+    }
+
+    pub(crate) fn resolve(home: &Path) -> Result<Self> {
+        ensure!(home.is_dir(), "local Codex home is unavailable");
+        let home = home.to_path_buf();
+        let mut roots = Vec::new();
+        for name in ["sessions", "archived_sessions"] {
+            let configured = home.join(name);
+            let exists = match fs::symlink_metadata(&configured) {
+                Err(error) if error.kind() == ErrorKind::NotFound => false,
+                Err(error) => return Err(error).context("could not inspect session capture root"),
+                Ok(_) => true,
+            };
+            let canonical = if exists {
+                let path = fs::canonicalize(&configured)
+                    .context("session capture root target is unavailable")?;
+                ensure!(
+                    path.is_dir(),
+                    "session capture root must resolve to a directory"
+                );
+                Some(path)
+            } else {
+                None
+            };
+            #[cfg(unix)]
+            let identity = {
+                use std::os::unix::fs::MetadataExt;
+                canonical
+                    .as_ref()
+                    .map(|path| fs::metadata(path).map(|metadata| (metadata.dev(), metadata.ino())))
+                    .transpose()?
+            };
+            #[cfg(windows)]
+            let identity = canonical
+                .as_deref()
+                .map(windows_stable_file_identity)
+                .transpose()?;
+            roots.push(SessionCaptureRoot {
+                configured,
+                canonical,
+                #[cfg(any(unix, windows))]
+                identity,
+            });
+        }
+        if let (Some(active), Some(archived)) = (&roots[0].canonical, &roots[1].canonical) {
+            ensure!(
+                !active.starts_with(archived) && !archived.starts_with(active),
+                "active and archived session capture roots must not overlap"
+            );
+        }
+        Ok(Self { home, roots })
+    }
+
+    pub(crate) fn validate_unchanged(&self) -> Result<()> {
+        ensure!(
+            Self::resolve(&self.home)? == *self,
+            "session capture root targets changed; prepare deletion again"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn validate_log_path(&self, path: &Path) -> Result<()> {
+        let canonical = fs::canonicalize(path).context("persisted session log is unavailable")?;
+        let root = self
+            .roots
+            .iter()
+            .find(|root| {
+                root.canonical
+                    .as_ref()
+                    .is_some_and(|target| canonical.starts_with(target))
+            })
+            .context("session log is outside the local Codex sessions directories")?;
+        let target = root.canonical.as_ref().expect("matched an existing root");
+        // Only the configured root may be a link. Inspect the supplied relative
+        // path too, so a descendant alias cannot hide behind canonicalization.
+        let relative = path
+            .strip_prefix(&root.configured)
+            .or_else(|_| path.strip_prefix(target))
+            .unwrap_or_else(|_| canonical.strip_prefix(target).expect("matched root"));
+        let mut current = target.clone();
+        for component in relative.components() {
+            ensure!(
+                matches!(component, std::path::Component::Normal(_)),
+                "session log path has an invalid descendant component"
+            );
+            current.push(component.as_os_str());
+            let metadata = fs::symlink_metadata(&current)?;
+            ensure!(
+                !metadata.file_type().is_symlink(),
+                "session log descendants must not be symbolic links"
+            );
+        }
+        ensure!(
+            fs::canonicalize(&current)? == canonical && current.is_file(),
+            "persisted session log must be an ordinary file within its capture root"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn remaining_owned_threads(
+        &self,
+        targets: &HashSet<String>,
+    ) -> Result<HashSet<String>> {
+        ensure!(
+            !targets.is_empty() && targets.len() <= 1024,
+            "invalid session absence verification target set"
+        );
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        Ok(discover_session_capture_files(self, targets, &cancel)?
+            .into_iter()
+            .map(|(_, owner)| owner)
+            .collect())
+    }
+}
+
+/// Complete, owner-verified inputs for one explicit deletion operation. This
+/// never reads the persistent rollout cache or writes a history observation.
+#[derive(Clone, Debug)]
+pub(crate) struct SessionUsageCapture {
+    pub(crate) dataset: RolloutDataset,
+    roots: SessionCaptureRoots,
+    targets: HashSet<String>,
+    files: Vec<(RolloutFile, String)>,
+}
+
+impl SessionUsageCapture {
+    #[cfg(test)]
+    pub(crate) fn empty_for_test() -> Self {
+        Self {
+            dataset: RolloutDataset::default(),
+            roots: SessionCaptureRoots::empty_for_test(),
+            targets: HashSet::new(),
+            files: Vec::new(),
+        }
+    }
+
+    pub(crate) fn paths(&self) -> Vec<PathBuf> {
+        self.files
+            .iter()
+            .map(|(file, _)| file.path.clone())
+            .collect()
+    }
+
+    pub(crate) fn paths_for_thread(&self, thread_id: &str) -> Vec<PathBuf> {
+        self.files
+            .iter()
+            .filter(|(_, owner)| owner == thread_id)
+            .map(|(file, _)| file.path.clone())
+            .collect()
+    }
+
+    pub(crate) fn validate_unchanged(&self) -> Result<()> {
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let current = discover_session_capture_files(&self.roots, &self.targets, &cancel)?;
+        ensure!(
+            current == self.files,
+            "session rollout files changed after usage capture; prepare deletion again"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn remaining_owned_threads(&self) -> Result<HashSet<String>> {
+        self.roots.remaining_owned_threads(&self.targets)
+    }
+}
+
+fn discover_session_capture_files(
+    roots: &SessionCaptureRoots,
+    targets: &HashSet<String>,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<Vec<(RolloutFile, String)>> {
+    use std::sync::atomic::Ordering;
+    let mut files = Vec::new();
+    let mut entries = 0usize;
+    let mut probes = 0usize;
+    roots.validate_unchanged()?;
+    for root in &roots.roots {
+        let Some(target) = &root.canonical else {
+            continue;
+        };
+        for entry in WalkDir::new(target).follow_links(false).max_depth(16) {
+            ensure!(
+                !cancel.load(Ordering::Relaxed),
+                "session usage capture cancelled"
+            );
+            entries += 1;
+            ensure!(
+                entries <= 100_000,
+                "session ownership discovery exceeded its bounded entry limit; deletion refused"
+            );
+            let entry = entry.context("session ownership discovery was incomplete")?;
+            ensure!(
+                entry.depth() < 16 || !entry.file_type().is_dir(),
+                "session ownership discovery reached its directory-depth bound; deletion refused"
+            );
+            ensure!(
+                !entry.file_type().is_symlink(),
+                "session ownership discovery encountered a symbolic link; deletion refused"
+            );
+            if !entry.file_type().is_file() || entry.path().extension() != Some(OsStr::new("jsonl"))
+            {
+                continue;
+            }
+            probes += 1;
+            ensure!(
+                probes <= 16_384,
+                "session ownership discovery exceeded its file limit; deletion refused"
+            );
+            // Keep the configured logical path for active/archive replay rules;
+            // only traversal uses the frozen canonical target.
+            let path = root.configured.join(entry.path().strip_prefix(target)?);
+            let handle = open_rollout_source_for_validation(&path)?;
+            let metadata = handle.metadata()?;
+            let file = RolloutFile {
+                fingerprint: FileFingerprint::from_path_and_metadata(&path, &metadata)?,
+                path,
+                modified_at: DateTime::<Utc>::from(metadata.modified()?),
+            };
+            let mut reader = BufReader::new(handle.take(OWNER_PROBE_MAX_BYTES));
+            let mut line = Vec::new();
+            let mut owner = None;
+            let mut spawned_parent = None;
+            for _ in 0..OWNER_PROBE_MAX_LINES {
+                match read_bounded_line(&mut reader, &mut line, OWNER_PROBE_MAX_BYTES as usize)? {
+                    BoundedLine::Eof => break,
+                    BoundedLine::TooLong => break,
+                    BoundedLine::Line => {
+                        if let Ok(value) = serde_json::from_slice::<Value>(&line)
+                            && value.get("type").and_then(Value::as_str) == Some("session_meta")
+                        {
+                            owner = value
+                                .pointer("/payload/id")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned);
+                            if let Some(payload) = value.get("payload").and_then(Value::as_object)
+                                && is_subagent_session(payload)
+                            {
+                                spawned_parent =
+                                    nested_subagent_parent_thread_id(payload, owner.as_deref())
+                                        .or_else(|| {
+                                            valid_parent_thread_id_in(
+                                                payload,
+                                                &["parent_thread_id", "parentThreadId"],
+                                                owner.as_deref(),
+                                            )
+                                        })
+                                        .map(str::to_owned);
+                            }
+                            break;
+                        }
+                    }
+                }
+                line.clear();
+            }
+            let owner = owner.with_context(|| {
+                format!(
+                    "could not establish rollout owner for {}; deletion refused",
+                    file.path.display()
+                )
+            })?;
+            ensure!(
+                targets.contains(&owner)
+                    || !spawned_parent
+                        .as_ref()
+                        .is_some_and(|parent| targets.contains(parent)),
+                "owned rollout identifies an unlisted spawned descendant {owner}; deletion scope is incomplete"
+            );
+            if targets.contains(&owner) {
+                files.push((file, owner));
+            }
+        }
+    }
+    files.sort_by(|left, right| left.0.path.cmp(&right.0.path));
+    ensure!(
+        files.len() <= 4_096,
+        "session capture exceeded its file-count budget"
+    );
+    roots.validate_unchanged()?;
+    Ok(files)
+}
+
+pub(crate) fn capture_session_usage(
+    config: &CollectConfig,
+    targets: &HashSet<String>,
+    as_of: DateTime<Utc>,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<SessionUsageCapture> {
+    use std::sync::atomic::Ordering;
+    struct CaptureRead<'a> {
+        reader: File,
+        cancel: &'a std::sync::atomic::AtomicBool,
+    }
+    impl Read for CaptureRead<'_> {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if self.cancel.load(Ordering::Relaxed) {
+                return Err(std::io::Error::other("session usage capture cancelled"));
+            }
+            self.reader.read(buffer)
+        }
+    }
+    ensure!(
+        !targets.is_empty() && targets.len() <= 1024,
+        "invalid session usage capture target set"
+    );
+    let roots = SessionCaptureRoots::resolve(&config.codex_home)?;
+    let owned = discover_session_capture_files(&roots, targets, cancel)?;
+    let mut cache = HashMap::new();
+    let mut files = Vec::new();
+    let mut bytes = 0u64;
+    let mut safe_config = config.clone();
+    safe_config.redact_content = true;
+    for (file, owner) in &owned {
+        ensure!(
+            !cancel.load(Ordering::Relaxed),
+            "session usage capture cancelled"
+        );
+        bytes = bytes.saturating_add(file.fingerprint.len);
+        ensure!(
+            file.fingerprint.len <= 1024 * 1024 * 1024 && bytes <= 4 * 1024 * 1024 * 1024,
+            "complete deletion usage capture exceeds its byte budget; deletion refused"
+        );
+        let handle = open_rollout_source_for_validation(&file.path)?;
+        let parsed = parse_rollout_reader(
+            file,
+            &safe_config,
+            ParsedFile {
+                replay_timestamps_complete: true,
+                ..ParsedFile::default()
+            },
+            BufReader::new(CaptureRead {
+                reader: handle,
+                cancel,
+            }),
+        );
+        ensure!(
+            parsed.complete && parsed.skipped_lines == 0 && parsed.unreadable_files == 0,
+            "session rollout was unreadable or incomplete; deletion usage cannot be safely saved"
+        );
+        ensure!(
+            parsed.owner_thread_id.as_deref() == Some(owner),
+            "rollout owner changed during deletion capture"
+        );
+        ensure!(
+            !parsed
+                .events
+                .iter()
+                .filter_map(parsed_event_available_at)
+                .any(|timestamp| timestamp > as_of),
+            "session rollout contains evidence after the capture boundary; deletion refused"
+        );
+        ensure!(
+            inspect_rollout_file(&file.path)?.fingerprint == file.fingerprint,
+            "rollout changed during deletion capture; prepare again"
+        );
+        let forked = parsed.events.iter().any(|event| {
+            matches!(event,
+            ParsedEvent::SessionMeta { payload, .. } if is_forked_session(payload))
+        });
+        let has_counter = parsed
+            .events
+            .iter()
+            .any(|event| matches!(event, ParsedEvent::TokenCount(_)));
+        let explicit_own_zero_baseline = parsed
+            .events
+            .iter()
+            .enumerate()
+            .find_map(|(index, event)| match event {
+                ParsedEvent::TokenCount(counter) => Some((index, counter)),
+                _ => None,
+            })
+            .is_some_and(|(index, counter)| {
+                counter.total_usage.is_some_and(TokenUsage::is_zero)
+                    && counter.last_usage.is_none_or(TokenUsage::is_zero)
+                    && parsed.events.iter().take(index).any(|event| {
+                        matches!(event,
+                        ParsedEvent::TaskStarted { started_at:Some(started_at), .. }
+                            if parsed.owning_created_at.is_some_and(|created_at|
+                                *started_at >= created_at - ChronoDuration::seconds(2)
+                                    && *started_at <= counter.timestamp))
+                    })
+            });
+        ensure!(
+            !forked
+                || !has_counter
+                || parsed.foreign_baseline_events > 0
+                || explicit_own_zero_baseline,
+            "forked session has no retained parent counter baseline; deletion refused"
+        );
+        cache.insert(
+            file.path.clone(),
+            CachedFile {
+                fingerprint: file.fingerprint.clone(),
+                parsed: Arc::new(parsed),
+            },
+        );
+        files.push(file.clone());
+    }
+    for target in targets {
+        ensure!(
+            owned.iter().any(|(_, owner)| owner == target),
+            "no owned rollout was found for deletion target {target}"
+        );
+    }
+    sort_rollout_files_for_replay_as_of(&mut files, &cache, Some(as_of));
+    let plan = build_replay_plan(
+        &files,
+        &cache,
+        None,
+        &mut HashMap::new(),
+        &safe_config,
+        Some(as_of),
+    );
+    ensure!(
+        plan.incomplete_counter_threads.is_empty(),
+        "session counter replay is incomplete or ambiguous; deletion refused"
+    );
+    let reduced = reduce_cached_files_as_of(&files, &cache, &safe_config, &plan, as_of);
+    let dataset = materialize_dataset(
+        &reduced,
+        RolloutDataset::default(),
+        0,
+        &safe_config,
+        as_of,
+        &HashMap::new(),
+    );
+    ensure!(
+        dataset.stats.unreadable_files == 0
+            && dataset.stats.skipped_lines == 0
+            && dataset.stats.ambiguous_token_resets == 0,
+        "session usage could not be completely reconstructed; deletion refused"
+    );
+    let capture = SessionUsageCapture {
+        dataset,
+        roots,
+        targets: targets.clone(),
+        files: owned,
+    };
+    capture.validate_unchanged()?;
+    Ok(capture)
+}
+
+#[cfg(test)]
+mod deleted_capture_tests {
+    use super::*;
+    use chrono::TimeZone;
+    use serde_json::json;
+    use std::sync::atomic::AtomicBool;
+
+    const THREAD: &str = "01a10855-6354-7043-be0b-dfebaaa70758";
+    fn time() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 10, 20, 12, 0, 0).unwrap()
+    }
+    fn log(future: bool, fork: bool) -> String {
+        let at = time() - ChronoDuration::hours(6);
+        let mut owner = json!({"id":THREAD});
+        if fork {
+            owner["forked_from_id"] = json!("01a10855-6354-7043-be0b-dfebaaa70759");
+        }
+        [
+            json!({"timestamp":at,"type":"session_meta","payload":owner}),
+            json!({"timestamp":at+ChronoDuration::seconds(1),"type":"event_msg","payload":{"type":"task_started","turn_id":"turn","started_at":at+ChronoDuration::seconds(1)}}),
+            json!({"timestamp":if future {time()+ChronoDuration::seconds(1)} else {at+ChronoDuration::seconds(2)},"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":17,"total_tokens":17},"last_token_usage":{"input_tokens":17,"total_tokens":17}}}}),
+            json!({"timestamp":at+ChronoDuration::seconds(3),"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn"}}),
+        ].iter().map(Value::to_string).collect::<Vec<_>>().join("\n")+"\n"
+    }
+    fn fixture(contents: &str) -> (tempfile::TempDir, CollectConfig, PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let sessions = directory.path().join("sessions");
+        fs::create_dir(&sessions).unwrap();
+        let path = sessions.join(format!("rollout-{THREAD}.jsonl"));
+        fs::write(&path, contents).unwrap();
+        let config = CollectConfig {
+            codex_home: directory.path().into(),
+            offline: true,
+            deleted_sessions_dir: Some(directory.path().join("user-data")),
+            ..CollectConfig::default()
+        };
+        (directory, config, path)
+    }
+
+    #[test]
+    fn deleted_sessions_capture_is_complete_and_detects_changed_file_sets() {
+        let (_directory, config, path) = fixture(&log(false, false));
+        let targets = HashSet::from([THREAD.to_string()]);
+        let capture =
+            capture_session_usage(&config, &targets, time(), &AtomicBool::new(false)).unwrap();
+        assert_eq!(
+            capture
+                .dataset
+                .calls
+                .iter()
+                .map(|call| call.tokens.total_tokens)
+                .sum::<u64>(),
+            17
+        );
+        assert_eq!(capture.paths_for_thread(THREAD), vec![path.clone()]);
+        capture.validate_unchanged().unwrap();
+        fs::copy(&path, path.with_file_name("copied.jsonl")).unwrap();
+        assert!(
+            capture.validate_unchanged().is_err(),
+            "new same-owner copies must invalidate the destructive plan"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deleted_sessions_capture_accepts_root_links_and_preserves_archive_replay() {
+        use std::os::unix::fs::symlink;
+        for archived_only in [false, true] {
+            let (directory, config, original) = fixture(&log(false, false));
+            let active_target = directory.path().join("active-target");
+            let archive_target = directory.path().join("archive-target");
+            fs::rename(config.codex_home.join("sessions"), &active_target).unwrap();
+            fs::create_dir(&archive_target).unwrap();
+            symlink(&active_target, config.codex_home.join("sessions")).unwrap();
+            symlink(&archive_target, config.codex_home.join("archived_sessions")).unwrap();
+            let archived = config
+                .codex_home
+                .join("archived_sessions")
+                .join(original.file_name().unwrap());
+            fs::copy(&original, &archived).unwrap();
+            if archived_only {
+                fs::remove_file(&original).unwrap();
+            }
+            let capture = capture_session_usage(
+                &config,
+                &HashSet::from([THREAD.to_owned()]),
+                time(),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+            assert_eq!(
+                capture
+                    .dataset
+                    .calls
+                    .iter()
+                    .map(|call| call.tokens.total_tokens)
+                    .sum::<u64>(),
+                17
+            );
+            assert_eq!(capture.dataset.tasks.len(), 1);
+            assert_eq!(capture.dataset.tasks[0].archived, archived_only);
+            assert!(capture.paths().contains(&archived));
+            assert_eq!(capture.paths().len(), if archived_only { 1 } else { 2 });
+            capture.validate_unchanged().unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deleted_sessions_capture_freezes_root_links_even_for_identical_copies() {
+        use std::os::unix::fs::symlink;
+        for name in ["sessions", "archived_sessions"] {
+            let (directory, config, original) = fixture(&log(false, false));
+            let target = directory.path().join("root-target");
+            fs::rename(config.codex_home.join("sessions"), &target).unwrap();
+            let root = config.codex_home.join(name);
+            symlink(&target, &root).unwrap();
+            let capture = capture_session_usage(
+                &config,
+                &HashSet::from([THREAD.to_owned()]),
+                time(),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+            let replacement = directory.path().join("replacement");
+            fs::create_dir(&replacement).unwrap();
+            fs::copy(
+                target.join(original.file_name().unwrap()),
+                replacement.join(original.file_name().unwrap()),
+            )
+            .unwrap();
+            fs::remove_file(&root).unwrap();
+            symlink(&replacement, &root).unwrap();
+            assert!(
+                target.join(original.file_name().unwrap()).is_file(),
+                "old scope still exists"
+            );
+            assert!(capture.validate_unchanged().is_err());
+            assert!(capture.remaining_owned_threads().is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deleted_sessions_capture_rejects_descendant_links_beneath_a_linked_root() {
+        use std::os::unix::fs::symlink;
+        for directory_link in [false, true] {
+            let (directory, config, original) = fixture(&log(false, false));
+            let target = directory.path().join("root-target");
+            fs::rename(config.codex_home.join("sessions"), &target).unwrap();
+            symlink(&target, config.codex_home.join("sessions")).unwrap();
+            let outside = directory.path().join("outside");
+            fs::create_dir(&outside).unwrap();
+            let external_file = outside.join("copied.jsonl");
+            fs::copy(&original, &external_file).unwrap();
+            symlink(
+                if directory_link {
+                    &outside
+                } else {
+                    &external_file
+                },
+                target.join(if directory_link {
+                    "nested"
+                } else {
+                    "alias.jsonl"
+                }),
+            )
+            .unwrap();
+            let error = capture_session_usage(
+                &config,
+                &HashSet::from([THREAD.to_owned()]),
+                time(),
+                &AtomicBool::new(false),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("symbolic link"), "{error:#}");
+        }
+    }
+
+    #[test]
+    fn deleted_sessions_capture_freezes_a_missing_archive_root() {
+        let (_directory, config, _) = fixture(&log(false, false));
+        let capture = capture_session_usage(
+            &config,
+            &HashSet::from([THREAD.to_owned()]),
+            time(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        fs::create_dir(config.codex_home.join("archived_sessions")).unwrap();
+        assert!(capture.validate_unchanged().is_err());
+        assert!(capture.remaining_owned_threads().is_err());
+    }
+
+    #[test]
+    fn deleted_sessions_capture_refuses_an_unlisted_spawned_child_but_not_a_plain_fork() {
+        let (_directory, config, _) = fixture(&log(false, false));
+        let targets = HashSet::from([THREAD.to_string()]);
+        let capture =
+            capture_session_usage(&config, &targets, time(), &AtomicBool::new(false)).unwrap();
+        let extra = config.codex_home.join("sessions/unlisted.jsonl");
+        let child = "22222222-2222-4222-8222-222222222222";
+        let write_metadata = |payload: Value| {
+            fs::write(
+                &extra,
+                format!(
+                    "{}\n",
+                    json!({
+                        "timestamp":time(), "type":"session_meta", "payload":payload,
+                    })
+                ),
+            )
+            .unwrap();
+        };
+        write_metadata(json!({"id":child,"source":{"subagent":{"thread_spawn":{
+            "parent_thread_id":THREAD,"depth":1,
+        }}}}));
+        assert!(
+            capture.validate_unchanged().is_err(),
+            "a new child outside the confirmed API inventory must invalidate deletion"
+        );
+        let error =
+            capture_session_usage(&config, &targets, time(), &AtomicBool::new(false)).unwrap_err();
+        assert!(error.to_string().contains("unlisted spawned descendant"));
+        write_metadata(json!({"id":child,"source":"cli","forked_from_id":THREAD}));
+        capture.validate_unchanged().unwrap();
+        capture_session_usage(&config, &targets, time(), &AtomicBool::new(false)).unwrap();
+    }
+
+    #[test]
+    fn deleted_sessions_capture_rejects_future_usage_and_missing_fork_baseline() {
+        for (future, fork) in [(true, false), (false, true)] {
+            let (_directory, config, _) = fixture(&log(future, fork));
+            assert!(
+                capture_session_usage(
+                    &config,
+                    &HashSet::from([THREAD.to_string()]),
+                    time(),
+                    &AtomicBool::new(false)
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn deleted_sessions_capture_accepts_fresh_child_with_explicit_owned_zero_baseline() {
+        for last in [0, 3] {
+            let mut records: Vec<Value> = log(false, true)
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            records.insert(
+                2,
+                json!({"timestamp":time()-ChronoDuration::hours(6)+ChronoDuration::seconds(1),
+                "type":"event_msg","payload":{"type":"token_count","info":{
+                    "total_token_usage":{"input_tokens":0,"total_tokens":0},
+                    "last_token_usage":{"input_tokens":last,"total_tokens":last}}}}),
+            );
+            let contents = records
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n";
+            let (_directory, config, _) = fixture(&contents);
+            let capture = capture_session_usage(
+                &config,
+                &HashSet::from([THREAD.to_string()]),
+                time(),
+                &AtomicBool::new(false),
+            );
+            if last == 0 {
+                let capture = capture.expect("the first owned zero cumulative sample proves the fresh child's counter baseline");
+                assert_eq!(
+                    capture
+                        .dataset
+                        .calls
+                        .iter()
+                        .map(|call| call.tokens.total_tokens)
+                        .sum::<u64>(),
+                    17
+                );
+            } else {
+                assert!(
+                    capture.is_err(),
+                    "an inconsistent zero-total/positive-last sample proves no zero baseline"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn deleted_sessions_capture_rejects_cancelled_and_unknown_owner_input() {
+        let (_directory, config, path) = fixture(&log(false, false));
+        let targets = HashSet::from([THREAD.to_string()]);
+        assert!(capture_session_usage(&config, &targets, time(), &AtomicBool::new(true)).is_err());
+        fs::write(path.with_file_name("unknown.jsonl"), "{}\n").unwrap();
+        assert!(capture_session_usage(&config, &targets, time(), &AtomicBool::new(false)).is_err());
+    }
+
+    #[test]
+    fn deleted_sessions_cache_reloads_saved_usage_and_survives_restart_without_raw_logs() {
+        let (_directory, config, path) = fixture(&log(false, false));
+        let mut cache = RolloutCache::new();
+        let original = cache.scan(&config, time()).unwrap();
+        assert_eq!(original.calls.len(), 1);
+        let record = crate::deleted_sessions::DeletedSessionRecord::from_dataset(
+            THREAD,
+            "Deleted short title",
+            time(),
+            &original,
+        )
+        .unwrap();
+        crate::deleted_sessions::prepare_delete(&config, "saved", &[record]).unwrap();
+        crate::deleted_sessions::set_deletion_outcome(
+            &config,
+            "saved",
+            THREAD,
+            crate::deleted_sessions::DeletionStatus::Deleted,
+            time(),
+        )
+        .unwrap();
+        let overlap = cache
+            .scan_if_changed(&config, time())
+            .unwrap()
+            .expect("ledger revision invalidates an otherwise unchanged scan");
+        assert_eq!(
+            overlap.calls.len(),
+            1,
+            "same-source saved and live observations count once"
+        );
+        fs::remove_file(path).unwrap();
+        cache.invalidate_after_session_mutation();
+        let removed = cache.scan(&config, time()).unwrap();
+        let restarted = RolloutCache::new().scan(&config, time()).unwrap();
+        for dataset in [removed, restarted] {
+            assert_eq!(dataset.calls.len(), 1);
+            assert_eq!(dataset.tasks[0].token_usage.total_tokens, 17);
+            assert_eq!(
+                dataset.calls[0].timestamp,
+                time() - ChronoDuration::hours(6) + ChronoDuration::seconds(2)
+            );
+            assert!(dataset.turns[0].message_preview.is_none());
+            assert_eq!(dataset.tasks[0].title, "Deleted short title");
+        }
+    }
+
+    #[test]
+    fn deleted_sessions_ledger_only_change_bypasses_materialization_coalescing() {
+        let (_directory, config, path) = fixture(&log(false, false));
+        let original = RolloutCache::new().scan(&config, time()).unwrap();
+        let record = crate::deleted_sessions::DeletedSessionRecord::from_dataset(
+            THREAD,
+            "Saved during coalescing",
+            time(),
+            &original,
+        )
+        .unwrap();
+        fs::remove_file(path).unwrap();
+
+        let mut cache = RolloutCache::new();
+        assert!(cache.scan(&config, time()).unwrap().calls.is_empty());
+        assert!(
+            cache
+                .scan_if_changed_coalesced_with_external_boundary(&config, time(), None)
+                .unwrap()
+                .is_none()
+        );
+
+        crate::deleted_sessions::prepare_delete(&config, "coalesced", &[record]).unwrap();
+        crate::deleted_sessions::set_deletion_outcome(
+            &config,
+            "coalesced",
+            THREAD,
+            crate::deleted_sessions::DeletionStatus::Deleted,
+            time(),
+        )
+        .unwrap();
+
+        // Keep the scan clock and rollout inventory unchanged: neither the
+        // coalescing interval nor a freshness boundary can trigger this result.
+        let refreshed = cache
+            .scan_if_changed_coalesced_with_external_boundary(&config, time(), None)
+            .unwrap()
+            .expect("new saved usage must be visible before the coalescing interval elapses");
+        assert_eq!(refreshed.calls.len(), 1);
+        assert_eq!(refreshed.calls[0].tokens.total_tokens, 17);
+        assert_eq!(refreshed.tasks.len(), 1);
+        assert_eq!(refreshed.tasks[0].title, "Saved during coalescing");
+        assert_eq!(refreshed.tasks[0].status, TaskStatus::Completed);
+        assert!(
+            cache
+                .scan_if_changed_coalesced_with_external_boundary(&config, time(), None)
+                .unwrap()
+                .is_none(),
+            "the ledger change must be consumed by the immediate result"
+        );
+    }
+
+    #[test]
+    fn limits_only_collection_is_independent_of_an_unavailable_deleted_session_ledger() {
+        let (_directory, config, path) = fixture(&log(false, false));
+        let ledger_root = config.deleted_sessions_dir.as_ref().unwrap();
+        let sentinel = b"this file must not be opened as a ledger directory";
+        fs::write(ledger_root, sentinel).unwrap();
+        let scan_error = RolloutCache::new().scan(&config, time()).unwrap_err();
+        assert!(
+            scan_error
+                .to_string()
+                .contains("deleted-session usage ledger unavailable")
+        );
+        let cached = crate::domain::AccountSnapshot {
+            rate_limit_reset_credits: Some(crate::domain::RateLimitResetCreditsSnapshot {
+                available_count: 2,
+                credits: None,
+                provenance: Provenance::ServerSnapshot,
+                as_of: Utc::now() - ChronoDuration::hours(1),
+            }),
+            ..crate::domain::AccountSnapshot::default()
+        };
+
+        let result = crate::snapshot::collect_limits_snapshot(&config, Some(cached), false);
+
+        assert_eq!(
+            result
+                .snapshot
+                .rate_limit_reset_credits
+                .unwrap()
+                .available_count,
+            2
+        );
+        assert!(result.snapshot.errors.is_empty());
+        assert!(result.snapshot.tasks.is_empty());
+        assert!(
+            result
+                .snapshot
+                .sources
+                .iter()
+                .all(|source| source.source != "rollout_jsonl")
+        );
+        assert_eq!(fs::read(ledger_root).unwrap(), sentinel.as_slice());
+        assert_eq!(fs::read_to_string(path).unwrap(), log(false, false));
+    }
+}
+
 /// Reuse the collector's counter, fork, request and replay rules for an
 /// on-demand detail projection. This never writes the rollout/history cache.
 pub(crate) fn load_detail_usage(
@@ -1110,6 +2023,15 @@ impl RolloutCache {
         Self::default()
     }
 
+    /// Force filesystem discovery after an explicitly requested mutation while
+    /// preserving the ongoing observer's prospective coverage interval.
+    pub(crate) fn invalidate_after_session_mutation(&mut self) {
+        self.discovery_cache = None;
+        self.last_discovery = None;
+        self.last_materialized_at = None;
+        self.materialization_pending = true;
+    }
+
     /// Shares immutable parsed inputs with a one-shot history scan. Selection,
     /// discovery, reduction, as-of boundaries, coverage and writer scheduling
     /// belong to the new scan; changing its lookback cannot widen the live UI.
@@ -1127,6 +2049,14 @@ impl RolloutCache {
 
     pub fn metrics(&self) -> RolloutCacheMetrics {
         self.metrics
+    }
+
+    /// Membership in the actual rollout reduction, before deletion evidence
+    /// is overlaid. A restored thread must behave like a live session again.
+    pub(crate) fn has_live_thread(&self, thread_id: &str) -> bool {
+        self.reduced
+            .as_ref()
+            .is_some_and(|reduced| reduced.threads.contains_key(thread_id))
     }
 
     pub(crate) fn set_startup_progress(&mut self, progress: StartupLoadProgressTracker) {
@@ -1372,6 +2302,7 @@ impl RolloutCache {
             self.local_coverage_started_at = None;
             self.local_coverage_last_complete_at = None;
             self.materialization_pending = false;
+            self.deleted_ledger_fingerprint = None;
             self.key = Some(key.clone());
         }
         let external_boundary_changed = self
@@ -1991,7 +2922,11 @@ impl RolloutCache {
                 self.last_materialized_at
                     .is_some_and(|last| last < boundary && boundary <= now)
             });
-        let projection_changed = refresh.rebuilt || discovery_changed || title_changed;
+        let deleted_ledger_fingerprint = crate::deleted_sessions::ledger_fingerprint(config)
+            .context("deleted-session usage ledger unavailable; previously saved statistics were not discarded")?;
+        let deleted_ledger_changed = self.deleted_ledger_fingerprint != deleted_ledger_fingerprint;
+        let projection_changed =
+            refresh.rebuilt || discovery_changed || title_changed || deleted_ledger_changed;
         if projection_changed {
             // A coalesced scan may update `reduced` without materializing it.
             // The prior as-of projection was derived from the old reduced
@@ -2008,6 +2943,7 @@ impl RolloutCache {
                         .is_ok_and(|elapsed| elapsed >= SNAPSHOT_MATERIALIZE_COALESCE_INTERVAL)
             });
         let should_materialize = force_materialize
+            || deleted_ledger_changed
             || self.last_materialized_at.is_none()
             || external_boundary_changed
             || freshness_changed
@@ -2085,7 +3021,7 @@ impl RolloutCache {
         });
         let next_freshness_deadline =
             next_freshness_deadline(materialized_reduced, now, config.active_grace);
-        let dataset = materialize_dataset(
+        let mut dataset = materialize_dataset(
             materialized_reduced,
             discovery,
             discovery_suppressed_warnings,
@@ -2093,6 +3029,10 @@ impl RolloutCache {
             now,
             &self.session_titles.titles,
         );
+        let deleted = crate::deleted_sessions::load_deleted_sessions(config)
+            .context("deleted-session usage ledger could not be read; usage refresh refused")?;
+        crate::deleted_sessions::overlay_deleted_sessions(&mut dataset, &deleted, now)?;
+        self.deleted_ledger_fingerprint = deleted_ledger_fingerprint;
         refresh.materialize_us = elapsed_micros(materialize_started);
         self.last_refresh = refresh;
         self.last_materialized_at = Some(now);

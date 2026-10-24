@@ -1,6 +1,7 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use super::*;
+use crate::tui::session_management::{DeletePhase, SessionDeleteDialog, SessionDeleteTarget};
 
 #[test]
 fn poisoned_history_exit_does_not_persist_staged_observation() {
@@ -238,6 +239,90 @@ fn poisoned_rollout_cache_rejects_initial_local_and_backfill_collection() {
         !history.is_poisoned(),
         "cache failure must not poison unrelated history"
     );
+}
+
+#[test]
+fn poisoned_refresh_stops_post_delete_refresh_even_with_a_visible_dialog() {
+    #[cfg(windows)]
+    let _signal_test_guard = WINDOWS_TERMINATION_TEST_LOCK.lock().unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let config = CollectConfig {
+        codex_home: directory.path().to_path_buf(),
+        offline: true,
+        ..CollectConfig::default()
+    };
+    for poison_history in [false, true] {
+        for show_dialog in [false, true] {
+            let cache = Arc::new(Mutex::new(RolloutCache::new()));
+            let history = Arc::new(Mutex::new(TuiHistoryStore::memory_fallback(
+                HistoryStore::memory_only(&config.codex_home, false),
+                Vec::new(),
+            )));
+            assert!(
+                catch_unwind(AssertUnwindSafe(|| {
+                    if poison_history {
+                        let _guard = history.lock().unwrap();
+                        panic!("interrupt history before the post-delete refresh");
+                    } else {
+                        let _guard = cache.lock().unwrap();
+                        panic!("interrupt cache before the post-delete refresh");
+                    }
+                }))
+                .is_err()
+            );
+            let mut app = interaction_test_app(1, 1);
+            let displayed_tasks = app.snapshot.tasks.clone();
+            let displayed_turns = app.snapshot.turns.clone();
+            app.session_management.force_local_refresh = true;
+            app.refresh_retry_not_before = Some(Instant::now() + Duration::from_secs(60));
+            if show_dialog {
+                app.session_management.dialog = Some(SessionDeleteDialog {
+                    target: SessionDeleteTarget {
+                        thread_id: "deleted-thread".to_string(),
+                        title: "Deleted session".to_string(),
+                        codex_home: config.codex_home.clone(),
+                    },
+                    phase: DeletePhase::Failed("delete failed".to_string()),
+                });
+            }
+            let termination = TerminationSignal::for_test();
+            let (refresh_sender, refresh_receiver) = mpsc::channel();
+            let (resume_sender, resume_receiver) = mpsc::channel();
+            let (remote_sender, remote_receiver) = mpsc::channel();
+            let context = RunLoopContext {
+                termination: &termination,
+                refresh_sender: &refresh_sender,
+                refresh_receiver: &refresh_receiver,
+                resume_sender: &resume_sender,
+                resume_receiver: &resume_receiver,
+                remote_sender: &remote_sender,
+                remote_receiver: &remote_receiver,
+            };
+            let mut worker = RefreshWorker::default();
+            assert!(start_refresh_if_due(
+                &mut app,
+                &config,
+                &context,
+                &cache,
+                &history,
+                &mut worker,
+            ));
+            assert!(app.refresh_stopped);
+            assert!(!app.worker_running);
+            assert!(worker.handle.is_none());
+            assert!(refresh_receiver.try_recv().is_err());
+            assert_eq!(app.snapshot.tasks, displayed_tasks);
+            assert_eq!(app.snapshot.turns, displayed_turns);
+            assert!(!start_refresh_if_due(
+                &mut app,
+                &config,
+                &context,
+                &cache,
+                &history,
+                &mut worker,
+            ));
+        }
+    }
 }
 
 #[test]

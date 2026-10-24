@@ -59,12 +59,14 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 mod entity_detail;
 mod geometry;
+mod session_management;
 mod stacked_area;
 mod terminal;
 mod text;
 
 use entity_detail::{EntityDetailHitbox, EntityDetailPopup, render_entity_detail};
 use geometry::{reveal_offset, scale_rounded, scroll_offset, scrollbar_geometry};
+use session_management::{SessionDeleteHitbox, SessionManagementState, render_session_delete};
 use stacked_area::{StackedArea, StackedAreaSeries, StackedAreaState, date_index_at_column};
 #[cfg(all(test, unix))]
 use terminal::poll_terminal_fd;
@@ -1944,6 +1946,41 @@ fn aggregate_task_row_usage_with_api_long_context(
     window_only: bool,
     api_long_context: bool,
 ) -> WindowUsage {
+    if row.kind == TaskRowKind::DeletedRoot {
+        let mut result = WindowUsage::default();
+        let mut confidence = None;
+        for &index in &row.hidden_descendants {
+            let leaf = TaskListRow {
+                kind: TaskRowKind::DeletedSession,
+                index,
+                prefix: String::new(),
+                depth: 1,
+                has_children: false,
+                collapsed: false,
+                hidden_descendants: Vec::new(),
+            };
+            let usage = aggregate_task_row_usage_with_api_long_context(
+                snapshot,
+                scope,
+                &leaf,
+                window_only,
+                api_long_context,
+            );
+            result.token_usage.add_assign(usage.token_usage);
+            result.local_token_share_percent += usage.local_token_share_percent;
+            result.estimated_quota_percent += usage.estimated_quota_percent;
+            result
+                .api_equivalent_cost
+                .add_assign(usage.api_equivalent_cost);
+            if quota_estimate_participates(&usage) {
+                confidence = Some(confidence.map_or(usage.quota_confidence, |current| {
+                    weakest_quota_confidence(current, usage.quota_confidence)
+                }));
+            }
+        }
+        result.quota_confidence = confidence.unwrap_or(Confidence::Unknown);
+        return result;
+    }
     let Some(task) = snapshot.tasks.get(row.index) else {
         return WindowUsage::default();
     };
@@ -2089,6 +2126,7 @@ impl TaskListMode {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TaskListRow {
+    kind: TaskRowKind,
     index: usize,
     prefix: String,
     depth: usize,
@@ -2097,8 +2135,18 @@ struct TaskListRow {
     hidden_descendants: Vec<usize>,
 }
 
+const DELETED_TASK_ROOT: usize = usize::MAX;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TaskRowKind {
+    Session,
+    DeletedRoot,
+    DeletedSession,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct OverviewRefreshAnchor {
+    selected_deleted_root: bool,
     selected_thread_id: Option<String>,
     selected_turn_id: Option<String>,
     task_viewport_thread_id: Option<String>,
@@ -2511,6 +2559,7 @@ struct ResumeLaunchCompletion {
 }
 
 struct RefreshCompletion {
+    deleted_sessions: Option<Result<Vec<crate::deleted_sessions::DeletedSessionRecord>, String>>,
     result: Option<CollectionResult>,
     remote_live: Option<Result<Vec<SourceRemoteLiveSnapshot>, String>>,
     remote_overview_history: Option<Result<RemoteOverviewHistory, String>>,
@@ -2562,6 +2611,7 @@ impl RefreshWorkerFailure {
 
 fn refresh_worker_failure_completion(failure: RefreshWorkerFailure) -> RefreshCompletion {
     RefreshCompletion {
+        deleted_sessions: None,
         result: None,
         remote_live: None,
         remote_overview_history: None,
@@ -3205,6 +3255,8 @@ impl View {
 }
 
 struct App {
+    session_management: SessionManagementState,
+    session_delete_hitbox: Option<SessionDeleteHitbox>,
     snapshot: Snapshot,
     /// Collector-only baseline. Remote history/live overlays always rebuild
     /// from this copy so replica replacement and source removal are idempotent.
@@ -3379,6 +3431,8 @@ impl App {
         let local_snapshot_partial = result.snapshot.partial;
         let local_snapshot = result.snapshot.clone();
         Self {
+            session_management: SessionManagementState::default(),
+            session_delete_hitbox: None,
             snapshot: result.snapshot,
             local_snapshot,
             account: result.account,
@@ -3765,6 +3819,9 @@ impl App {
     }
 
     fn open_control_available(&self) -> bool {
+        if self.selected_deleted_task() {
+            return false;
+        }
         if self.view != View::Overview || self.focus != Focus::Tasks || !self.shortcuts_active() {
             return false;
         }
@@ -3785,6 +3842,9 @@ impl App {
     }
 
     fn activate_open(&mut self) {
+        if self.selected_deleted_task() {
+            return;
+        }
         if self.view != View::Overview || self.focus != Focus::Tasks {
             return;
         }
@@ -4110,14 +4170,15 @@ impl App {
             .iter()
             .enumerate()
             .filter_map(|(index, task)| {
-                self.task_matches_filter_query(task, &query)
+                (!self.is_deleted_task(task) && self.task_matches_filter_query(task, &query))
                     .then_some(index)
             })
             .collect::<Vec<_>>();
         if self.task_list_mode == TaskListMode::Flat {
-            return filtered
+            let mut rows = filtered
                 .into_iter()
                 .map(|index| TaskListRow {
+                    kind: TaskRowKind::Session,
                     index,
                     prefix: String::new(),
                     depth: 0,
@@ -4126,6 +4187,8 @@ impl App {
                     hidden_descendants: Vec::new(),
                 })
                 .collect();
+            self.insert_deleted_task_rows(&mut rows);
+            return rows;
         }
 
         let visible_by_thread = filtered
@@ -4194,6 +4257,7 @@ impl App {
                 &mut rows,
             );
         }
+        self.insert_deleted_task_rows(&mut rows);
         rows
     }
 
@@ -4266,6 +4330,9 @@ impl App {
     }
 
     fn raw_turn_indices(&self) -> Vec<usize> {
+        if self.selected_deleted_task() {
+            return Vec::new();
+        }
         let Some(thread_id) = self.selected_thread_id() else {
             return Vec::new();
         };
@@ -4325,6 +4392,7 @@ impl App {
 
     fn shortcuts_active(&self) -> bool {
         !self.focus.is_search()
+            && !self.session_delete_visible()
             && self.entity_detail.is_none()
             && !self.version_info_visible
             && !self.quit_confirmation_visible
@@ -5733,8 +5801,18 @@ impl App {
         let target = if visible.contains(&self.selected_task) {
             self.selected_task
         } else {
-            self.nearest_visible_task_ancestor(self.selected_task, &visible)
-                .unwrap_or(filtered[0])
+            if self
+                .snapshot
+                .tasks
+                .get(self.selected_task)
+                .is_some_and(|task| self.is_deleted_task(task))
+                && visible.contains(&DELETED_TASK_ROOT)
+            {
+                DELETED_TASK_ROOT
+            } else {
+                self.nearest_visible_task_ancestor(self.selected_task, &visible)
+                    .unwrap_or(filtered[0])
+            }
         };
         let selection_changed = target != self.selected_task;
         if selection_changed {
@@ -5793,10 +5871,12 @@ impl App {
             self.focus = Focus::Tasks;
             let visible_tasks = self.filtered_task_indices();
             let restored_task = restore_thread_id.as_deref().and_then(|thread_id| {
-                visible_tasks
-                    .iter()
-                    .copied()
-                    .find(|index| self.snapshot.tasks[*index].thread_id == thread_id)
+                visible_tasks.iter().copied().find(|index| {
+                    self.snapshot
+                        .tasks
+                        .get(*index)
+                        .is_some_and(|task| task.thread_id == thread_id)
+                })
             });
             if let Some(task_index) = restored_task {
                 self.selected_task = task_index;
@@ -5994,6 +6074,16 @@ impl App {
     }
 
     fn set_task_collapsed(&mut self, index: usize, collapsed: bool) -> bool {
+        if index == DELETED_TASK_ROOT {
+            let changed = self.session_management.expanded == collapsed;
+            self.session_management.expanded = !collapsed;
+            if changed {
+                self.selected_task = DELETED_TASK_ROOT;
+                self.reset_turn_selection();
+                self.task_reveal_pending = true;
+            }
+            return changed;
+        }
         if self.task_list_mode != TaskListMode::Tree
             || !self
                 .filtered_task_rows()
@@ -6079,6 +6169,7 @@ impl App {
             .iter()
             .position(|index| *index == self.selected_task);
         OverviewRefreshAnchor {
+            selected_deleted_root: self.selected_task == DELETED_TASK_ROOT,
             selected_thread_id: self.raw_selected_thread_id().map(str::to_owned),
             selected_turn_id: self.selected_turn_record().map(|turn| turn.turn_id.clone()),
             task_viewport_thread_id: filtered
@@ -6138,6 +6229,15 @@ impl App {
             0
         };
         self.reconcile_task_filter(false);
+        if anchor.selected_deleted_root
+            && self
+                .filtered_task_rows()
+                .iter()
+                .any(|row| row.kind == TaskRowKind::DeletedRoot)
+        {
+            self.selected_task = DELETED_TASK_ROOT;
+            self.task_reveal_pending = true;
+        }
 
         if task_was_restored && !self.task_reveal_pending {
             // Keep offset zero as the live-list anchor. Once scrolled, anchor
@@ -7910,6 +8010,7 @@ fn append_task_tree_rows(
         collect_task_descendants(index, children, &mut hidden_descendants);
     }
     rows.push(TaskListRow {
+        kind: TaskRowKind::Session,
         index,
         prefix,
         depth: guides.len(),
@@ -7940,6 +8041,18 @@ fn collect_task_descendants(index: usize, children: &[Vec<usize>], descendants: 
 }
 
 fn handle_mouse_event(app: &mut App, event: MouseEvent) -> bool {
+    if app.session_delete_visible() {
+        if event.kind == MouseEventKind::Down(MouseButton::Left)
+            && let Some(hitbox) = app.session_delete_hitbox
+        {
+            if rect_contains(hitbox.confirm, event.column, event.row) {
+                app.confirm_session_delete();
+            } else if rect_contains(hitbox.cancel, event.column, event.row) {
+                app.cancel_session_delete();
+            }
+        }
+        return true;
+    }
     if app.entity_detail.is_some() {
         if let Some(hitbox) = app.entity_detail_hitbox {
             match event.kind {
@@ -7951,6 +8064,8 @@ fn handle_mouse_event(app: &mut App, event: MouseEvent) -> bool {
                         app.scroll_entity_detail(false, 1);
                     } else if rect_contains(hitbox.down, event.column, event.row) {
                         app.scroll_entity_detail(true, 1);
+                    } else if rect_contains(hitbox.delete, event.column, event.row) {
+                        app.request_session_delete();
                     } else if rect_contains(hitbox.next, event.column, event.row) {
                         app.cycle_entity_detail_section(true);
                     } else if rect_contains(hitbox.toggle, event.column, event.row) {
@@ -8178,7 +8293,7 @@ fn handle_mouse_event(app: &mut App, event: MouseEvent) -> bool {
                     true
                 } else if app.select_task_at(event.column, event.row) {
                     if activate_selected_task && app.selected_task == previously_selected_task {
-                        app.focus_turns();
+                        app.activate_selected_task();
                     } else {
                         app.focus_tasks();
                     }
@@ -8371,12 +8486,25 @@ fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
         return true;
     }
 
+    if app.session_delete_visible() {
+        match key.code {
+            KeyCode::Enter if key.modifiers.is_empty() => app.confirm_session_delete(),
+            KeyCode::Esc | KeyCode::Left => app.cancel_session_delete(),
+            _ => {}
+        }
+        return false;
+    }
     if app.entity_detail.is_some() {
         let page = app
             .entity_detail_hitbox
             .map_or(1, |hitbox| usize::from(hitbox.body.height).max(1));
         match key.code {
             KeyCode::Esc | KeyCode::Left | KeyCode::Char('q') => app.close_entity_detail(),
+            KeyCode::Char('x' | 'X')
+                if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+            {
+                app.request_session_delete();
+            }
             KeyCode::Up => app.scroll_entity_detail(false, 1),
             KeyCode::Down => app.scroll_entity_detail(true, 1),
             KeyCode::PageUp => app.scroll_entity_detail(false, page),
@@ -8990,7 +9118,7 @@ fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
             Focus::Tasks | Focus::Turns => {}
         },
         KeyCode::Enter if app.view == View::Overview && app.focus == Focus::Tasks => {
-            app.focus_turns();
+            app.activate_selected_task();
         }
         KeyCode::Backspace if app.view == View::Overview && app.focus == Focus::Turns => {
             app.focus_tasks();
@@ -9219,6 +9347,7 @@ fn prepare_deferred_initial_tui(
     let app_span = config.startup_trace.span("tui.app_create");
     let initial_theme = theme_override.unwrap_or_else(|| ui_state.theme.into());
     let mut app = App::new(initial_loading_result(config), initial_theme);
+    app.session_management.config = Some(config.clone());
     app.history_initialization_pending = true;
     app.attach_startup_progress(startup_progress);
     app.local_redact_content = config.redact_content;
@@ -9871,6 +10000,10 @@ fn apply_refresh_completion_at(
     let initialization_completed =
         app.history_initialization_pending && completion.history_source_state.is_some();
     let mut refresh_changed = false;
+    if let Some(records) = completion.deleted_sessions {
+        app.apply_deleted_session_records(records);
+        refresh_changed = true;
+    }
     if completion.summary_backfill {
         app.summary_backfill_running = false;
     }
@@ -10159,6 +10292,10 @@ fn run_loop(
         if app.poll_startup_progress(Instant::now()) {
             redraw_reasons.insert(RedrawReasons::PROGRESS);
         }
+        app.start_session_delete_work();
+        if app.poll_session_delete() {
+            redraw_reasons.insert(RedrawReasons::SNAPSHOT);
+        }
         if app.poll_entity_detail() {
             redraw_reasons.insert(RedrawReasons::SNAPSHOT);
         }
@@ -10421,7 +10558,19 @@ fn collect_initial_refresh_completion(
         },
     );
 
+    let deleted_sessions = session_management::load_records(config, rollout_cache);
+    if let Some(failure) = poisoned_refresh_state(rollout_cache, history_store) {
+        return refresh_worker_failure_completion(failure);
+    }
+    let deleted_sessions = match deleted_sessions {
+        Ok(records) => Ok(records),
+        Err(session_management::SessionRecordLoadError::Ledger(error)) => Err(error),
+        Err(session_management::SessionRecordLoadError::RolloutCachePoisoned) => {
+            return refresh_worker_failure_completion(RefreshWorkerFailure::RolloutCachePoisoned);
+        }
+    };
     RefreshCompletion {
+        deleted_sessions: Some(deleted_sessions),
         result: Some(result),
         remote_live: Some(remote_live),
         remote_overview_history: Some(remote_overview_history),
@@ -10465,6 +10614,7 @@ fn initial_refresh_panic_completion(config: &CollectConfig) -> RefreshCompletion
         TraceFields::new().label("reason", "panic")
     });
     RefreshCompletion {
+        deleted_sessions: None,
         result: Some(result),
         remote_live: None,
         remote_overview_history: None,
@@ -10607,6 +10757,21 @@ fn start_refresh_if_due(
     if let Some(failure) = poisoned_refresh_state(rollout_cache, history_store) {
         return app.record_refresh_worker_failure(failure, now, Utc::now());
     }
+    if app.session_delete_visible() || app.session_delete_busy() {
+        return false;
+    }
+    if app.session_management.force_local_refresh {
+        let Ok(mut cache) = rollout_cache.lock() else {
+            return app.record_refresh_worker_failure(
+                RefreshWorkerFailure::RolloutCachePoisoned,
+                now,
+                Utc::now(),
+            );
+        };
+        cache.invalidate_after_session_mutation();
+        app.last_local_refresh = now.checked_sub(LOCAL_REFRESH).unwrap_or(now);
+        app.refresh_retry_not_before = None;
+    }
     if app.refresh_retry_wait(now).is_some() {
         return false;
     }
@@ -10667,6 +10832,7 @@ fn start_refresh_if_due(
                         history_view_since(Utc::now()),
                     );
                     RefreshCompletion {
+                        deleted_sessions: None,
                         result: None,
                         remote_live: None,
                         remote_overview_history: None,
@@ -10693,8 +10859,11 @@ fn start_refresh_if_due(
         return true;
     }
     let local_refresh_due = now.saturating_duration_since(app.last_local_refresh) >= LOCAL_REFRESH;
-    let account_refresh_due = !config.offline && app.account_refresh_due(now);
-    if local_refresh_due
+    let forced_local_refresh = std::mem::take(&mut app.session_management.force_local_refresh);
+    let account_refresh_due =
+        !forced_local_refresh && !config.offline && app.account_refresh_due(now);
+    if !forced_local_refresh
+        && local_refresh_due
         && app.view == View::Summary
         && app.summary_range == SummaryRange::ThirtyDays
         && !app.summary_backfill_running
@@ -10702,7 +10871,8 @@ fn start_refresh_if_due(
         let query_now = Utc::now().max(app.snapshot.as_of);
         app.summary_backfill_pending = summary_history_backfill_needed(&app.history, query_now);
     }
-    let summary_backfill_due = app.view == View::Summary
+    let summary_backfill_due = !forced_local_refresh
+        && app.view == View::Summary
         && app.summary_range == SummaryRange::ThirtyDays
         && app.summary_backfill_pending
         && !matches!(
@@ -10771,6 +10941,7 @@ fn start_refresh_if_due(
                     };
                     normalize_history_warnings(&mut projection.history);
                     RefreshCompletion {
+                        deleted_sessions: None,
                         result: None,
                         remote_live: None,
                         remote_overview_history: None,
@@ -10800,7 +10971,7 @@ fn start_refresh_if_due(
     let collection_inputs = RefreshCollectionInputs::prepare(
         account_refresh_due,
         app.account.clone(),
-        account_window_projection_pending(&app.local_snapshot),
+        forced_local_refresh || account_window_projection_pending(&app.local_snapshot),
         || app.local_snapshot.clone(),
     );
     let worker_sender = context.refresh_sender.clone();
@@ -10874,7 +11045,22 @@ fn start_refresh_if_due(
                             Some(recorder_health),
                         )
                     });
+                let deleted_sessions =
+                    session_management::load_records(&worker_config, &worker_cache);
+                if let Some(failure) = poisoned_refresh_state(&worker_cache, &worker_history) {
+                    return refresh_worker_failure_completion(failure);
+                }
+                let deleted_sessions = match deleted_sessions {
+                    Ok(records) => Ok(records),
+                    Err(session_management::SessionRecordLoadError::Ledger(error)) => Err(error),
+                    Err(session_management::SessionRecordLoadError::RolloutCachePoisoned) => {
+                        return refresh_worker_failure_completion(
+                            RefreshWorkerFailure::RolloutCachePoisoned,
+                        );
+                    }
+                };
                 RefreshCompletion {
+                    deleted_sessions: Some(deleted_sessions),
                     result,
                     remote_live,
                     remote_overview_history,
@@ -10925,6 +11111,7 @@ fn next_run_loop_poll_timeout(app: &App, now: Instant, account_refresh_enabled: 
     if !app.launching_threads.is_empty()
         || app.remote_action_running.is_some()
         || app.entity_detail_loading()
+        || app.session_delete_busy()
     {
         timeout = timeout.min(BACKGROUND_CHANNEL_POLL);
     }
@@ -12138,6 +12325,9 @@ fn render_at(frame: &mut Frame<'_>, app: &mut App, now: DateTime<Utc>) {
         app.quit_confirmation_hitbox = Some(render_quit_confirmation(frame, area, app.theme));
     } else if app.version_info_visible {
         app.version_info_hitbox = Some(render_version_info(frame, area, app));
+    }
+    if app.session_delete_visible() {
+        app.session_delete_hitbox = Some(render_session_delete(frame, area, app));
     }
     if app
         .scroll_drag
@@ -18932,7 +19122,14 @@ fn render_health(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     frame.render_widget(source_table, rows[0]);
 
     let stats = &app.snapshot.stats;
-    let status_counts = count_statuses(&app.snapshot.tasks);
+    let ordinary_tasks = app
+        .snapshot
+        .tasks
+        .iter()
+        .filter(|task| !app.is_deleted_task(task))
+        .cloned()
+        .collect::<Vec<_>>();
+    let status_counts = count_statuses(&ordinary_tasks);
     let stats_text = vec![
         Line::from(format!(
             "Files  {}/{} scanned ({} truncated, {} unreadable)    Lines  {} parsed / {} skipped    Token counters  {} ambiguous resets",
@@ -19018,8 +19215,10 @@ fn diagnostics_paragraph(app: &App) -> Paragraph<'static> {
 fn diagnostics_issue_lines(app: &App) -> Vec<Line<'static>> {
     let palette = app.theme.palette();
     let issues = app
-        .remote_action_diagnostic
+        .session_management
+        .load_error
         .iter()
+        .chain(app.remote_action_diagnostic.iter())
         .map(|value| {
             Line::from(Span::styled(
                 terminal_safe_text(value),
@@ -19600,7 +19799,15 @@ fn render_tasks(frame: &mut Frame<'_>, area: Rect, app: &mut App, window_only: b
     let selected_position = filtered
         .iter()
         .position(|row| row.index == app.selected_task);
-    let (block, controls) = task_panel_block(area, app, window_only, filtered.len());
+    let (block, controls) = task_panel_block(
+        area,
+        app,
+        window_only,
+        filtered
+            .iter()
+            .filter(|row| row.kind == TaskRowKind::Session)
+            .count(),
+    );
     app.task_controls_hitbox = Some(controls);
     let table_inner = block.inner(area);
     let visible_capacity = usize::from(table_inner.height.saturating_sub(1));
@@ -19660,7 +19867,11 @@ fn render_tasks(frame: &mut Frame<'_>, area: Rect, app: &mut App, window_only: b
         .last()
         .copied()
         .unwrap_or(table_inner);
-    if tree_mode {
+    if tree_mode
+        || filtered
+            .iter()
+            .any(|row| row.kind == TaskRowKind::DeletedRoot)
+    {
         app.task_tree_marker_hitboxes = filtered
             .iter()
             .skip(offset)
@@ -19669,6 +19880,25 @@ fn render_tasks(frame: &mut Frame<'_>, area: Rect, app: &mut App, window_only: b
             .filter_map(|(position, row)| {
                 if !row.has_children {
                     return None;
+                }
+                if row.kind == TaskRowKind::DeletedRoot {
+                    let width = UnicodeWidthStr::width(
+                        app.deleted_task_root_label(row.hidden_descendants.len())
+                            .as_str(),
+                    )
+                    .min(usize::from(task_column.width)) as u16;
+                    return Some(TaskTreeMarkerHitbox {
+                        area: Rect::new(
+                            task_column.x,
+                            table_inner
+                                .y
+                                .saturating_add(1)
+                                .saturating_add(position as u16),
+                            width,
+                            1,
+                        ),
+                        task_index: DELETED_TASK_ROOT,
+                    });
                 }
                 let marker_x = task_column.x.saturating_add(
                     u16::try_from(UnicodeWidthStr::width(row.prefix.as_str())).unwrap_or(u16::MAX),
@@ -19695,13 +19925,57 @@ fn render_tasks(frame: &mut Frame<'_>, area: Rect, app: &mut App, window_only: b
         .skip(offset)
         .take(visible_capacity)
         .enumerate()
-        .filter_map(|(visible_position, row)| {
-            app.snapshot
-                .tasks
-                .get(row.index)
-                .map(|task| (task, row, visible_position))
-        })
+        .map(|(visible_position, row)| (app.snapshot.tasks.get(row.index), row, visible_position))
         .map(|(task, row, visible_position)| {
+            if row.kind == TaskRowKind::DeletedRoot {
+                let usage = aggregate_task_row_usage_with_api_long_context(
+                    &app.snapshot,
+                    app.window_scope,
+                    row,
+                    window_only,
+                    app.api_long_context_multiplier,
+                );
+                let mut cells = Vec::new();
+                if visible_columns.tokens {
+                    cells.push(Cell::from(format_tokens(usage.token_usage)));
+                }
+                if visible_columns.token_share {
+                    cells.push(Cell::from(format!(
+                        "{:.1}%",
+                        usage.local_token_share_percent
+                    )));
+                }
+                if visible_columns.estimated_quota {
+                    cells.push(Cell::from(format_estimated_quota(
+                        usage.estimated_quota_percent,
+                        usage.quota_confidence,
+                    )));
+                }
+                if visible_columns.api_equivalent {
+                    cells.push(Cell::from(api_cost_values[visible_position].clone()));
+                }
+                let active = tasks_focused
+                    && app.shortcuts_active()
+                    && app.selected_task == DELETED_TASK_ROOT;
+                let label = app.deleted_task_root_label(row.hidden_descendants.len());
+                let normal = Style::default().fg(palette.muted);
+                let shortcut = if active {
+                    Style::default()
+                        .fg(palette.accent)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    normal
+                };
+                cells.push(Cell::from(Line::from(vec![
+                    Span::styled("[", normal),
+                    Span::styled("↵", shortcut),
+                    Span::styled(label.chars().skip(2).collect::<String>(), normal),
+                ])));
+                return Row::new(cells);
+            }
+            let Some(task) = task else {
+                return Row::new(Vec::<Cell>::new());
+            };
             let usage = aggregate_task_row_usage_with_api_long_context(
                 &app.snapshot,
                 app.window_scope,
@@ -19719,7 +19993,7 @@ fn render_tasks(frame: &mut Frame<'_>, area: Rect, app: &mut App, window_only: b
             } else {
                 format!("{} ", status_marker(tone))
             };
-            let task_cell = if tree_mode {
+            let task_cell = if tree_mode || row.kind == TaskRowKind::DeletedSession {
                 let marker_style = Style::default().fg(palette.muted);
                 let shortcut_style =
                     if tasks_focused && app.shortcuts_active() && row.index == app.selected_task {
@@ -19741,8 +20015,20 @@ fn render_tasks(frame: &mut Frame<'_>, area: Rect, app: &mut App, window_only: b
                     spans.push(Span::raw("   "));
                 }
                 spans.push(Span::raw(" "));
+                let status_prefix_width = UnicodeWidthStr::width(status_prefix.as_str());
                 spans.push(Span::raw(status_prefix));
-                spans.push(Span::raw(task_display_label(task, row.depth > 0)));
+                spans.push(Span::raw(if row.kind == TaskRowKind::DeletedSession {
+                    let reserved = UnicodeWidthStr::width(row.prefix.as_str())
+                        + TASK_TREE_MARKER_WIDTH as usize
+                        + 1
+                        + status_prefix_width;
+                    app.deleted_task_label(
+                        task,
+                        usize::from(task_column.width).saturating_sub(reserved),
+                    )
+                } else {
+                    task_display_label(task, row.depth > 0)
+                }));
                 Cell::from(Line::from(spans))
             } else {
                 Cell::from(format!(
@@ -20186,7 +20472,15 @@ fn task_panel_block(
             OpenNoticeTone::Error => palette.error,
         };
         (
-            format!(" Open · {} ", terminal_safe_text(&notice.message)),
+            format!(
+                " {} · {} ",
+                if notice.message.starts_with("Deleted ") {
+                    "Session"
+                } else {
+                    "Open"
+                },
+                terminal_safe_text(&notice.message)
+            ),
             color,
         )
     } else {
@@ -20196,9 +20490,16 @@ fn task_panel_block(
             .get(app.selected_task)
             .filter(|task| app.task_matches_filter(task))
             .map(|task| {
+                if app.is_deleted_task(task) {
+                    return " Deleted · retained usage ".to_string();
+                }
                 format!(
                     " {filtered_count}/{} · {} {} ",
-                    app.snapshot.tasks.len(),
+                    app.snapshot
+                        .tasks
+                        .iter()
+                        .filter(|candidate| !app.is_deleted_task(candidate))
+                        .count(),
                     task.status.label(),
                     status_evidence(task.status_provenance, task.status_confidence)
                 )
