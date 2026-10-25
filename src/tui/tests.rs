@@ -27,6 +27,7 @@ mod backfill_memory;
 mod entity_detail;
 mod facts_projection;
 mod history_memory;
+mod initial_refresh;
 mod integration_scenarios;
 mod poisoned_refresh;
 mod refresh_memory;

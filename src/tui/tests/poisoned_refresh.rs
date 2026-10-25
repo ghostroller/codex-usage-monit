@@ -113,7 +113,7 @@ fn poisoned_initial_history_worker_stops_refresh_and_preserves_displayed_data() 
     let completion = refresh_receiver
         .recv_timeout(Duration::from_secs(5))
         .expect("a panic must still deliver the worker completion");
-    worker.join();
+    worker.finish();
     assert!(history.is_poisoned());
     assert!(apply_refresh_completion(&mut app, completion));
     // The panic boundary identifies poisoned state in its completion. No

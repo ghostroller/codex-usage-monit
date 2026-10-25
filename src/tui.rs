@@ -261,6 +261,8 @@ struct TuiHistoryStore {
     projection_cache_delivery_clones: usize,
     #[cfg(test)]
     deferred_runtime_preparation_hook: Option<Box<dyn FnOnce() + Send>>,
+    #[cfg(test)]
+    initial_history_load_hook: Option<Box<dyn FnOnce() + Send>>,
     remote_overview_cache: TuiRemoteOverviewCache,
 }
 
@@ -304,6 +306,8 @@ impl TuiHistoryStore {
             projection_cache_delivery_clones: 0,
             #[cfg(test)]
             deferred_runtime_preparation_hook: None,
+            #[cfg(test)]
+            initial_history_load_hook: None,
             remote_overview_cache: TuiRemoteOverviewCache::default(),
         }
     }
@@ -327,6 +331,8 @@ impl TuiHistoryStore {
             projection_cache_delivery_clones: 0,
             #[cfg(test)]
             deferred_runtime_preparation_hook: None,
+            #[cfg(test)]
+            initial_history_load_hook: None,
             remote_overview_cache: TuiRemoteOverviewCache::default(),
         }
     }
@@ -2571,6 +2577,13 @@ struct RefreshCompletion {
     worker_failure: Option<RefreshWorkerFailure>,
 }
 
+/// A display-only result from the initial worker, before history persistence
+/// and projection loading finish. It never releases the worker's ownership.
+struct InitialSnapshot {
+    result: CollectionResult,
+    deleted_sessions: Result<Vec<crate::deleted_sessions::DeletedSessionRecord>, String>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RefreshWorkerFailure {
     Initial,
@@ -2665,21 +2678,41 @@ struct HistoryRefreshCompletion {
 #[derive(Default)]
 struct RefreshWorker {
     handle: Option<thread::JoinHandle<()>>,
+    initial_snapshot: Option<Receiver<InitialSnapshot>>,
 }
 
 impl RefreshWorker {
     fn start(&mut self, handle: thread::JoinHandle<()>) {
-        self.join();
+        self.finish();
         self.handle = Some(handle);
     }
 
-    fn join(&mut self) {
-        if let Some(handle) = self.handle.take() {
+    fn start_initial(
+        &mut self,
+        handle: thread::JoinHandle<()>,
+        initial_snapshot: Receiver<InitialSnapshot>,
+    ) {
+        self.start(handle);
+        self.initial_snapshot = Some(initial_snapshot);
+    }
+
+    fn take_initial_snapshot(&mut self) -> Option<InitialSnapshot> {
+        self.initial_snapshot.as_ref()?.try_recv().ok()
+    }
+
+    fn finish(&mut self) {
+        self.initial_snapshot = None;
+        // Sending the terminal completion can precede thread teardown.
+        // Never make input handling or terminal restoration wait for it.
+        if let Some(handle) = self.handle.take()
+            && handle.is_finished()
+        {
             let _ = handle.join();
         }
     }
 
     fn detach(&mut self) {
+        self.initial_snapshot = None;
         self.handle.take();
     }
 }
@@ -2687,8 +2720,8 @@ impl RefreshWorker {
 impl Drop for RefreshWorker {
     fn drop(&mut self) {
         // Error and unwind paths must not delay TerminalGuard restoration on
-        // an in-flight refresh. Completed workers are joined explicitly when
-        // their completion is received; dropping only detaches unfinished work.
+        // an in-flight refresh. Only already finished threads may be joined;
+        // dropping detaches unfinished work.
         self.detach();
     }
 }
@@ -3624,7 +3657,7 @@ impl App {
     }
 
     fn startup_progress_label(&self, compact: bool) -> Option<String> {
-        initial_collection_loading(&self.snapshot)
+        (self.history_initialization_pending || initial_collection_loading(&self.snapshot))
             .then(|| format_startup_progress(self.startup_progress, compact))
     }
 
@@ -6290,9 +6323,30 @@ impl App {
         }
     }
 
-    fn replace(&mut self, mut result: CollectionResult, refreshed_account: bool) {
-        let completing_initial_load = initial_collection_loading(&self.snapshot);
+    fn replace(&mut self, result: CollectionResult, refreshed_account: bool) {
+        let completing_initial_load =
+            self.history_initialization_pending || initial_collection_loading(&self.snapshot);
         let force_local_materialization = account_window_projection_pending(&result.snapshot);
+        self.replace_displayed_collection(result, refreshed_account);
+        if completing_initial_load && let Some(tracker) = self.startup_progress_tracker.take() {
+            tracker.finish();
+            self.startup_progress = tracker.snapshot();
+        }
+        self.worker_running = false;
+        self.refresh_retry_not_before = None;
+        let now = Instant::now();
+        self.last_local_refresh = if force_local_materialization {
+            now.checked_sub(LOCAL_REFRESH).unwrap_or(now)
+        } else {
+            now
+        };
+    }
+
+    fn replace_displayed_collection(
+        &mut self,
+        mut result: CollectionResult,
+        refreshed_account: bool,
+    ) {
         self.local_snapshot_partial = result.snapshot.partial;
         self.local_snapshot = result.snapshot.clone();
         self.trusted_remote_parent_edges = merge_remote_live_into_snapshot(
@@ -6359,18 +6413,6 @@ impl App {
         self.scroll_drag = None;
         self.resume_confirmation_hitbox = None;
         self.restore_overview_refresh_anchor(anchor);
-        if completing_initial_load && let Some(tracker) = self.startup_progress_tracker.take() {
-            tracker.finish();
-            self.startup_progress = tracker.snapshot();
-        }
-        self.worker_running = false;
-        self.refresh_retry_not_before = None;
-        let now = Instant::now();
-        self.last_local_refresh = if force_local_materialization {
-            now.checked_sub(LOCAL_REFRESH).unwrap_or(now)
-        } else {
-            now
-        };
     }
 
     fn replace_remote_live_states(&mut self, states: Vec<SourceRemoteLiveSnapshot>) -> bool {
@@ -9991,12 +10033,66 @@ fn apply_refresh_completion(app: &mut App, completion: RefreshCompletion) -> boo
     apply_refresh_completion_at(app, completion, Instant::now(), Utc::now())
 }
 
+fn poll_refresh_worker(
+    app: &mut App,
+    config: &CollectConfig,
+    receiver: &Receiver<RefreshCompletion>,
+    worker: &mut RefreshWorker,
+    rollout_cache: &Mutex<RolloutCache>,
+    history_store: &Mutex<TuiHistoryStore>,
+) -> bool {
+    let mut changed = false;
+    if let Some(initial) = worker.take_initial_snapshot()
+        && app.history_initialization_pending
+        && !app.refresh_stopped
+    {
+        if let Some(failure) = poisoned_refresh_state(rollout_cache, history_store) {
+            changed |= app.record_refresh_worker_failure(failure, Instant::now(), Utc::now());
+        } else {
+            app.apply_deleted_session_records(initial.deleted_sessions);
+            app.replace_displayed_collection(initial.result, false);
+            app.event_log.lifecycle(
+                "tui.local_ready",
+                "preview",
+                "local usage is visible; history initialization is still running",
+            );
+            changed = true;
+        }
+    }
+    while let Ok(completion) = receiver.try_recv() {
+        let refresh_changed = apply_refresh_completion(app, completion);
+        config.event_log.record(
+            LogLevel::Debug,
+            "tui.refresh",
+            &format!(
+                "changed={refresh_changed} snapshotErrors={} snapshotWarnings={} historyWarnings={} initializing={}",
+                app.snapshot.errors.len(),
+                app.snapshot.warnings.len(),
+                app.history.warnings.len(),
+                app.history_initialization_pending,
+            ),
+        );
+        app.observe_diagnostics();
+        changed |= refresh_changed;
+        worker.finish();
+    }
+    changed
+}
+
 fn apply_refresh_completion_at(
     app: &mut App,
-    completion: RefreshCompletion,
+    mut completion: RefreshCompletion,
     now: Instant,
     observed_at: DateTime<Utc>,
 ) -> bool {
+    if completion.worker_failure == Some(RefreshWorkerFailure::Initial)
+        && app.history_initialization_pending
+        && !initial_collection_loading(&app.snapshot)
+    {
+        // A later bootstrap failure must not replace an already displayed
+        // local snapshot with the empty initial-loading fallback.
+        completion.result = None;
+    }
     let initialization_completed =
         app.history_initialization_pending && completion.history_source_state.is_some();
     let mut refresh_changed = false;
@@ -10254,24 +10350,15 @@ fn run_loop(
             refresh_worker.detach();
             return Ok(());
         }
-        while let Ok(completion) = context.refresh_receiver.try_recv() {
-            let refresh_changed = apply_refresh_completion(app, completion);
-            config.event_log.record(
-                LogLevel::Debug,
-                "tui.refresh",
-                &format!(
-                    "changed={refresh_changed} snapshotErrors={} snapshotWarnings={} historyWarnings={} initializing={}",
-                    app.snapshot.errors.len(),
-                    app.snapshot.warnings.len(),
-                    app.history.warnings.len(),
-                    app.history_initialization_pending,
-                ),
-            );
-            app.observe_diagnostics();
-            if refresh_changed {
-                redraw_reasons.insert(RedrawReasons::SNAPSHOT);
-            }
-            refresh_worker.join();
+        if poll_refresh_worker(
+            app,
+            config,
+            context.refresh_receiver,
+            &mut refresh_worker,
+            &rollout_cache,
+            &history_store,
+        ) {
+            redraw_reasons.insert(RedrawReasons::SNAPSHOT);
         }
         while let Ok(completion) = context.resume_receiver.try_recv() {
             app.apply_resume_completion(completion);
@@ -10432,6 +10519,26 @@ fn collect_initial_refresh_completion(
     history_source_selection: &HistorySourceSelection,
     startup_progress: Option<&StartupLoadProgressTracker>,
 ) -> RefreshCompletion {
+    collect_initial_refresh_with_snapshot(
+        config,
+        rollout_cache,
+        history_store,
+        history_source_generation,
+        history_source_selection,
+        startup_progress,
+        None,
+    )
+}
+
+fn collect_initial_refresh_with_snapshot(
+    config: &CollectConfig,
+    rollout_cache: &Arc<Mutex<RolloutCache>>,
+    history_store: &Arc<Mutex<TuiHistoryStore>>,
+    history_source_generation: u64,
+    history_source_selection: &HistorySourceSelection,
+    startup_progress: Option<&StartupLoadProgressTracker>,
+    initial_snapshot: Option<&mpsc::Sender<InitialSnapshot>>,
+) -> RefreshCompletion {
     let operation_trace = config.trace_log.span_with("tui.initial_data_ready", || {
         TraceFields::new().bool("offline", config.offline).label(
             "sourceScope",
@@ -10488,12 +10595,45 @@ fn collect_initial_refresh_completion(
         )
     });
 
+    if let Some(progress) = startup_progress {
+        progress.set_stage(StartupLoadStage::LoadingHistory);
+    }
+    if let Some(sender) = initial_snapshot {
+        // The preview needs retained deletion labels, but it must not wait for
+        // App Server reconciliation. The normal final path still reconciles
+        // receipts and invalidates the cache after any recovered outcome.
+        let deleted_sessions =
+            session_management::load_records_with_reconcile(config, rollout_cache, |_| {
+                Ok(Vec::new())
+            });
+        if let Some(failure) = poisoned_refresh_state(rollout_cache, history_store) {
+            return refresh_worker_failure_completion(failure);
+        }
+        let deleted_sessions = match deleted_sessions {
+            Ok(records) => Ok(records),
+            Err(session_management::SessionRecordLoadError::Ledger(error)) => Err(error),
+            Err(session_management::SessionRecordLoadError::RolloutCachePoisoned) => {
+                return refresh_worker_failure_completion(
+                    RefreshWorkerFailure::RolloutCachePoisoned,
+                );
+            }
+        };
+        let _ = sender.send(InitialSnapshot {
+            result: result.clone(),
+            deleted_sessions,
+        });
+    }
+
     let history_observation = report_history_observation(&result, config.offline);
     let history_span = config.startup_trace.span("tui.initial_history");
     let (projection, recorder_health, remote_live, remote_overview_history) = {
         let Ok(mut history_store) = history_store.lock() else {
             return refresh_worker_failure_completion(RefreshWorkerFailure::HistoryStatePoisoned);
         };
+        #[cfg(test)]
+        if let Some(hook) = history_store.initial_history_load_hook.take() {
+            hook();
+        }
         history_store.with_query_request(result.snapshot.as_of, |history_store| {
             let (projection, recorder_health) = stage_and_load_history_selected(
                 history_store,
@@ -10784,21 +10924,23 @@ fn start_refresh_if_due(
         let history_source_generation = app.history_source_generation;
         let history_source_selection = app.history_source_selection.clone();
         let startup_progress = app.startup_progress_tracker.clone();
+        let (initial_sender, initial_receiver) = mpsc::channel();
         app.initial_bootstrap_pending = false;
         app.history_source_loading = true;
         app.history_source_query_error = None;
         app.worker_running = true;
-        refresh_worker.start(thread::spawn(move || {
+        let handle = thread::spawn(move || {
             send_refresh_completion_catching_panics(
                 &worker_sender,
                 || {
-                    collect_initial_refresh_completion(
+                    collect_initial_refresh_with_snapshot(
                         &worker_config,
                         &worker_cache,
                         &worker_history,
                         history_source_generation,
                         &history_source_selection,
                         startup_progress.as_ref(),
+                        Some(&initial_sender),
                     )
                 },
                 || {
@@ -10808,7 +10950,8 @@ fn start_refresh_if_due(
                     )
                 },
             );
-        }));
+        });
+        refresh_worker.start_initial(handle, initial_receiver);
         return true;
     }
     if app.history_source_query_pending {
@@ -19537,7 +19680,7 @@ fn render_limits(
     let windows = ordered_quota_windows(snapshot);
 
     if windows.is_empty() {
-        let message = if initial_collection_loading(snapshot) {
+        let message = if startup_progress_label.is_some() || initial_collection_loading(snapshot) {
             startup_progress_label.unwrap_or("Loading quota and usage...")
         } else {
             "Quota unavailable"

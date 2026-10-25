@@ -1021,6 +1021,54 @@ mod tests {
     }
 
     #[test]
+    fn pending_receipt_capacity_prevents_the_mutating_rpc_and_preserves_prior_evidence() {
+        let (_directory, config, mut client) = fixture();
+        let prepared = prepare(&config, &mut client);
+        let template = DeletedSessionRecord::from_dataset(
+            ROOT,
+            "Existing pending session",
+            prepared.captured_at,
+            &prepared.capture.dataset,
+        )
+        .unwrap();
+        let records = (0..crate::app_server::session_management::MAX_DELETION_THREADS)
+            .map(|index| {
+                let mut record = template.clone();
+                record.thread_id = format!("aaaaaaaa-aaaa-4aaa-8aaa-{index:012x}");
+                record.parent_thread_id = None;
+                record.calls.clear();
+                record.turns.clear();
+                record.agent_interactions.clear();
+                record
+            })
+            .collect::<Vec<_>>();
+        deleted_sessions::prepare_delete(&config, "prior", &records).unwrap();
+        let before =
+            serde_json::to_value(deleted_sessions::load_deleted_sessions(&config).unwrap())
+                .unwrap();
+
+        let error = execute_with_client(&config, prepared, &mut client).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unresolved deletion member budget")
+        );
+        assert_eq!(client.calls, 0);
+        assert_eq!(
+            serde_json::to_value(deleted_sessions::load_deleted_sessions(&config).unwrap())
+                .unwrap(),
+            before
+        );
+        assert_eq!(
+            deleted_sessions::pending_deletion_receipts(&config)
+                .unwrap()
+                .len(),
+            records.len()
+        );
+        assert!(client.threads.values().all(|thread| thread.path.is_file()));
+    }
+
+    #[test]
     fn ledger_write_failure_prevents_the_mutating_rpc() {
         let (directory, mut config, mut client) = fixture();
         let bad_root = directory.path().join("not-a-ledger-directory");

@@ -4,10 +4,13 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-25
+
 ### Added
 
 - Open scrollable session and turn details with `F2` in Overview and Summary, including derived usage/duration metrics and bounded background reads of local message, tool, file-change, configuration, Git and model/hourly evidence. Preserve exact entity attribution, content redaction, capture/range boundaries and explicit missing/partial results.
 - View the running application's version, source build ID, target, and bundled current-version release notes in the TUI with `?` or Settings **[?]Version info**. Scroll with keyboard, mouse wheel, or the draggable scrollbar and return with **[←]Back**.
+- Delete selected local sessions through the desktop's existing App Server after an explicit confirmation. Retain recorded usage in a private, transactional deleted-session ledger so removing a conversation does not erase its historical usage.
 
 ### Changed
 
@@ -16,10 +19,24 @@ All notable changes to this project are documented in this file.
 - Avoid copying the complete local TUI snapshot during ordinary rollout refreshes; account refreshes still reuse their own local snapshot without rescanning rollouts.
 - Share quota, usage-bucket and weekly history arrays between cached projections and report views. Changes copy only the modified array, while warnings, read-only state and backfill markers remain independent.
 - Reuse immutable parsed rollout events during 30-day Summary backfill, keeping scan selection, reductions and refresh state independent of the live cache. Store events in shared bounded chunks and move large event payloads out of the common event slot while preserving the on-disk cache format.
+- Adopt a scoped Rust review policy, explicit collection policies and documented API contracts; isolate TUI terminal ownership and restoration without changing the application's keyboard bindings.
 
 ### Fixed
 
 - Keep session pane titles and launch error messages within their display-width limits without splitting Unicode grapheme clusters.
+- Stop refresh and deletion scheduling after interrupted history or rollout-cache updates, preserve the last displayed snapshot, and report the failure without publishing poisoned state during refresh or shutdown.
+- Preserve Windows file identity and compare-and-swap checks when reading and replacing private mappings, and avoid repeated history initialization work during startup.
+- Show the initial local snapshot while history preparation continues in the background, retaining input responsiveness and explicit loading state until history is ready.
+- Reject hard-linked or insufficiently private SQLite side files before opening or committing the deleted-session ledger, while preserving interrupted-transaction recovery.
+- Enforce the unresolved-deletion limit inside the durable preparation transaction, so an over-capacity batch cannot disable reconciliation or send a delete request.
+- Validate the ledger's final record count, total bytes and largest record before committing capture or outcome updates, keeping saved usage within its complete-read budgets.
+- Preserve usage attribution and reject unsafe state-output locations. Make RPC deadline, SSH and lock regressions independent of short scheduler delays.
+
+### Compatibility
+
+- The active history schema remains SQLite schema 2 and the remote protocol remains v5. Update synchronized nodes to the same source build and model-catalog fingerprint; restart already-running TUIs after updating.
+- Bundled estimator revision remains 8 and API pricing catalog revision remains 5; the complete external-catalog example remains 9/6. This release does not change model rates.
+- Session deletion requires the desktop App Server connection. The retained-usage ledger is independent of the rollout cache; deletion failures are reported explicitly and are not silently retried.
 
 ## [0.6.0] - 2026-10-04
 
@@ -368,7 +385,8 @@ All notable changes to this project are documented in this file.
 
 - JSON schema remains version 1. Existing confidence and preferred five-hour fields keep their prior meaning; reset-credit fields are additive and backward compatible.
 
-[Unreleased]: https://github.com/ghostroller/codex-usage-monit/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/ghostroller/codex-usage-monit/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/ghostroller/codex-usage-monit/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/ghostroller/codex-usage-monit/compare/v0.5.2...v0.6.0
 [0.5.2]: https://github.com/ghostroller/codex-usage-monit/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/ghostroller/codex-usage-monit/compare/v0.5.0...v0.5.1

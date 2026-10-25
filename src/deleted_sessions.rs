@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
@@ -31,6 +31,20 @@ const MAX_READ_BYTES: usize = 256 * 1024 * 1024;
 const MAX_RECORDS: usize = 100_000;
 const MAX_CALLS: usize = 500_000;
 const MAX_PENDING_RECEIPTS: usize = 512;
+
+#[derive(Clone, Copy)]
+struct LedgerReadBudget {
+    records: usize,
+    record_bytes: usize,
+    total_bytes: usize,
+}
+
+const LEDGER_READ_BUDGET: LedgerReadBudget = LedgerReadBudget {
+    records: MAX_RECORDS,
+    record_bytes: MAX_RECORD_BYTES,
+    total_bytes: MAX_READ_BYTES,
+};
+
 const LAYOUT: PrivateStoreLayout = PrivateStoreLayout {
     store_name: "deleted-session ledger",
     data_file_name: "ledger.sqlite3",
@@ -310,6 +324,85 @@ pub(crate) fn acquire_operation_lock(config: &CollectConfig) -> Result<FileLock>
     .open_lock(&directory, LockMode::Exclusive, LockFilePolicy::Create)?)
 }
 
+/// Validate existing recovery files before SQLite can consume or overwrite them.
+/// Repeat before commit because a transaction can create new side files. The
+/// rollback journal must remain removable by SQLite, so no guard survives this
+/// check; the enclosing private namespace and ledger lock serialize its owners.
+fn validate_side_files(directory: &Path) -> Result<()> {
+    for suffix in ["-journal", "-wal", "-shm"] {
+        let path = directory.join(format!("{}{suffix}", LAYOUT.data_file_name));
+        if !LAYOUT.data_file_exists(&path)? {
+            continue;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            // Do not open and close another fd for SQLite's files: that can
+            // release this process's POSIX locks on an active transaction.
+            ensure!(
+                fs::symlink_metadata(&path)?.nlink() == 1,
+                "deleted-session side files must have exactly one hard link"
+            );
+        }
+        #[cfg(windows)]
+        validate_windows_side_file(&path)?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn validate_windows_side_file(path: &Path) -> Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, GetFileInformationByHandle,
+    };
+
+    let open = || {
+        fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+    };
+    let validate = |file: &fs::File| -> Result<BY_HANDLE_FILE_INFORMATION> {
+        crate::source_identity::validate_windows_private_file(
+            path,
+            file,
+            "deleted-session database side file",
+        )?;
+        ensure!(
+            file.metadata()?.is_file(),
+            "deleted-session side file must be a regular file"
+        );
+        let mut information = BY_HANDLE_FILE_INFORMATION::default();
+        // SAFETY: file owns the live handle and information is a writable,
+        // correctly aligned output. This query does not transfer ownership.
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) } == 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        ensure!(
+            information.nNumberOfLinks == 1,
+            "deleted-session side files must have exactly one hard link"
+        );
+        Ok(information)
+    };
+    // Deny deletion only while checking both handles. Keeping either handle
+    // across SQLite recovery or COMMIT would prevent journal cleanup.
+    let guard = open()?;
+    let before = validate(&guard)?;
+    let current = open()?;
+    let after = validate(&current)?;
+    ensure!(
+        before.dwVolumeSerialNumber == after.dwVolumeSerialNumber
+            && before.nFileIndexHigh == after.nFileIndexHigh
+            && before.nFileIndexLow == after.nFileIndexLow,
+        "deleted-session side file pathname changed"
+    );
+    Ok(())
+}
+
 fn with_database<T>(
     config: &CollectConfig,
     write: bool,
@@ -333,9 +426,7 @@ fn with_database<T>(
         LAYOUT.write_atomically(&path, b"")?;
     }
     LAYOUT.data_file_exists(&path)?;
-    for suffix in ["-journal", "-wal", "-shm"] {
-        LAYOUT.data_file_exists(&directory.join(format!("ledger.sqlite3{suffix}")))?;
-    }
+    validate_side_files(&directory)?;
     let before = fs::symlink_metadata(&path)?;
     #[cfg(unix)]
     {
@@ -428,9 +519,7 @@ fn with_database<T>(
             )?;
             crate::source_history::database::validate_windows_sqlite_handle(connection, &current)?;
         }
-        for suffix in ["-journal", "-wal", "-shm"] {
-            LAYOUT.data_file_exists(&directory.join(format!("ledger.sqlite3{suffix}")))?;
-        }
+        validate_side_files(&directory)?;
         Ok(())
     };
     validate(&connection)?;
@@ -492,6 +581,15 @@ pub(crate) fn prepare_delete(
     operation_id: &str,
     records: &[DeletedSessionRecord],
 ) -> Result<()> {
+    prepare_delete_with_budget(config, operation_id, records, LEDGER_READ_BUDGET)
+}
+
+fn prepare_delete_with_budget(
+    config: &CollectConfig,
+    operation_id: &str,
+    records: &[DeletedSessionRecord],
+    budget: LedgerReadBudget,
+) -> Result<()> {
     ensure!(
         !operation_id.is_empty() && operation_id.len() <= 256 && !records.is_empty(),
         "invalid deletion operation"
@@ -523,6 +621,18 @@ pub(crate) fn prepare_delete(
     }
     with_database(config, true, |connection| {
         let transaction = connection;
+        // The ledger lock and BEGIN IMMEDIATE cover both the capacity check
+        // and publication. A separate read could admit concurrent operations
+        // whose combined unresolved members exceed the reconciliation budget.
+        let mut pending_ids = pending_deletion_receipts_in_database(transaction)?
+            .into_iter()
+            .map(|receipt| receipt.thread_id)
+            .collect::<HashSet<_>>();
+        pending_ids.extend(payloads.iter().map(|record| record.thread_id.clone()));
+        ensure!(
+            pending_ids.len() <= MAX_PENDING_RECEIPTS,
+            "unresolved deletion member budget exceeded; verify pending results before deleting more sessions"
+        );
         transaction.execute(
             "INSERT INTO operations(id,prepared_at) VALUES (?1,?2)",
             params![operation_id, Utc::now().to_rfc3339()],
@@ -551,6 +661,7 @@ pub(crate) fn prepare_delete(
             transaction.execute("INSERT INTO sessions(thread_id,operation_id,payload) VALUES (?1,?2,?3) ON CONFLICT(thread_id) DO UPDATE SET operation_id=excluded.operation_id,payload=excluded.payload", params![record.thread_id,operation_id,payload])?;
             transaction.execute("INSERT INTO outcomes(operation_id,thread_id,status,at) VALUES (?1,?2,'pending',?3)", params![operation_id,record.thread_id,record.captured_at.to_rfc3339()])?;
         }
+        validate_ledger_read_budget(transaction, budget)?;
         Ok(())
     })?;
     Ok(())
@@ -562,6 +673,24 @@ pub(crate) fn set_deletion_outcome(
     thread_id: &str,
     status: DeletionStatus,
     at: DateTime<Utc>,
+) -> Result<()> {
+    set_deletion_outcome_with_budget(
+        config,
+        operation_id,
+        thread_id,
+        status,
+        at,
+        LEDGER_READ_BUDGET,
+    )
+}
+
+fn set_deletion_outcome_with_budget(
+    config: &CollectConfig,
+    operation_id: &str,
+    thread_id: &str,
+    status: DeletionStatus,
+    at: DateTime<Utc>,
+    budget: LedgerReadBudget,
 ) -> Result<()> {
     with_database(config, true, |connection| {
         let transaction = connection;
@@ -591,8 +720,37 @@ pub(crate) fn set_deletion_outcome(
                 at.to_rfc3339()
             ],
         )?;
+        validate_ledger_read_budget(transaction, budget)?;
         Ok(())
     })?;
+    Ok(())
+}
+
+fn validate_ledger_read_budget(connection: &Connection, budget: LedgerReadBudget) -> Result<()> {
+    // Validate the resulting ledger inside the write transaction. Incoming
+    // batches alone do not account for old records, merged events, or fields
+    // added when recording an outcome after the delete RPC has completed.
+    let (records, total_bytes, record_bytes): (i64, i64, i64) = connection.query_row(
+        "SELECT count(*),COALESCE(sum(length(payload)),0),COALESCE(max(length(payload)),0) FROM sessions",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    let records = usize::try_from(records).context("invalid deletion ledger record count")?;
+    let total_bytes = usize::try_from(total_bytes).context("invalid deletion ledger total size")?;
+    let record_bytes =
+        usize::try_from(record_bytes).context("invalid deletion ledger record size")?;
+    ensure!(
+        records <= budget.records,
+        "deleted-session ledger would exceed its record-count read budget; operation was not committed"
+    );
+    ensure!(
+        record_bytes <= budget.record_bytes,
+        "deleted-session ledger would exceed its per-record read budget; operation was not committed"
+    );
+    ensure!(
+        total_bytes <= budget.total_bytes,
+        "deleted-session ledger would exceed its total-byte read budget; operation was not committed"
+    );
     Ok(())
 }
 
@@ -685,55 +843,80 @@ pub(crate) fn load_deleted_sessions(config: &CollectConfig) -> Result<Vec<Delete
 pub(crate) fn pending_deletion_receipts(
     config: &CollectConfig,
 ) -> Result<Vec<PendingDeletionReceipt>> {
-    Ok(with_database(config, false, |connection| {
-        let mut statement = connection.prepare(
-            "SELECT s.thread_id,s.operation_id,length(s.payload),s.payload,o.id,r.status \
+    Ok(with_database(config, false, pending_deletion_receipts_in_database)?.unwrap_or_default())
+}
+
+fn pending_deletion_receipts_in_database(
+    connection: &mut Connection,
+) -> Result<Vec<PendingDeletionReceipt>> {
+    let mut statement = connection.prepare(
+        "SELECT s.thread_id,s.operation_id,length(s.payload),s.payload,o.id,r.status \
              FROM sessions s \
              LEFT JOIN operations o ON o.id=s.operation_id \
              LEFT JOIN outcomes r ON r.operation_id=s.operation_id AND r.thread_id=s.thread_id \
              ORDER BY s.thread_id",
-        )?;
-        let mut rows = statement.query([])?;
-        let mut receipts = Vec::new();
-        let mut bytes = 0usize;
-        let mut count = 0usize;
-        while let Some(row) = rows.next()? {
-            let len = usize::try_from(row.get::<_, i64>(2)?)
-                .context("invalid pending deletion evidence length")?;
-            bytes = bytes.saturating_add(len);
-            count += 1;
-            ensure!(len <= MAX_RECORD_BYTES && bytes <= MAX_READ_BYTES && count <= MAX_RECORDS,
-                "pending deletion evidence exceeds the bounded read limit; reconciliation refused");
-            let thread_id: String = row.get(0)?;
-            let operation_id: String = row.get(1)?;
-            ensure!(!operation_id.is_empty() && operation_id.len() <= 256
+    )?;
+    let mut rows = statement.query([])?;
+    let mut receipts = Vec::new();
+    let mut bytes = 0usize;
+    let mut count = 0usize;
+    while let Some(row) = rows.next()? {
+        let len = usize::try_from(row.get::<_, i64>(2)?)
+            .context("invalid pending deletion evidence length")?;
+        bytes = bytes.saturating_add(len);
+        count += 1;
+        ensure!(
+            len <= MAX_RECORD_BYTES && bytes <= MAX_READ_BYTES && count <= MAX_RECORDS,
+            "pending deletion evidence exceeds the bounded read limit; reconciliation refused"
+        );
+        let thread_id: String = row.get(0)?;
+        let operation_id: String = row.get(1)?;
+        ensure!(
+            !operation_id.is_empty()
+                && operation_id.len() <= 256
                 && !operation_id.chars().any(char::is_control),
-                "invalid current deletion operation identity");
-            let parent: Option<String> = row.get(4)?;
-            ensure!(parent.as_deref() == Some(operation_id.as_str()),
-                "current deletion operation is missing from the ledger");
-            let payload: Vec<u8> = row.get(3)?;
-            let record: DeletedSessionRecord = serde_json::from_slice(&payload)
-                .context("invalid pending deletion usage evidence")?;
-            record.validate()?;
-            ensure!(record.thread_id == thread_id, "pending deletion thread identity mismatch");
-            let outcome: Option<String> = row.get(5)?;
-            let outcome = outcome.context("current deletion operation has no member outcome")?;
-            // Version 1 prepare stored bare `pending`; outcome updates stored
-            // JSON enum strings. Accept both existing representations without
-            // rewriting the journal during a read-only reconciliation query.
-            let status: DeletionStatus = serde_json::from_str(&outcome).or_else(|_| {
-                serde_json::from_value(serde_json::Value::String(outcome.clone()))
-            }).context("invalid current deletion member outcome")?;
-            ensure!(status == record.status, "current deletion member status disagrees with saved usage evidence");
-            if matches!(status, DeletionStatus::Pending | DeletionStatus::Unknown | DeletionStatus::Partial) {
-                ensure!(receipts.len() < MAX_PENDING_RECEIPTS,
-                    "more than 512 pending deletion receipts; reconciliation refused without truncation");
-                receipts.push(PendingDeletionReceipt { operation_id, thread_id });
-            }
+            "invalid current deletion operation identity"
+        );
+        let parent: Option<String> = row.get(4)?;
+        ensure!(
+            parent.as_deref() == Some(operation_id.as_str()),
+            "current deletion operation is missing from the ledger"
+        );
+        let payload: Vec<u8> = row.get(3)?;
+        let record: DeletedSessionRecord =
+            serde_json::from_slice(&payload).context("invalid pending deletion usage evidence")?;
+        record.validate()?;
+        ensure!(
+            record.thread_id == thread_id,
+            "pending deletion thread identity mismatch"
+        );
+        let outcome: Option<String> = row.get(5)?;
+        let outcome = outcome.context("current deletion operation has no member outcome")?;
+        // Version 1 prepare stored bare `pending`; outcome updates stored
+        // JSON enum strings. Accept both existing representations without
+        // rewriting the journal during a read-only reconciliation query.
+        let status: DeletionStatus = serde_json::from_str(&outcome)
+            .or_else(|_| serde_json::from_value(serde_json::Value::String(outcome.clone())))
+            .context("invalid current deletion member outcome")?;
+        ensure!(
+            status == record.status,
+            "current deletion member status disagrees with saved usage evidence"
+        );
+        if matches!(
+            status,
+            DeletionStatus::Pending | DeletionStatus::Unknown | DeletionStatus::Partial
+        ) {
+            ensure!(
+                receipts.len() < MAX_PENDING_RECEIPTS,
+                "more than 512 pending deletion receipts; reconciliation refused without truncation"
+            );
+            receipts.push(PendingDeletionReceipt {
+                operation_id,
+                thread_id,
+            });
         }
-        Ok(receipts)
-    })?.unwrap_or_default())
+    }
+    Ok(receipts)
 }
 
 pub(crate) fn ledger_fingerprint(config: &CollectConfig) -> Result<Option<String>> {
@@ -886,6 +1069,9 @@ pub(crate) fn overlay_deleted_sessions(
 mod tests {
     use super::*;
     use chrono::{Duration as ChronoDuration, TimeZone};
+
+    mod pending_capacity_tests;
+    mod side_file_tests;
 
     fn at() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 10, 20, 12, 0, 0).unwrap()
@@ -1146,7 +1332,24 @@ mod tests {
             pending_deletion_receipts(&config).unwrap().len(),
             MAX_PENDING_RECEIPTS
         );
-        prepare_delete(&config, "overflow", &[record("extra", "event", 1)]).unwrap();
+        // Emulate a ledger written before preparation enforced this bound.
+        // Current callers must never publish this unreconcilable state.
+        with_database(&config, true, |connection| {
+            connection.execute(
+                "INSERT INTO operations VALUES ('overflow', ?1)",
+                [at().to_rfc3339()],
+            )?;
+            connection.execute(
+                "INSERT INTO sessions VALUES ('extra', 'overflow', ?1)",
+                [serde_json::to_vec(&record("extra", "event", 1))?],
+            )?;
+            connection.execute(
+                "INSERT INTO outcomes VALUES ('overflow', 'extra', 'pending', ?1)",
+                [at().to_rfc3339()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
         assert!(
             pending_deletion_receipts(&config).is_err(),
             "513 pending members must not silently return a truncated list"
