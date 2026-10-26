@@ -22,6 +22,7 @@ use crate::history::{
     HISTORY_PROJECT_BREAKDOWN_REVISION, HistoryData, LocalHalfHourBucket, LocalProjectUsageGroup,
     LocalUsageGroup, current_history_estimator_revision,
 };
+use crate::history_query::WEEKLY_HISTORY_PROJECTION_UNAVAILABLE_WARNING;
 use crate::source_identity::NodeId;
 
 const LOGICAL_THREAD_PREFIX: &str = "logical-thread:";
@@ -36,8 +37,8 @@ pub(crate) struct RemoteOverviewHistory {
     unified_buckets: Arc<Vec<LocalHalfHourBucket>>,
     warnings: Arc<Vec<String>>,
     /// At least one unified-history warning means that the all-source API
-    /// total itself may be incomplete or duplicated. Project-label and tree
-    /// warnings deliberately do not set this bit.
+    /// total itself may be incomplete or duplicated. Project-label, tree,
+    /// and weekly-projection warnings deliberately do not set this bit.
     api_history_warning: bool,
     /// Included SSH node IDs and presentation labels. IDs classify scoped
     /// `raw@node` identities; labels are used only for visible source names.
@@ -964,14 +965,16 @@ fn remote_bucket_reason_affects_api_total(reason: &str) -> bool {
 
 fn remote_history_warning_affects_api_total(warning: &str) -> bool {
     // These warnings only affect project naming, tree placement, or an exact
-    // source selector that AllIncluded intentionally omitted. Every other
-    // warning is conservatively treated as possible source/replica loss.
+    // source selector that AllIncluded intentionally omitted, or the separate
+    // weekly projection. Every other warning is conservatively treated as
+    // possible source/replica loss.
     ![
         "project_mapping_partial",
         "project_mapping_unavailable",
         "project_mapping_registration_failed",
         "replica_project_conflict",
         "source_selection_excluded_from_aggregates",
+        WEEKLY_HISTORY_PROJECTION_UNAVAILABLE_WARNING,
     ]
     .iter()
     .any(|prefix| warning == *prefix || warning.starts_with(&format!("{prefix}:")))
@@ -1675,6 +1678,66 @@ mod tests {
             .as_ref()
             .unwrap();
         assert!(!project_warning_api.is_partial());
+    }
+
+    #[test]
+    fn weekly_projection_failure_preserves_complete_unified_api_totals() {
+        let node = "node-0123456789abcdef0123456789abcdef";
+        let history = HistoryData {
+            half_hour_buckets: vec![bucket(
+                at(11, 0),
+                vec![group(
+                    &format!("thread@{node}"),
+                    &format!("turn@{node}"),
+                    None,
+                    40,
+                )],
+            )]
+            .into(),
+            ..HistoryData::default()
+        };
+        let project = |data: &HistoryData| {
+            let history = RemoteOverviewHistory::from_unified(
+                data,
+                [(node.parse().unwrap(), "remote-a".to_owned())],
+                at(12, 0),
+            );
+            project_remote_overview_history(&history, &[analysis(300, at(10, 0))], at(12, 0))
+        };
+        let healthy = project(&history);
+        let mut failed_weekly = history;
+        failed_weekly
+            .warnings
+            .push("weekly_history_projection_unavailable: resource budget exceeded".into());
+        let isolated = project(&failed_weekly);
+        assert_eq!(
+            isolated.windows[0].api_equivalent_cost,
+            healthy.windows[0].api_equivalent_cost
+        );
+        assert!(
+            !isolated.windows[0]
+                .api_equivalent_cost
+                .as_ref()
+                .unwrap()
+                .is_partial()
+        );
+        assert_eq!(isolated.windows[0].model_token_usage.total_tokens, 40);
+        assert!(
+            isolated.windows[0]
+                .partial_reasons
+                .contains(&"remote_unified_history_warning".to_owned())
+        );
+        assert!(
+            !isolated.windows[0]
+                .partial_reasons
+                .contains(&"remote_api_history_warning".to_owned())
+        );
+        assert!(
+            isolated
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("weekly_history_projection_unavailable"))
+        );
     }
 
     #[test]

@@ -1,5 +1,8 @@
 //! Bucket and weekly aggregation projections for source-aware history reads.
 
+#[cfg(test)]
+mod tests;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 
@@ -20,12 +23,59 @@ use crate::source_identity::NodeId;
 use crate::source_model::ObservedProjectKey;
 use crate::trace::{TraceFields, TraceOutcome, process_trace_log};
 
-// Source history retains 35 days. A weekly reset can therefore contribute at
-// most five complete cycles plus boundary/current-cycle corrections. Sixteen
-// leaves ample room for clock-drift anchors while bounding corrupt remote
-// inputs before cycle projection multiplies their work.
-pub(super) const MAX_WEEKLY_RESET_CYCLES: usize = 16;
-const MAX_WEEKLY_PROJECTION_MEMBERSHIPS: usize = 4_000_000;
+// Reset schedules can change several times within a week. Bound the actual
+// index, allocation and projection work instead of guessing a cycle count
+// from the history retention window.
+const MAX_WEEKLY_PROJECTION_WORK: usize = 4_000_000;
+
+#[cfg(test)]
+thread_local! {
+    static WEEKLY_PROJECTION_WORK_LIMIT: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(MAX_WEEKLY_PROJECTION_WORK) };
+}
+
+#[cfg(test)]
+pub(super) fn with_weekly_projection_budget<T>(limit: usize, action: impl FnOnce() -> T) -> T {
+    struct RestoreLimit(usize);
+
+    impl Drop for RestoreLimit {
+        fn drop(&mut self) {
+            WEEKLY_PROJECTION_WORK_LIMIT.set(self.0);
+        }
+    }
+
+    let _restore = RestoreLimit(WEEKLY_PROJECTION_WORK_LIMIT.replace(limit));
+    action()
+}
+
+struct WeeklyProjectionBudget {
+    limit: usize,
+    used: usize,
+}
+
+impl WeeklyProjectionBudget {
+    fn new() -> Self {
+        #[cfg(test)]
+        let limit = WEEKLY_PROJECTION_WORK_LIMIT.get();
+        #[cfg(not(test))]
+        let limit = MAX_WEEKLY_PROJECTION_WORK;
+        Self { limit, used: 0 }
+    }
+
+    fn consume(&mut self, units: usize, phase: &str) -> io::Result<()> {
+        self.used = self
+            .used
+            .checked_add(units)
+            .ok_or_else(|| weekly_projection_limit_error("projection work count overflowed"))?;
+        if self.used > self.limit {
+            return Err(weekly_projection_limit_error(&format!(
+                "more than {} projection work units ({phase})",
+                self.limit
+            )));
+        }
+        Ok(())
+    }
+}
 
 pub(super) struct BucketProjection {
     pub(super) buckets: Vec<LocalHalfHourBucket>,
@@ -474,17 +524,30 @@ fn scoped_value(value: &str, source_id: &NodeId) -> String {
     format!("{value}@{}", source_id.as_str())
 }
 
+#[cfg(test)]
 pub(super) fn aggregate_source_weekly_points(
     sources: &[SourceSlice],
     account_quota: &[QuotaPoint],
     since: DateTime<Utc>,
 ) -> io::Result<Vec<WeeklyLocalPoint>> {
+    let resets = canonical_weekly_resets(sources, account_quota)?;
+    aggregate_source_weekly_points_for_resets(sources, &resets, since)
+}
+
+/// Projects only the already canonicalized cycles. Callers can isolate a
+/// failure of this projection while retaining independently reconciled
+/// buckets, and replica rebuilding cannot reinterpret rolling reset samples.
+pub(super) fn aggregate_source_weekly_points_for_resets(
+    sources: &[SourceSlice],
+    resets: &[DateTime<Utc>],
+    since: DateTime<Utc>,
+) -> io::Result<Vec<WeeklyLocalPoint>> {
     let trace = process_trace_log().span_with("history.weekly_aggregate", || {
         TraceFields::new()
             .usize("sourceCount", sources.len())
-            .usize("quotaPointCount", account_quota.len())
+            .usize("resetCycles", resets.len())
     });
-    match aggregate_source_weekly_points_with_work(sources, account_quota, since) {
+    match aggregate_weekly_resets_with_work(sources, resets, since) {
         Ok((points, work)) => {
             trace.finish_with(TraceOutcome::Ok, || {
                 TraceFields::new()
@@ -525,25 +588,47 @@ pub(super) struct WeeklyAggregationWork {
     pub(super) bucket_partition_evaluations: usize,
 }
 
+#[cfg(test)]
 pub(super) fn aggregate_source_weekly_points_with_work(
     sources: &[SourceSlice],
     account_quota: &[QuotaPoint],
     since: DateTime<Utc>,
 ) -> io::Result<(Vec<WeeklyLocalPoint>, WeeklyAggregationWork)> {
-    let mut work = WeeklyAggregationWork::default();
     let resets = canonical_weekly_resets(sources, account_quota)?;
-    work.reset_cycles = resets.len();
-    let cycle_plans = weekly_cycle_plans(sources, &resets, &mut work)?;
+    aggregate_weekly_resets_with_work(sources, &resets, since)
+}
+
+fn aggregate_weekly_resets_with_work(
+    sources: &[SourceSlice],
+    resets: &[DateTime<Utc>],
+    since: DateTime<Utc>,
+) -> io::Result<(Vec<WeeklyLocalPoint>, WeeklyAggregationWork)> {
+    let mut work = WeeklyAggregationWork {
+        reset_cycles: resets.len(),
+        ..WeeklyAggregationWork::default()
+    };
+    let mut budget = WeeklyProjectionBudget::new();
+    let cycle_plans = weekly_cycle_plans(sources, resets, &mut work, &mut budget)?;
     let mut points = Vec::new();
     for cycle_plan in cycle_plans {
         let resets_at = cycle_plan.resets_at;
-        points
-            .try_reserve(cycle_plan.timeline.len())
-            .map_err(|error| {
-                io::Error::other(format!(
-                    "could not allocate weekly projection output: {error}"
-                ))
-            })?;
+        let first_visible = cycle_plan.timeline.partition_point(|at| *at < since);
+        let end_visible = cycle_plan.timeline.partition_point(|at| *at < resets_at);
+        let visible_count = end_visible.saturating_sub(first_visible);
+        let evaluations = cycle_plan
+            .source_inputs
+            .len()
+            .checked_add(1)
+            .and_then(|width| visible_count.checked_mul(width))
+            .ok_or_else(|| weekly_projection_limit_error("source evaluation count overflowed"))?;
+        // Charge the emitted timeline before reserving output or cursors. The
+        // evidence lookback can be much larger than the visible projection.
+        budget.consume(evaluations, "source evaluations")?;
+        points.try_reserve(visible_count).map_err(|error| {
+            io::Error::other(format!(
+                "could not allocate weekly projection output: {error}"
+            ))
+        })?;
         let mut cursors = Vec::new();
         cursors
             .try_reserve(cycle_plan.source_inputs.len())
@@ -561,7 +646,8 @@ pub(super) fn aggregate_source_weekly_points_with_work(
         for observed_at in cycle_plan
             .timeline
             .into_iter()
-            .filter(|observed_at| *observed_at >= since && *observed_at < resets_at)
+            .skip(first_visible)
+            .take(visible_count)
         {
             work.timeline_points = work.timeline_points.saturating_add(1);
             let mut aggregate = WeeklyAccumulator::default();
@@ -622,15 +708,11 @@ fn weekly_projection_limit_error(detail: &str) -> io::Error {
     )
 }
 
-fn reserve_weekly_membership<T>(values: &mut Vec<T>, memberships: &mut usize) -> io::Result<()> {
-    *memberships = memberships
-        .checked_add(1)
-        .ok_or_else(|| weekly_projection_limit_error("projection membership count overflowed"))?;
-    if *memberships > MAX_WEEKLY_PROJECTION_MEMBERSHIPS {
-        return Err(weekly_projection_limit_error(&format!(
-            "more than {MAX_WEEKLY_PROJECTION_MEMBERSHIPS} indexed memberships"
-        )));
-    }
+fn reserve_weekly_membership<T>(
+    values: &mut Vec<T>,
+    budget: &mut WeeklyProjectionBudget,
+) -> io::Result<()> {
+    budget.consume(1, "indexed memberships")?;
     values.try_reserve(1).map_err(|error| {
         io::Error::other(format!(
             "could not allocate weekly projection index: {error}"
@@ -645,7 +727,14 @@ fn weekly_cycle_plans<'a>(
     sources: &'a [SourceSlice],
     resets: &[DateTime<Utc>],
     work: &mut WeeklyAggregationWork,
+    budget: &mut WeeklyProjectionBudget,
 ) -> io::Result<Vec<WeeklyCyclePlan<'a>>> {
+    let plan_cells = sources
+        .len()
+        .checked_add(1)
+        .and_then(|width| resets.len().checked_mul(width))
+        .ok_or_else(|| weekly_projection_limit_error("cycle/source plan count overflowed"))?;
+    budget.consume(plan_cells, "cycle/source plans")?;
     let mut plans = Vec::new();
     plans.try_reserve(resets.len()).map_err(|error| {
         io::Error::other(format!(
@@ -671,7 +760,6 @@ fn weekly_cycle_plans<'a>(
     }
 
     let weekly_window = Duration::minutes(WEEKLY_WINDOW_MINUTES);
-    let mut memberships = 0_usize;
     for (source_index, source) in sources.iter().enumerate() {
         for point in &source.weekly_local_points {
             work.weekly_partition_evaluations = work.weekly_partition_evaluations.saturating_add(1);
@@ -688,9 +776,9 @@ fn weekly_cycle_plans<'a>(
                 continue;
             }
             let input = &mut plan.source_inputs[source_index];
-            reserve_weekly_membership(&mut input.weekly, &mut memberships)?;
+            reserve_weekly_membership(&mut input.weekly, budget)?;
             input.weekly.push(point);
-            reserve_weekly_membership(&mut plan.timeline, &mut memberships)?;
+            reserve_weekly_membership(&mut plan.timeline, budget)?;
             plan.timeline.push(point.observed_at);
         }
 
@@ -705,9 +793,9 @@ fn weekly_cycle_plans<'a>(
                 });
             for plan in plans.iter_mut().take(complete_end).skip(complete_start) {
                 let input = &mut plan.source_inputs[source_index];
-                reserve_weekly_membership(&mut input.buckets, &mut memberships)?;
+                reserve_weekly_membership(&mut input.buckets, budget)?;
                 input.buckets.push(bucket);
-                reserve_weekly_membership(&mut plan.timeline, &mut memberships)?;
+                reserve_weekly_membership(&mut plan.timeline, budget)?;
                 plan.timeline.push(bucket.ends_at);
             }
 
@@ -720,7 +808,7 @@ fn weekly_cycle_plans<'a>(
                 });
             for plan in plans.iter_mut().take(coverage_end).skip(coverage_start) {
                 let coverage = &mut plan.source_inputs[source_index].coverage_buckets;
-                reserve_weekly_membership(coverage, &mut memberships)?;
+                reserve_weekly_membership(coverage, budget)?;
                 coverage.push(bucket);
             }
         }
@@ -747,11 +835,20 @@ pub(super) fn canonical_weekly_resets(
     account_quota: &[QuotaPoint],
 ) -> io::Result<Vec<DateTime<Utc>>> {
     // A server reports `observed_at + 7d` while a completely unused weekly
-    // window is not anchored yet. Persisted samples of that rolling estimate
-    // must not each become a distinct cycle. Non-zero account observations
-    // are authoritative; retain only the newest zero-evidence candidate so an
-    // actually idle current cycle can still be represented.
-    let latest_anchored_observation = account_quota
+    // window is not anchored yet. A local call can arrive before that gauge
+    // refreshes, so non-zero local usage alone must not turn a known rolling
+    // estimate into another historical cycle. Keep such estimates with the
+    // other unanchored candidates; only the newest idle cycle is represented.
+    let source_candidate_count = sources.iter().try_fold(0_usize, |total, source| {
+        total
+            .checked_add(source.weekly_local_points.len())
+            .ok_or_else(|| weekly_projection_limit_error("reset candidate count overflowed"))
+    })?;
+    let mut budget = WeeklyProjectionBudget::new();
+    budget.consume(account_quota.len(), "account reset candidates")?;
+    budget.consume(source_candidate_count, "source reset candidates")?;
+
+    let mut latest_anchored_observation = account_quota
         .iter()
         .filter(|point| {
             point.duration_mins == WEEKLY_WINDOW_MINUTES
@@ -759,13 +856,6 @@ pub(super) fn canonical_weekly_resets(
                 && quota_point_establishes_weekly_cycle(point)
         })
         .map(|point| point.observed_at)
-        .chain(
-            sources
-                .iter()
-                .flat_map(|source| &source.weekly_local_points)
-                .filter(|point| weekly_point_establishes_cycle(point))
-                .map(|point| point.observed_at),
-        )
         .max();
     let mut account_candidates = Vec::new();
     account_candidates
@@ -782,13 +872,19 @@ pub(super) fn canonical_weekly_resets(
         .then_some(point.resets_at)
     }));
     account_candidates.sort_unstable();
-    let account_resets = cluster_sorted_weekly_resets(&account_candidates, 0)?;
+    let account_resets = cluster_sorted_weekly_resets(&account_candidates)?;
+    let rolling_resets = RollingResetEvidence::from_quota(account_quota)?;
 
-    let source_candidate_count = sources.iter().try_fold(0_usize, |total, source| {
-        total
-            .checked_add(source.weekly_local_points.len())
-            .ok_or_else(|| weekly_projection_limit_error("reset candidate count overflowed"))
-    })?;
+    let mut latest_unanchored = account_quota
+        .iter()
+        .filter(|point| {
+            point.duration_mins == WEEKLY_WINDOW_MINUTES
+                && point.limit_id.trim().eq_ignore_ascii_case("codex")
+                && !quota_point_establishes_weekly_cycle(point)
+        })
+        .map(|point| (point.observed_at, true, point.resets_at))
+        // Prefer the account timestamp on an exact observation tie.
+        .max_by_key(|(observed_at, account, _)| (*observed_at, *account));
     let mut source_candidates = Vec::new();
     source_candidates
         .try_reserve(source_candidate_count)
@@ -797,19 +893,42 @@ pub(super) fn canonical_weekly_resets(
                 "could not allocate source weekly reset candidates: {error}"
             ))
         })?;
-    source_candidates.extend(
-        sources
+    for point in sources
+        .iter()
+        .flat_map(|source| &source.weekly_local_points)
+    {
+        // Account anchors and replica-rebuild markers remain authoritative.
+        // Exact rolling evidence is used only for otherwise unmatched source
+        // baselines, preserving genuinely distinct nearby account cycles.
+        let account_reset = assigned_canonical_reset(point.resets_at, &account_resets);
+        let rebuilt = point
+            .partial_reasons
             .iter()
-            .flat_map(|source| &source.weekly_local_points)
-            .filter(|point| weekly_point_establishes_cycle(point))
-            .map(|point| point.resets_at)
-            // An account reset is authoritative even when its timestamp is
-            // later than the source candidate, so filter against the complete
-            // account set before clustering source-only timestamps.
-            .filter(|candidate| assigned_canonical_reset(*candidate, &account_resets).is_none()),
-    );
+            .any(|reason| reason == DUPLICATE_SESSION_WEEKLY_REBUILT_FROM_BUCKETS);
+        let anchored = weekly_point_establishes_cycle(point)
+            && (account_reset.is_some()
+                || rebuilt
+                || !rolling_resets.was_superseded(point, &account_resets));
+        if anchored {
+            latest_anchored_observation = Some(
+                latest_anchored_observation
+                    .map_or(point.observed_at, |latest| latest.max(point.observed_at)),
+            );
+            if account_reset.is_none() {
+                source_candidates.push(point.resets_at);
+            }
+        } else {
+            let candidate = (point.observed_at, false, point.resets_at);
+            if latest_unanchored
+                .as_ref()
+                .is_none_or(|latest| (candidate.0, candidate.1) > (latest.0, latest.1))
+            {
+                latest_unanchored = Some(candidate);
+            }
+        }
+    }
     source_candidates.sort_unstable();
-    let source_resets = cluster_sorted_weekly_resets(&source_candidates, account_resets.len())?;
+    let source_resets = cluster_sorted_weekly_resets(&source_candidates)?;
 
     let mut resets = account_resets;
     resets.try_reserve(source_resets.len()).map_err(|error| {
@@ -819,38 +938,11 @@ pub(super) fn canonical_weekly_resets(
     })?;
     resets.extend(source_resets);
     resets.sort_unstable();
-    if resets.len() > MAX_WEEKLY_RESET_CYCLES {
-        return Err(weekly_projection_limit_error(&format!(
-            "more than {MAX_WEEKLY_RESET_CYCLES} canonical reset cycles in retained history"
-        )));
-    }
 
-    let latest_unanchored = account_quota
-        .iter()
-        .filter(|point| {
-            point.duration_mins == WEEKLY_WINDOW_MINUTES
-                && point.limit_id.trim().eq_ignore_ascii_case("codex")
-                && !quota_point_establishes_weekly_cycle(point)
-        })
-        .map(|point| (point.observed_at, true, point.resets_at))
-        .chain(
-            sources
-                .iter()
-                .flat_map(|source| &source.weekly_local_points)
-                .filter(|point| !weekly_point_establishes_cycle(point))
-                .map(|point| (point.observed_at, false, point.resets_at)),
-        )
-        // Prefer the account timestamp on an exact observation tie.
-        .max_by_key(|(observed_at, account, _)| (*observed_at, *account));
     if let Some((observed_at, _, candidate)) = latest_unanchored
         && latest_anchored_observation.is_none_or(|anchored| observed_at > anchored)
         && assigned_canonical_reset(candidate, &resets).is_none()
     {
-        if resets.len() >= MAX_WEEKLY_RESET_CYCLES {
-            return Err(weekly_projection_limit_error(&format!(
-                "more than {MAX_WEEKLY_RESET_CYCLES} canonical reset cycles in retained history"
-            )));
-        }
         resets.try_reserve(1).map_err(|error| {
             io::Error::other(format!(
                 "could not allocate canonical weekly reset index: {error}"
@@ -862,36 +954,77 @@ pub(super) fn canonical_weekly_resets(
     Ok(resets)
 }
 
-fn cluster_sorted_weekly_resets(
-    candidates: &[DateTime<Utc>],
-    existing_cycle_count: usize,
-) -> io::Result<Vec<DateTime<Utc>>> {
-    let available = MAX_WEEKLY_RESET_CYCLES
-        .checked_sub(existing_cycle_count)
-        .ok_or_else(|| {
-            weekly_projection_limit_error(&format!(
-                "more than {MAX_WEEKLY_RESET_CYCLES} canonical reset cycles in retained history"
-            ))
-        })?;
+/// Zero gauges whose reset is still `observed_at + 7d`, indexed by the exact
+/// server timestamp copied into local history. A known replacement must have
+/// begun before the local baseline, so a genuinely stable zero gauge remains a
+/// source-only cycle even after later cycles arrive. The sorted index keeps
+/// matching logarithmic in retained samples.
+struct RollingResetEvidence {
+    observations: Vec<(DateTime<Utc>, DateTime<Utc>)>,
+}
+
+impl RollingResetEvidence {
+    fn from_quota(account_quota: &[QuotaPoint]) -> io::Result<Self> {
+        let mut observations = Vec::new();
+        observations
+            .try_reserve(account_quota.len())
+            .map_err(|error| {
+                io::Error::other(format!(
+                    "could not allocate rolling reset evidence: {error}"
+                ))
+            })?;
+        observations.extend(account_quota.iter().filter_map(|point| {
+            (point.duration_mins == WEEKLY_WINDOW_MINUTES
+                && point.limit_id.trim().eq_ignore_ascii_case("codex")
+                && !quota_point_establishes_weekly_cycle(point)
+                && point
+                    .observed_at
+                    .checked_add_signed(Duration::minutes(WEEKLY_WINDOW_MINUTES))
+                    .is_some_and(|rolling| reset_matches(rolling, point.resets_at)))
+            .then_some((point.resets_at, point.observed_at))
+        }));
+        observations.sort_unstable();
+        // Sorting by (reset, observation) retains the earliest explanation of
+        // each exact reset without scanning the quota history for every point.
+        observations.dedup_by_key(|(reset, _)| *reset);
+        Ok(Self { observations })
+    }
+
+    fn was_superseded(&self, point: &WeeklyLocalPoint, account_resets: &[DateTime<Utc>]) -> bool {
+        let Some(rolling_observed_at) = self
+            .observations
+            .binary_search_by_key(&point.resets_at, |(reset, _)| *reset)
+            .ok()
+            .map(|index| self.observations[index].1)
+        else {
+            return false;
+        };
+        if rolling_observed_at > point.observed_at {
+            return false;
+        }
+        let replacement = account_resets.partition_point(|reset| *reset <= point.resets_at);
+        account_resets
+            .get(replacement)
+            .and_then(|reset| reset.checked_sub_signed(Duration::minutes(WEEKLY_WINDOW_MINUTES)))
+            .is_some_and(|starts_at| {
+                starts_at >= rolling_observed_at && starts_at <= point.observed_at
+            })
+    }
+}
+
+fn cluster_sorted_weekly_resets(candidates: &[DateTime<Utc>]) -> io::Result<Vec<DateTime<Utc>>> {
     let mut resets = Vec::new();
-    resets
-        .try_reserve(available.min(candidates.len()))
-        .map_err(|error| {
-            io::Error::other(format!(
-                "could not allocate canonical weekly reset index: {error}"
-            ))
-        })?;
+    resets.try_reserve(candidates.len()).map_err(|error| {
+        io::Error::other(format!(
+            "could not allocate canonical weekly reset index: {error}"
+        ))
+    })?;
     for candidate in candidates.iter().copied() {
         if resets
             .last()
             .is_some_and(|existing| reset_matches(*existing, candidate))
         {
             continue;
-        }
-        if resets.len() >= available {
-            return Err(weekly_projection_limit_error(&format!(
-                "more than {MAX_WEEKLY_RESET_CYCLES} canonical reset cycles in retained history"
-            )));
         }
         resets.push(candidate);
     }

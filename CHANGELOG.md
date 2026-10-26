@@ -4,6 +4,10 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Keep existing Trends and Summary history readable when reset schedules change frequently. Recognize rolling zero-usage reset estimates carried into local usage, replace the fixed 16-cycle limit with a projection work budget, and isolate weekly projection failures while retaining quota, deduplicated buckets and project totals. Stored history and database schema remain unchanged.
+
 ## [0.7.0] - 2026-10-25
 
 ### Added

@@ -364,6 +364,9 @@ fn half_hour_estimated_trend(
     as_of: DateTime<Utc>,
     api_long_context: bool,
 ) -> Vec<TrendPoint> {
+    if !history.weekly_projection_available() {
+        return Vec::new();
+    }
     let resets = weekly_resets_overlapping_as_of(history, bounds, as_of);
     let estimates_by_reset = resets
         .iter()
@@ -701,6 +704,38 @@ mod tests {
         );
         assert!(partial.partial);
         assert!(report.half_hour_estimated[1].partial);
+    }
+
+    #[test]
+    fn weekly_projection_failure_preserves_quota_and_fifteen_minute_tokens() {
+        let now = at("2026-07-29T09:16:42Z");
+        let mut history = history_fixture(now);
+        let healthy = build_trends_report(&history, now, 0, false);
+        let warning = "weekly_history_projection_unavailable: resource budget exceeded";
+        history.warnings = vec![warning.to_owned()];
+
+        for api_long_context in [false, true] {
+            let report = build_trends_report(&history, now, 0, api_long_context);
+            assert_eq!(report.five_hour_remaining, healthy.five_hour_remaining);
+            assert_eq!(report.weekly_remaining, healthy.weekly_remaining);
+            assert_eq!(report.half_hour_tokens, healthy.half_hour_tokens);
+            assert_eq!(
+                report.five_hour_remaining_readout,
+                healthy.five_hour_remaining_readout
+            );
+            assert_eq!(
+                report.weekly_remaining_readout,
+                healthy.weekly_remaining_readout
+            );
+            assert!(report.half_hour_history_present);
+            assert!(report.weekly_tokens.is_empty());
+            assert!(report.weekly_estimated.is_empty());
+            assert!(report.half_hour_estimated.is_empty());
+            assert!(report.weekly_tokens_readout.is_none());
+            assert!(report.weekly_estimated_readout.is_none());
+            assert!(!report.weekly_history_present);
+            assert_eq!(report.history_warnings, [warning]);
+        }
     }
 
     #[test]

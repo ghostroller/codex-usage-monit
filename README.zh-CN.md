@@ -251,6 +251,8 @@ codex-usage-monit --redact-content record
 
 历史生产后端统一为 SQLite；`history-v1` 是沿用的路径绑定名称，数据保存在同一 state-root 的 `history-v2/{profile}/history.sqlite3`。初始化只保留旧配额采样，以及来源策略、本地编号高水位和未完成的来源删除意图等控制状态；即使来源 metadata 已删除，中断的不可逆删除仍阻止重新配对；身份和配置原文件保持不动，其余旧派生历史由既有采集、Summary 有界回填与 SSH bootstrap 按需重建，不在启动时主动解析全部历史。已激活的数据库缺失、损坏或 receipt 不支持时明确报错，不自动丢库重建，也不退回旧文件历史；当前 schema 为 version 2；旧 schema 1 开发预览库及 full-migration receipt 不兼容，不自动删库；正常旧文件版本的配额采样保留不受影响。完整去重与远端协议继续保留，范围和当前验证状态见[存储执行方案](docs/storage-rewrite-execution-plan-2026-10-02.zh-CN.md#73-sqlite-唯一后端与按需重建)。
 
+周历史会区分未使用窗口的滚动重置估计与已确定的重置时间，包括本地调用先于账户额度刷新到达的情况。重置安排可能在一周内多次变化，因此读取按实际投影工作量限额，不再限制固定周期数；这些修正保留原有历史记录。周投影无法完成时，会明确诊断周累计与配额估算不可用，同时保留账户配额、15 分钟 token 历史，以及独立完成去重的 Summary/Overview 总额。存储读取或副本去重失败仍会停止相应查询。
+
 **Settings** 中也提供相同的逐主机控制和显式项目映射。Git 证据仍只是需要接受的建议；未映射 instance 会单独列出，可多选后明确执行手工 Merge，Split 则撤销 logical membership。同步完成后，Overview 使用两层本地数据：source-aware 统一历史独立于 Summary/Trends 的来源选择器，负责提供经过 replica 去重的 task/turn 行以及 5 小时/周窗口用量；有边界的 live 快照只负责近期状态和元数据。live 层包含活动/不确定任务以及最近 24 小时的终态记录，语义 revision 握手只在内容变化时发送完整快照，硬上限为 128 个 task、512 个 turn 和 64 KiB；没有变化时只发送 revision，本地 baseline 丢失时则强制补发完整 replacement。远端行只读，连续 15 分钟没有成功刷新后会变为 `STALE`。live 中的 task/turn 累计计数绝不会在历史缺失时冒充 5 小时或周窗口数据；历史覆盖不完整时会继续明确显示为下界。
 
 滚动带宽预算按每个已配置 source 独立计算：自动 bulk 在 rolling 24 小时达到 150 MiB 时暂停，普通自动传输在 250 MiB 时暂停。调度器只有一个 worker，同一时刻最多连接一台主机；但如果显式启用多台主机，总预算仍会线性叠加，因此只应启用确实需要轮询的主机。Exclude 只会让保留 source 不再参与 **All** 和 replica authority 计算，不会删除数据；在 Summary 或 Trends 精确选中该 source 时仍可查看 inspect-only 数据，并明确标为 `EXCLUDED`。

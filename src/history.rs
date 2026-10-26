@@ -23,6 +23,7 @@ use crate::domain::{
     AgentInteraction, AgentInteractionKind, ApiCostAmount, LimitBucket, Provenance, TaskRecord,
     TokenUsage, TurnRecord, UsageCall,
 };
+use crate::history_query::WEEKLY_HISTORY_PROJECTION_UNAVAILABLE_WARNING;
 
 pub const HISTORY_FORMAT_VERSION: u32 = 2;
 pub const HISTORY_METRIC_REVISION: u32 = 5;
@@ -345,6 +346,18 @@ impl HistoryData {
         &self.half_hour_buckets
     }
 
+    /// Whether weekly totals and quota estimates can use this history snapshot.
+    /// A failed weekly projection must not silently fall back to bucket-derived
+    /// estimates. Account quota and raw local buckets remain independently usable.
+    pub fn weekly_projection_available(&self) -> bool {
+        !self.warnings.iter().any(|warning| {
+            warning == WEEKLY_HISTORY_PROJECTION_UNAVAILABLE_WARNING
+                || warning
+                    .strip_prefix(WEEKLY_HISTORY_PROJECTION_UNAVAILABLE_WARNING)
+                    .is_some_and(|detail| detail.starts_with(':'))
+        })
+    }
+
     pub fn latest_weekly_reset(&self) -> Option<DateTime<Utc>> {
         self.latest_weekly_reset_as_of(DateTime::<Utc>::MAX_UTC)
     }
@@ -397,6 +410,9 @@ impl HistoryData {
         as_of: DateTime<Utc>,
         api_long_context: bool,
     ) -> Vec<HalfHourSeriesPoint> {
+        if !self.weekly_projection_available() {
+            return Vec::new();
+        }
         let cycle_starts_at =
             datetime_saturating_sub(weekly_resets_at, Duration::minutes(WEEK_MINS));
         let boundary_crosses_bucket =
@@ -479,6 +495,9 @@ impl HistoryData {
         as_of: DateTime<Utc>,
         api_long_context: bool,
     ) -> Vec<WeeklyCumulativePoint> {
+        if !self.weekly_projection_available() {
+            return Vec::new();
+        }
         if let Some(points) =
             self.recorded_weekly_cumulative_series(weekly_resets_at, as_of, api_long_context)
         {
@@ -5736,6 +5755,73 @@ mod tests {
         assert_eq!(cumulative[2].token_usage.total_tokens, 40);
         assert_eq!(cumulative[2].estimated_quota_percent, Some(60.0));
         assert_eq!(data.latest_weekly_reset(), Some(reset));
+    }
+
+    #[test]
+    fn weekly_projection_failure_disables_all_weekly_and_estimated_series() {
+        let reset = at(2026, 7, 31, 12, 0, 0);
+        let observed_at = reset - Duration::hours(1);
+        let data = HistoryData {
+            quota_points: vec![quota_point(observed_at, reset, 60.0)].into(),
+            half_hour_buckets: vec![local_bucket(
+                reset - Duration::days(7),
+                observed_at,
+                10,
+                100,
+            )]
+            .into(),
+            warnings: vec![
+                "weekly_history_projection_unavailable: resource budget exceeded".into(),
+            ],
+            ..HistoryData::default()
+        };
+        let quota = data.remaining_series(WEEK_MINS);
+        let buckets = data.half_hour_series().to_vec();
+        for with_recorded_baseline in [false, true] {
+            let mut history = data.clone();
+            if with_recorded_baseline {
+                history.weekly_local_points =
+                    vec![weekly_point(observed_at, reset, 10, 100)].into();
+            }
+            assert!(history.weekly_cumulative_series(reset).is_empty());
+            assert!(
+                history
+                    .weekly_cumulative_series_as_of(reset, observed_at)
+                    .is_empty()
+            );
+            assert!(
+                history
+                    .weekly_cumulative_series_with_api_long_context(reset, true)
+                    .is_empty()
+            );
+            assert!(
+                history
+                    .weekly_cumulative_series_with_api_long_context_as_of(reset, observed_at, true)
+                    .is_empty()
+            );
+            assert!(history.estimated_half_hour_series(reset).is_empty());
+            assert!(
+                history
+                    .estimated_half_hour_series_as_of(reset, observed_at)
+                    .is_empty()
+            );
+            assert!(
+                history
+                    .estimated_half_hour_series_with_api_long_context(reset, true)
+                    .is_empty()
+            );
+            assert!(
+                history
+                    .estimated_half_hour_series_with_api_long_context_as_of(
+                        reset,
+                        observed_at,
+                        true
+                    )
+                    .is_empty()
+            );
+            assert_eq!(history.remaining_series(WEEK_MINS), quota);
+            assert_eq!(history.half_hour_series(), buckets);
+        }
     }
 
     #[test]

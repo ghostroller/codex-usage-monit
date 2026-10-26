@@ -2016,6 +2016,74 @@ mod tests {
     }
 
     #[test]
+    fn weekly_projection_failure_preserves_summary_projects_and_exact_totals() {
+        let now = at(30, 10, 0);
+        let snapshot = snapshot(now);
+        let starts_at = now - Duration::days(7);
+        let bucket_count = 7 * 24 * 60 / LOCAL_BUCKET_MINUTES;
+        let buckets = (0..=bucket_count)
+            .map(|index| {
+                let start = starts_at + Duration::minutes(index * LOCAL_BUCKET_MINUTES);
+                if start == now - Duration::hours(1) {
+                    bucket(
+                        start,
+                        150,
+                        vec![project_group("root", "root", "turn-1", 150, 300, Some(100))],
+                    )
+                } else {
+                    bucket(start, 0, Vec::new())
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut history = HistoryData {
+            half_hour_buckets: buckets.into(),
+            ..HistoryData::default()
+        };
+        history.half_hour_buckets.last_mut().unwrap().sampled_at = now;
+        let warning = format!(
+            "{}: resource budget exceeded",
+            crate::history_query::WEEKLY_HISTORY_PROJECTION_UNAVAILABLE_WARNING
+        );
+        let mut failed_weekly = history.clone();
+        failed_weekly.warnings.push(warning.clone());
+
+        for metric in [SummaryMetric::Tokens, SummaryMetric::ApiEquivalent] {
+            let query = SummaryReportQuery::new(
+                SummaryRange::SevenDays,
+                SummaryGrain::Hours6,
+                metric,
+                false,
+                now,
+            );
+            let healthy =
+                build_summary_report_with_local_time(&snapshot, &history, query, |timestamp| {
+                    timestamp.naive_utc()
+                });
+            let isolated = build_summary_report_with_local_time(
+                &snapshot,
+                &failed_weekly,
+                query,
+                |timestamp| timestamp.naive_utc(),
+            );
+
+            assert_eq!(isolated.metrics, healthy.metrics);
+            assert_eq!(isolated.value, healthy.value);
+            assert_eq!(isolated.projects, healthy.projects);
+            assert_eq!(isolated.metrics.token_usage.total_tokens, 150);
+            assert_eq!(
+                isolated.metrics.api_equivalent_cost.minimum_pico_usd,
+                PicoUsd::new(1_500)
+            );
+            assert_eq!(isolated.projects.len(), 1);
+            assert_eq!(isolated.projects[0].label, "alpha");
+            assert_eq!(isolated.coverage.percent, 100.0);
+            assert!(isolated.partial_reasons.contains(&warning));
+            assert!(!isolated.value_is_lower_bound);
+            assert!(!isolated.api_chart_is_lower_bound);
+        }
+    }
+
+    #[test]
     fn report_preserves_unmerged_projects_for_one_logical_session() {
         let now = at(30, 10, 7);
         let snapshot = snapshot(now);

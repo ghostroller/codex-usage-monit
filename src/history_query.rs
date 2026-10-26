@@ -44,12 +44,12 @@ use crate::trace::{TraceFields, TraceOutcome, process_trace_log};
 
 #[cfg(test)]
 use aggregation::{
-    MAX_WEEKLY_RESET_CYCLES, WeeklyAggregationWork, WeeklySourceCursor, aggregate_source_buckets,
-    aggregate_source_weekly_points_with_work, assigned_canonical_reset,
-    source_weekly_cumulative_at,
+    WeeklyAggregationWork, WeeklySourceCursor, aggregate_source_buckets,
+    aggregate_source_weekly_points, aggregate_source_weekly_points_with_work,
+    assigned_canonical_reset, source_weekly_cumulative_at,
 };
 use aggregation::{
-    aggregate_source_buckets_with_logical_threads, aggregate_source_weekly_points,
+    aggregate_source_buckets_with_logical_threads, aggregate_source_weekly_points_for_resets,
     canonical_weekly_resets,
 };
 use reconciliation::{LogicalReplicaReport, resolve_logical_replicas};
@@ -72,6 +72,9 @@ pub const SOURCE_SELECTION_EXCLUDED_WARNING: &str = "source_selection_excluded_f
 pub const PROJECT_MAPPING_PARTIAL_WARNING: &str = "project_mapping_partial";
 pub const PROJECT_MAPPING_UNAVAILABLE_WARNING: &str = "project_mapping_unavailable";
 pub const REMOTE_MODEL_CATALOG_MISMATCH_WARNING: &str = "remote_model_catalog_fingerprint_mismatch";
+/// Weekly projection failed; independently reconciled buckets and quota remain usable.
+pub const WEEKLY_HISTORY_PROJECTION_UNAVAILABLE_WARNING: &str =
+    "weekly_history_projection_unavailable";
 pub(crate) const REMOTE_MODEL_CATALOG_UNCOVERED_TOKENS_PREFIX: &str =
     "remote_model_catalog_uncovered_tokens";
 pub const DUPLICATE_SESSION_DEDUP_UNAVAILABLE_WARNING: &str = "duplicate_session_dedup_unavailable";
@@ -1156,13 +1159,24 @@ fn load_v2_history_since_inner(
     included_sources.sort_by(|left, right| left.as_str().cmp(right.as_str()));
     redaction_skipped_sources.sort_by(|left, right| left.as_str().cmp(right.as_str()));
 
+    // Weekly schedules are a separate projection. A resource/allocation failure
+    // here must not discard account quota or independently reconcilable buckets.
+    let (weekly_cycle_resets, mut weekly_warning) =
+        match canonical_weekly_resets(&slices, &account.quota_points) {
+            Ok(resets) => (Some(resets), None),
+            Err(error) => (
+                None,
+                Some(format!(
+                    "{WEEKLY_HISTORY_PROJECTION_UNAVAILABLE_WARNING}: {error}"
+                )),
+            ),
+        };
     let mut replica_report = LogicalReplicaReport::default();
     if matches!(selection, HistorySourceSelection::AllIncluded) {
         // Preserve the reset-cycle interpretation from the physical inputs.
         // Logical replica resolution clears cumulative baselines because they
         // cannot be decomposed per thread; canonicalizing first prevents each
         // rolling zero-usage estimate from becoming an anchored marker.
-        let weekly_cycle_resets = canonical_weekly_resets(&slices, &account.quota_points)?;
         let replica_trace = process_trace_log().span_with("history.v2.replica_resolve", || {
             TraceFields::new()
                 .usize("sourceCount", slices.len())
@@ -1173,7 +1187,7 @@ fn load_v2_history_since_inner(
             &mut slices,
             &mut replica_evidence,
             &project_mapping.projection,
-            &weekly_cycle_resets,
+            weekly_cycle_resets.as_deref().unwrap_or_default(),
             read_budget,
         );
         match &replica_result {
@@ -1185,6 +1199,8 @@ fn load_v2_history_since_inner(
             ),
             Err(_) => replica_trace.finish(TraceOutcome::Error, TraceFields::new()),
         }
+        // Replica failures still fail the query: returning physical buckets
+        // without completing reconciliation could count the same usage twice.
         replica_report = replica_result?;
     }
 
@@ -1193,8 +1209,19 @@ fn load_v2_history_since_inner(
     // that projection so Summary does not over- or under-subtract coverage.
     annotate_model_catalog_uncovered_tokens(&mut slices, &replica_evidence);
 
-    let weekly_local_points =
-        aggregate_source_weekly_points(&slices, &account.quota_points, since)?;
+    let weekly_local_points = if let Some(resets) = weekly_cycle_resets {
+        match aggregate_source_weekly_points_for_resets(&slices, &resets, since) {
+            Ok(points) => points,
+            Err(error) => {
+                weekly_warning = Some(format!(
+                    "{WEEKLY_HISTORY_PROJECTION_UNAVAILABLE_WARNING}: {error}"
+                ));
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
     // The durable Summary backfill marker describes reconstruction of this
     // machine's local rollout history. It is meaningful for the all-source or
     // exact-current-local projections, but must not make a remote-only view
@@ -1242,6 +1269,7 @@ fn load_v2_history_since_inner(
         history.summary_backfill_attempt_complete = Some(marker.complete);
     }
     history.warnings.extend(replica_report.warnings);
+    history.warnings.extend(weekly_warning);
     for source_id in &model_catalog_mismatch_sources {
         history.warnings.push(format!(
             "{REMOTE_MODEL_CATALOG_MISMATCH_WARNING}:{}",
@@ -1384,6 +1412,162 @@ mod tests {
                 .unwrap();
         commit_query_observation(&ownership, &store, &identity, 1);
         (directory, ownership, store, identity)
+    }
+
+    fn persisted_history_records(store: &SourceHistoryStore) -> Vec<(String, String, Vec<u8>)> {
+        store
+            .sqlite_database()
+            .unwrap()
+            .read(|connection| {
+                let mut statement = connection
+                    .prepare(
+                        "SELECT namespace,record_key,payload FROM history_records \
+                         UNION ALL SELECT 'state',state_key,payload FROM history_state \
+                         ORDER BY 1,2",
+                    )
+                    .map_err(crate::source_history::database::sql_error)?;
+                statement
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                    .map_err(crate::source_history::database::sql_error)?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(crate::source_history::database::sql_error)
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn sqlite_weekly_projection_failure_preserves_quota_buckets_and_stored_history() {
+        let (_directory, ownership, store, identity) = query_observation_fixture();
+        let persisted = persisted_history_records(&store);
+        let expected = load_unified_history_since(&ownership, &store, at(2, 0, 0)).unwrap();
+
+        // Zero fails canonicalization; one permits its single quota candidate
+        // but cannot allocate a cycle plan. Neither is a storage/read failure.
+        for limit in [0, 1] {
+            for selection in [
+                HistorySourceSelection::AllIncluded,
+                HistorySourceSelection::Local(identity.node_id().clone()),
+            ] {
+                let (result, stats) = store.sqlite_database().unwrap().measure_io(|| {
+                    aggregation::with_weekly_projection_budget(limit, || {
+                        load_unified_history_since_selected(
+                            &ownership,
+                            &store,
+                            identity.node_id(),
+                            &selection,
+                            at(2, 0, 0),
+                        )
+                    })
+                });
+                let history = result.unwrap().history;
+                assert_eq!(history.quota_points, expected.history.quota_points);
+                assert_eq!(
+                    history.half_hour_buckets,
+                    expected.history.half_hour_buckets
+                );
+                assert!(history.weekly_local_points.is_empty());
+                assert!(!history.weekly_projection_available());
+                assert_eq!(
+                    history
+                        .warnings
+                        .iter()
+                        .filter(|warning| {
+                            warning.starts_with(WEEKLY_HISTORY_PROJECTION_UNAVAILABLE_WARNING)
+                        })
+                        .count(),
+                    1
+                );
+                assert!(
+                    history
+                        .warnings
+                        .iter()
+                        .all(|warning| !warning.starts_with("history query failed"))
+                );
+                assert_eq!(stats.write_connection_opens, 0);
+                assert_eq!(persisted_history_records(&store), persisted);
+            }
+        }
+
+        // The scoped budget and failure state cannot leak into a later query.
+        let recovered = load_unified_history_since(&ownership, &store, at(2, 0, 0)).unwrap();
+        assert!(recovered.history.weekly_projection_available());
+        assert_eq!(recovered.history, expected.history);
+    }
+
+    #[test]
+    fn sqlite_weekly_projection_failure_still_deduplicates_replica_buckets() {
+        let directory = tempfile::tempdir().unwrap();
+        let (ownership, store) = stores(
+            &directory.path().join("state"),
+            &directory.path().join("codex-home"),
+            RedactionProfile::Redacted,
+        );
+        for (id, label, project) in [
+            (SOURCE_A, "alpha", observed('a')),
+            (SOURCE_B, "beta", observed('b')),
+        ] {
+            let metadata = source(id, label, SourceKind::Local, RedactionProfile::Redacted);
+            install_local_replica(
+                &store,
+                &metadata,
+                bucket(at(2, 10, 0), 10, project.as_str()),
+                session_digest(metadata.source_id(), at(2, 0, 0), 'a', 10, 1, project),
+                Vec::new(),
+            );
+        }
+        store
+            .record_account_points(&[quota(at(2, 9, 0), at(8, 0, 0))])
+            .unwrap();
+        let persisted = persisted_history_records(&store);
+        for limit in [0, 1] {
+            let history = aggregation::with_weekly_projection_budget(limit, || {
+                load_unified_history_since(&ownership, &store, at(2, 0, 0))
+            })
+            .unwrap()
+            .history;
+            assert!(!history.weekly_projection_available());
+            assert_eq!(history.quota_points.len(), 1);
+            assert_eq!(history.half_hour_buckets.len(), 1);
+            let bucket = &history.half_hour_buckets[0];
+            assert_eq!(bucket.token_usage.total_tokens, 10);
+            assert_eq!(bucket.project_groups.len(), 1);
+            assert_eq!(bucket.project_groups[0].thread_id, "logical-thread:thread");
+            assert!(
+                !history
+                    .warnings
+                    .iter()
+                    .any(|warning| warning == DUPLICATE_SESSION_DEDUP_UNAVAILABLE_WARNING)
+            );
+            assert_eq!(persisted_history_records(&store), persisted);
+        }
+    }
+
+    #[test]
+    fn sqlite_more_than_sixteen_weekly_cycles_preserve_existing_records() {
+        let (_directory, ownership, store, _identity) = query_observation_fixture();
+        let quota_points = (0_i64..20)
+            .map(|index| quota(at(2, 9, 0), at(8, 0, 0) + Duration::minutes(index * 3)))
+            .collect::<Vec<_>>();
+        store.record_account_points(&quota_points).unwrap();
+        let persisted = persisted_history_records(&store);
+        let result = load_unified_history_since(&ownership, &store, at(2, 0, 0)).unwrap();
+        assert_eq!(result.history.quota_points.len(), 20);
+        assert_eq!(
+            result.history.half_hour_buckets[0].token_usage.total_tokens,
+            10
+        );
+        assert!(result.history.weekly_projection_available());
+        assert_eq!(
+            result
+                .history
+                .weekly_local_points
+                .iter()
+                .map(|point| point.resets_at)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            20
+        );
+        assert_eq!(persisted_history_records(&store), persisted);
     }
 
     #[test]
@@ -5130,7 +5314,7 @@ mod tests {
     }
 
     #[test]
-    fn weekly_reset_clustering_handles_large_duplicate_input_and_rejects_cycle_overflow() {
+    fn weekly_reset_clustering_handles_large_duplicate_input_and_more_than_sixteen_cycles() {
         let observed_at = at(1, 0, 0);
         let first_reset = observed_at + Duration::days(7);
         let dense = (0_i64..100_000)
@@ -5141,7 +5325,7 @@ mod tests {
             vec![first_reset]
         );
 
-        let at_limit = (0..MAX_WEEKLY_RESET_CYCLES)
+        let many_cycles = (0..17)
             .map(|offset| {
                 quota(
                     observed_at,
@@ -5153,22 +5337,9 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(
-            canonical_weekly_resets(&[], &at_limit).unwrap().len(),
-            MAX_WEEKLY_RESET_CYCLES
+            canonical_weekly_resets(&[], &many_cycles).unwrap().len(),
+            17
         );
-
-        let mut above_limit = at_limit;
-        above_limit.push(quota(
-            observed_at,
-            first_reset
-                + Duration::seconds(
-                    i64::try_from(MAX_WEEKLY_RESET_CYCLES * (RESET_DRIFT_SECONDS as usize + 1))
-                        .unwrap(),
-                ),
-        ));
-        let error = canonical_weekly_resets(&[], &above_limit).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert!(error.to_string().contains("canonical reset cycles"));
     }
 
     #[test]
