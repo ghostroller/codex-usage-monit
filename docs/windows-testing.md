@@ -198,6 +198,40 @@ cleanup's exit code is recorded. The guest also enforces its own deadline if
 the host transport disappears. Retain failed-run artifacts for diagnosis and
 remove only the identified run directories when they are no longer needed.
 
+## Native Task Scheduler registration regression
+
+When changing Windows task XML serialization or definition validation, run the
+following regression explicitly from a native Windows developer shell under the
+intended user account:
+
+```powershell
+cargo test --locked --lib service::tests::windows_task_registration_accepts_unicode_xml_without_starting_payload -- --exact --ignored --nocapture
+```
+
+The account must be able to register, query and delete its own Task Scheduler
+tasks. A restricted sandbox or a cross-target build does not establish this
+permission. Use the same private `TEMP` and `TMP` setup described above and record
+the actual Windows account, architecture, toolchain, source commit or dirty
+snapshot, complete command and log location.
+
+This test is deliberately marked `ignored`: ordinary `cargo test --all-targets`,
+the full Windows verification pipeline and normal `service::` test runs do not
+execute it. Record the explicit run separately when claiming native task
+registration coverage; a passing ordinary suite alone does not cover this path.
+
+The fixture uses a unique `CodexUsageMonitXmlTest-...` task name, checks that it
+does not already exist, and registers it disabled with a nonexistent executable
+path. It never runs a payload. The test exports and validates the task, deletes
+it and verifies that it is absent, with cleanup on failure as well. It leaves
+the user's installed recorder, trust state and installation receipt untouched.
+
+The regression covers the actual `schtasks /Create /XML` file boundary. Task XML
+uses UTF-16LE with a BOM and a matching encoding declaration; an XML parser test
+alone would miss the previously observed encoding-switch error. It also checks
+that Windows-exported account names resolve to the expected SID and that omitted
+or expanded default settings preserve the definition fingerprint. Non-default
+permissions or settings and a different user identity remain errors.
+
 ## Cross-target checks and runtime evidence
 
 Native linking and runtime checks run on Windows. A non-Windows host can still

@@ -4,6 +4,12 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.7.2] - 2026-10-27
+
+### Fixed
+
+- Use Unicode task-definition files for Windows recorder registration and accept Task Scheduler's equivalent default-field and account-name normalization while retaining strict definition and user-identity checks.
+
 ## [0.7.1] - 2026-10-26
 
 ### Fixed
@@ -397,7 +403,8 @@ All notable changes to this project are documented in this file.
 
 - JSON schema remains version 1. Existing confidence and preferred five-hour fields keep their prior meaning; reset-credit fields are additive and backward compatible.
 
-[Unreleased]: https://github.com/ghostroller/codex-usage-monit/compare/v0.7.1...HEAD
+[Unreleased]: https://github.com/ghostroller/codex-usage-monit/compare/v0.7.2...HEAD
+[0.7.2]: https://github.com/ghostroller/codex-usage-monit/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/ghostroller/codex-usage-monit/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/ghostroller/codex-usage-monit/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/ghostroller/codex-usage-monit/compare/v0.5.2...v0.6.0

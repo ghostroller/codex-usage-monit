@@ -3030,8 +3030,24 @@ fn windows_task_exit_failure_detail(result: &WindowsTaskOperationResult) -> Stri
 }
 
 fn register_windows_task(options: &ServiceOptions, task_name: &str, user_sid: &str) -> Result<()> {
-    let xml = windows_task_xml(options, user_sid);
-    register_windows_task_xml(options, task_name, xml.as_bytes())
+    let xml = windows_task_xml_file(options, user_sid);
+    register_windows_task_xml(options, task_name, &xml)
+}
+
+fn windows_task_xml_file(options: &ServiceOptions, user_sid: &str) -> Vec<u8> {
+    // schtasks reads /XML files as Unicode before passing them to the scheduler.
+    // Give that boundary an explicit BOM and matching declaration; BOM-less UTF-8
+    // can otherwise fail with "unable to switch encoding" before registration.
+    let document = windows_task_xml(options, user_sid).replacen(
+        "encoding=\"UTF-8\"",
+        "encoding=\"UTF-16\"",
+        1,
+    );
+    let mut bytes = vec![0xff, 0xfe];
+    for unit in document.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    bytes
 }
 
 fn register_windows_task_xml(options: &ServiceOptions, task_name: &str, xml: &[u8]) -> Result<()> {
@@ -3171,12 +3187,10 @@ fn canonical_windows_task_fingerprint(actual: &[u8], user_sid: &str) -> Result<S
     verify_windows_task_structure(&parsed, user_sid, false)?;
     let command = parsed.text("Task/Actions/Exec/Command")?;
     let arguments = parsed.text("Task/Actions/Exec/Arguments")?;
-    let trigger_user = parsed.text("Task/Triggers/LogonTrigger/UserId")?;
-    let principal_user = parsed.text("Task/Principals/Principal/UserId")?;
     let definition_id = definition_id_from_tokenized_contract(arguments, None)?;
     let mut canonical = format!(
         "task-contract=source-aware-v2/windows-task-v1\ncommand={}\narguments={}\ndefinition-id={}\nuser-trigger={}\nuser-principal={}\ntrigger-enabled=true\nsettings-enabled=normalized\nlogon-type=InteractiveToken\nrun-level=LeastPrivilege\nmultiple-instances=IgnoreNew\nbattery-start=false\nbattery-stop=false\nhard-terminate=true\nstart-when-available=true\nnetwork-required=false\non-demand=true\nhidden=false\nidle=false\nwake=false\nexecution-limit=PT0S\npriority=7\nrestart-interval=PT1M\nrestart-count=255\n",
-        command, arguments, definition_id, trigger_user, principal_user
+        command, arguments, definition_id, user_sid, user_sid
     );
     if parsed
         .nodes
@@ -3220,11 +3234,16 @@ fn verify_windows_task_structure(
     for path in ["Task", "Task/Principals/Principal", "Task/Actions"] {
         task.require_no_extra_attributes(path)?;
     }
+    for path in [
+        "Task/Triggers/LogonTrigger/UserId",
+        "Task/Principals/Principal/UserId",
+    ] {
+        verify_windows_task_user_id(task.text(path)?, user_sid).with_context(|| {
+            format!("Task Scheduler definition has an unexpected user at {path}")
+        })?;
+    }
     for (path, expected) in [
-        ("Task/Triggers/LogonTrigger/UserId", user_sid),
-        ("Task/Principals/Principal/UserId", user_sid),
         ("Task/Principals/Principal/LogonType", "InteractiveToken"),
-        ("Task/Principals/Principal/RunLevel", "LeastPrivilege"),
         ("Task/Settings/RestartOnFailure/Interval", "PT1M"),
         ("Task/Settings/RestartOnFailure/Count", "255"),
     ] {
@@ -3250,6 +3269,11 @@ fn verify_windows_task_structure(
         ("Task/Settings/ExecutionTimeLimit", "PT72H", "PT0S"),
         ("Task/Settings/Priority", "7", "7"),
         ("Task/Triggers/LogonTrigger/Enabled", "true", "true"),
+        (
+            "Task/Principals/Principal/RunLevel",
+            "LeastPrivilege",
+            "LeastPrivilege",
+        ),
     ] {
         if task.text_or_default(path, schema_default)? != expected {
             bail!("Task Scheduler definition has an unexpected value at {path}");
@@ -3275,6 +3299,85 @@ fn verify_windows_task_structure(
     }
     definition_id_from_tokenized_contract(arguments, None)?;
     Ok(())
+}
+
+fn verify_windows_task_user_id(actual: &str, expected_sid: &str) -> Result<()> {
+    if actual == expected_sid {
+        return Ok(());
+    }
+    // Task Scheduler exports logon-trigger SIDs as qualified account names.
+    // Resolve that representation through Windows; never trust a matching name
+    // from environment variables or accept a different SID as an alias.
+    let (domain, user) = actual.split_once('\\').ok_or_else(|| {
+        anyhow!("Task Scheduler user is neither the expected SID nor a qualified account")
+    })?;
+    if domain.is_empty() || user.is_empty() || user.contains('\\') || actual.contains('\0') {
+        bail!("Task Scheduler user is not a qualified Windows account");
+    }
+    if resolve_windows_task_account_sid(actual)? != expected_sid {
+        bail!("Task Scheduler account resolves to a different user SID");
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn resolve_windows_task_account_sid(account: &str) -> Result<String> {
+    use std::mem;
+    use std::ptr;
+
+    use windows_sys::Win32::Security::{LookupAccountNameW, SidTypeUser};
+
+    let account: Vec<u16> = account.encode_utf16().chain(Some(0)).collect();
+    let (mut sid_size, mut domain_size, mut kind) = (0, 0, 0);
+    // SAFETY: account is terminated and live. Null buffers with zero lengths
+    // request sizes; each output points to a writable local scalar.
+    unsafe {
+        LookupAccountNameW(
+            ptr::null(),
+            account.as_ptr(),
+            ptr::null_mut(),
+            &mut sid_size,
+            ptr::null_mut(),
+            &mut domain_size,
+            &mut kind,
+        );
+    }
+    if sid_size == 0 || sid_size > 65536 || domain_size > 32768 {
+        bail!("Task Scheduler account could not be resolved to a bounded SID");
+    }
+    let sid_bytes = usize::try_from(sid_size).context("account SID size exceeds this platform")?;
+    let domain_units =
+        usize::try_from(domain_size).context("account domain size exceeds this platform")?;
+    let mut sid = vec![0_u32; sid_bytes.div_ceil(mem::size_of::<u32>())];
+    let mut domain = vec![0_u16; domain_units];
+    // SAFETY: sid is DWORD-aligned and covers sid_size bytes; domain covers
+    // domain_size UTF-16 units. Both allocations and the terminated account
+    // remain live, and the API receives their capacities in its required units.
+    if unsafe {
+        LookupAccountNameW(
+            ptr::null(),
+            account.as_ptr(),
+            sid.as_mut_ptr().cast(),
+            &mut sid_size,
+            domain.as_mut_ptr(),
+            &mut domain_size,
+            &mut kind,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error()).context("could not resolve Task Scheduler account");
+    }
+    if kind != SidTypeUser {
+        bail!("Task Scheduler account does not identify a Windows user");
+    }
+    // SAFETY: successful LookupAccountNameW initialized a complete SID in the
+    // aligned allocation, which remains live until sid_string finishes reading.
+    Ok(unsafe { crate::windows_private_directory::sid_string(sid.as_mut_ptr().cast()) }?)
+}
+
+#[cfg(not(windows))]
+fn resolve_windows_task_account_sid(_account: &str) -> Result<String> {
+    bail!("Windows account resolution is unavailable on this platform")
 }
 
 #[derive(Debug)]
@@ -3327,6 +3430,11 @@ impl ParsedWindowsTaskXml {
             "Task/Settings/UseUnifiedSchedulingEngine",
             "Task/Settings/DisallowStartOnRemoteAppSession",
             "Task/Settings/DeleteExpiredTaskAfter",
+            "Task/Settings/IdleSettings",
+            "Task/Settings/IdleSettings/Duration",
+            "Task/Settings/IdleSettings/WaitTimeout",
+            "Task/Settings/IdleSettings/StopOnIdleEnd",
+            "Task/Settings/IdleSettings/RestartOnIdle",
         ];
         for path in self.nodes.keys() {
             let path = path.as_str();
@@ -3342,10 +3450,27 @@ impl ParsedWindowsTaskXml {
             ("Task/Settings/UseUnifiedSchedulingEngine", "false"),
             ("Task/Settings/DisallowStartOnRemoteAppSession", "false"),
             ("Task/Settings/DeleteExpiredTaskAfter", "PT0S"),
+            // The scheduler may export idleSettingsType's implicit defaults
+            // even though our recorder never requests an idle-only schedule.
+            ("Task/Settings/IdleSettings/Duration", "PT10M"),
+            ("Task/Settings/IdleSettings/WaitTimeout", "PT1H"),
+            ("Task/Settings/IdleSettings/StopOnIdleEnd", "true"),
+            ("Task/Settings/IdleSettings/RestartOnIdle", "false"),
         ] {
             if self.nodes.contains_key(path) && self.text(path)? != default {
                 bail!("Task Scheduler definition has a non-default optional value at {path}");
             }
+        }
+        for path in self
+            .nodes
+            .keys()
+            .filter(|path| path.starts_with("Task/Settings/IdleSettings"))
+        {
+            self.require_single_node(path)?;
+            self.require_no_extra_attributes(path)?;
+        }
+        if self.texts.contains_key("Task/Settings/IdleSettings") {
+            bail!("Task Scheduler definition has unexpected text in IdleSettings");
         }
         Ok(())
     }
@@ -4652,6 +4777,119 @@ mod tests {
     }
 
     #[test]
+    fn windows_task_file_encoding_preserves_unicode_definition_identity() {
+        let mut options = windows_options();
+        options.executable = PathBuf::from(r"C:\用户 🧪 & tools\监控.exe");
+        options.codex_home = PathBuf::from(r"C:\用户 🧪\会话 & history");
+        options.environment_path = Some(OsString::from(r"C:\工具 🧪;C:\Windows\System32"));
+        let sid = "S-1-5-21-1234";
+        let original = windows_task_xml(&options, sid);
+        let bytes = windows_task_xml_file(&options, sid);
+
+        assert!(bytes.starts_with(&[0xff, 0xfe]));
+        let decoded = decode_windows_task_xml(&bytes).unwrap();
+        assert!(decoded.starts_with("<?xml version=\"1.0\" encoding=\"UTF-16\"?>"));
+        assert_eq!(
+            decoded,
+            original.replacen("encoding=\"UTF-8\"", "encoding=\"UTF-16\"", 1)
+        );
+        verify_windows_task_xml_matches_options(&bytes, &options, sid).unwrap();
+        assert_eq!(
+            canonical_windows_task_fingerprint(&bytes, sid).unwrap(),
+            canonical_windows_task_fingerprint(original.as_bytes(), sid).unwrap()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "registers and deletes a disabled Task Scheduler fixture; run explicitly as the intended Windows user"]
+    fn windows_task_registration_accepts_unicode_xml_without_starting_payload() -> Result<()> {
+        struct TestTaskCleanup {
+            name: String,
+            armed: bool,
+        }
+
+        impl Drop for TestTaskCleanup {
+            fn drop(&mut self) {
+                if self.armed {
+                    let _ = run_windows_task_operation(WindowsTaskOperation::Delete {
+                        task_name: self.name.clone(),
+                    });
+                }
+            }
+        }
+
+        let directory = tempdir()?;
+        let mut options = options(directory.path());
+        // Never create this executable or enable/run the task. The real /XML
+        // parser is exercised without launching a recorder or touching its trust.
+        options.executable = directory.path().join("不会执行 🧪 & payload.exe");
+        options.codex_home = directory.path().join("会话 🧪 & history");
+        anyhow::ensure!(!options.executable.exists(), "test payload must not exist");
+        let name = format!(
+            "\\CodexUsageMonitXmlTest-{}-{}",
+            std::process::id(),
+            directory.path().file_name().unwrap().to_string_lossy()
+        );
+        anyhow::ensure!(
+            !windows_task_is_installed_with(&name, &mut run_windows_task_operation)?,
+            "test task name already exists"
+        );
+        let mut cleanup = TestTaskCleanup {
+            name: name.clone(),
+            armed: true,
+        };
+        let sid = windows_current_user_sid()?;
+        register_windows_task(&options, &name, &sid)?;
+        verify_windows_task_staged_with(&name, &mut run_windows_task_operation)?;
+        let (status, xml) = windows_task_xml_bounded(&name)?;
+        anyhow::ensure!(status.success(), "test task could not be exported");
+        verify_windows_task_xml_matches_options(&xml, &options, &sid).with_context(|| {
+            format!(
+                "Task Scheduler test fixture XML:\n{}",
+                decode_windows_task_xml(&xml).unwrap_or_else(|error| format!("{error:#}"))
+            )
+        })?;
+        anyhow::ensure!(
+            canonical_windows_task_fingerprint(&xml, &sid)?
+                == canonical_windows_task_fingerprint(
+                    windows_task_xml(&options, &sid).as_bytes(),
+                    &sid
+                )?,
+            "exported account names or defaults changed the task fingerprint"
+        );
+        let exported = parse_windows_task_xml(&decode_windows_task_xml(&xml)?)?;
+        anyhow::ensure!(
+            verify_windows_task_user_id(
+                exported.text("Task/Triggers/LogonTrigger/UserId")?,
+                "S-1-5-21-1-2-3-9999"
+            )
+            .is_err(),
+            "an exported account must not authorize another user SID"
+        );
+        anyhow::ensure!(
+            verify_windows_task_user_id(&format!(".\\{}", name.trim_start_matches('\\')), &sid)
+                .is_err(),
+            "an unknown local account must fail closed"
+        );
+
+        let deletion = run_windows_task_operation(WindowsTaskOperation::Delete {
+            task_name: name.clone(),
+        })?;
+        anyhow::ensure!(
+            deletion.success,
+            "test task cleanup failed: {}",
+            deletion.detail
+        );
+        anyhow::ensure!(
+            !windows_task_is_installed_with(&name, &mut run_windows_task_operation)?,
+            "test task survived cleanup"
+        );
+        cleanup.armed = false;
+        Ok(())
+    }
+
+    #[test]
     fn failed_service_install_uses_cleanup_instead_of_definition_rollback() {
         let directory = tempdir().unwrap();
         let service_options = options(directory.path());
@@ -5742,6 +5980,79 @@ mod tests {
             utf16.extend_from_slice(&unit.to_le_bytes());
         }
         verify_windows_task_xml_matches_options(&utf16, &options, sid).unwrap();
+    }
+
+    #[test]
+    fn windows_definition_accepts_only_scheduler_idle_and_privilege_defaults() {
+        let options = windows_options();
+        let sid = "S-1-5-21-1234";
+        let original = windows_task_xml(&options, sid);
+        let defaults = "<IdleSettings><StopOnIdleEnd>true</StopOnIdleEnd><RestartOnIdle>false</RestartOnIdle></IdleSettings>";
+        let normalized = original
+            .replace("<RunLevel>LeastPrivilege</RunLevel>", "")
+            .replace("<Enabled>true</Enabled>", "")
+            .replacen("</Settings>", &format!("{defaults}</Settings>"), 1);
+        let fingerprint = canonical_windows_task_fingerprint(original.as_bytes(), sid).unwrap();
+        verify_windows_task_xml_matches_options(normalized.as_bytes(), &options, sid).unwrap();
+        assert_eq!(
+            canonical_windows_task_fingerprint(normalized.as_bytes(), sid).unwrap(),
+            fingerprint
+        );
+        let all_defaults = normalized.replacen(
+            "</IdleSettings>",
+            "<Duration>PT10M</Duration><WaitTimeout>PT1H</WaitTimeout></IdleSettings>",
+            1,
+        );
+        assert_eq!(
+            canonical_windows_task_fingerprint(all_defaults.as_bytes(), sid).unwrap(),
+            fingerprint
+        );
+
+        for (before, after) in [
+            ("<StopOnIdleEnd>true", "<StopOnIdleEnd>false"),
+            ("<RestartOnIdle>false", "<RestartOnIdle>true"),
+            ("<Duration>PT10M", "<Duration>PT5M"),
+            ("<WaitTimeout>PT1H", "<WaitTimeout>PT2H"),
+            ("<IdleSettings>", "<IdleSettings unexpected=\"true\">"),
+            ("<RestartOnIdle>", "<RestartOnIdle unexpected=\"true\">"),
+            ("<IdleSettings>", "<IdleSettings>unexpected text"),
+            (
+                "</IdleSettings>",
+                "<UnknownSetting>false</UnknownSetting></IdleSettings>",
+            ),
+            (
+                "</IdleSettings>",
+                "<RestartOnIdle>false</RestartOnIdle></IdleSettings>",
+            ),
+            ("</Settings>", "<IdleSettings></IdleSettings></Settings>"),
+            (
+                "</Principal>",
+                "<RunLevel>HighestAvailable</RunLevel></Principal>",
+            ),
+        ] {
+            let changed = all_defaults.replacen(before, after, 1);
+            assert!(
+                canonical_windows_task_fingerprint(changed.as_bytes(), sid).is_err(),
+                "unexpected task change must remain rejected: {after}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_task_user_identity_rejects_unqualified_names_and_other_sids() {
+        let sid = "S-1-5-21-1234";
+        verify_windows_task_user_id(sid, sid).unwrap();
+        for actual in [
+            "",
+            "unqualified-user",
+            "S-1-5-21-9999",
+            "\\user",
+            "DOMAIN\\",
+            "DOMAIN\\user\\extra",
+            "DOMAIN\\user\0",
+        ] {
+            assert!(verify_windows_task_user_id(actual, sid).is_err());
+        }
     }
 
     #[test]
