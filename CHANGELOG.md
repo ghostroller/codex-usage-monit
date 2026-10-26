@@ -4,9 +4,17 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-10-26
+
 ### Fixed
 
-- Keep existing Trends and Summary history readable when reset schedules change frequently. Recognize rolling zero-usage reset estimates carried into local usage, replace the fixed 16-cycle limit with a projection work budget, and isolate weekly projection failures while retaining quota, deduplicated buckets and project totals. Stored history and database schema remain unchanged.
+- Restore Trends and Summary when retained history contains frequent changes to weekly reset schedules. Recognize superseded rolling zero-usage reset estimates carried into local usage while preserving established and source-only cycles.
+- Replace the fixed 16-cycle limit with a budget for actual projection work, including cycle/source plans, indexed memberships and timeline evaluations.
+- Isolate weekly projection failures: keep account quota, 15-minute token history and deduplicated Summary/Overview totals available, and explicitly mark weekly totals and quota estimates unavailable.
+
+### Compatibility
+
+- Existing history is preserved without a database reset or migration. SQLite schema 2, remote protocol v5, estimator revision 8 and API pricing catalog revision 5 remain unchanged.
 
 ## [0.7.0] - 2026-10-25
 
@@ -389,7 +397,8 @@ All notable changes to this project are documented in this file.
 
 - JSON schema remains version 1. Existing confidence and preferred five-hour fields keep their prior meaning; reset-credit fields are additive and backward compatible.
 
-[Unreleased]: https://github.com/ghostroller/codex-usage-monit/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/ghostroller/codex-usage-monit/compare/v0.7.1...HEAD
+[0.7.1]: https://github.com/ghostroller/codex-usage-monit/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/ghostroller/codex-usage-monit/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/ghostroller/codex-usage-monit/compare/v0.5.2...v0.6.0
 [0.5.2]: https://github.com/ghostroller/codex-usage-monit/compare/v0.5.1...v0.5.2

@@ -3438,6 +3438,8 @@ struct App {
     version_info_offset: usize,
     version_info_line_count: usize,
     version_info_hitbox: Option<VersionInfoHitbox>,
+    #[cfg(test)]
+    version_info_notes_override: Option<String>,
     quit_requested: bool,
     turn_reveal_pending: bool,
     /// True only for the real TUI's placeholder first frame. The initial
@@ -3603,6 +3605,8 @@ impl App {
             version_info_offset: 0,
             version_info_line_count: 0,
             version_info_hitbox: None,
+            #[cfg(test)]
+            version_info_notes_override: None,
             quit_requested: false,
             turn_reveal_pending: false,
             initial_bootstrap_pending: false,
@@ -13657,6 +13661,15 @@ fn render_version_info(frame: &mut Frame<'_>, area: Rect, app: &mut App) -> Vers
         .fg(palette.title)
         .add_modifier(Modifier::BOLD);
     let notes = crate::version_info::current_release_notes();
+    #[cfg(test)]
+    let notes = app
+        .version_info_notes_override
+        .as_deref()
+        .map(|body| crate::version_info::ReleaseNotes {
+            date: notes.as_ref().map_or("Unknown", |notes| notes.date),
+            body,
+        })
+        .or(notes);
     let mut lines = vec![
         Line::styled(env!("CARGO_PKG_NAME"), title_style),
         Line::from(format!("Version: {}", crate::version_info::VERSION)),

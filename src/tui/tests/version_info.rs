@@ -13,6 +13,23 @@ fn version_harness(width: u16, height: u16, theme: Theme) -> TuiHarness {
     harness
 }
 
+fn long_release_notes() -> String {
+    let mut notes = String::from("### Fixed\n\n");
+    for index in 0..80 {
+        notes.push_str(&format!(
+            "- Deterministic scrolling fixture item {index}.\n"
+        ));
+    }
+    notes
+}
+
+fn scrolling_version_harness(width: u16, height: u16, theme: Theme) -> TuiHarness {
+    let mut harness = version_harness(width, height, theme);
+    harness.app.version_info_notes_override = Some(long_release_notes());
+    harness.render();
+    harness
+}
+
 fn mouse_at(harness: &mut TuiHarness, kind: MouseEventKind, column: u16, row: u16) -> bool {
     let handled = handle_mouse_event(
         &mut harness.app,
@@ -105,10 +122,72 @@ fn version_info_displays_current_binary_metadata_and_matching_release_notes() {
 }
 
 #[test]
+fn version_info_short_notes_fit_without_a_scrollbar_and_keep_scroll_at_zero() {
+    const SHORT_NOTES: &str = "### Fixed\n\n- Short scrolling fixture.\n";
+    for theme in [Theme::Dark, Theme::Light] {
+        for (width, height) in [(120, 40), (80, 24)] {
+            let mut harness = version_harness(width, height, theme);
+            harness.app.version_info_notes_override = Some(SHORT_NOTES.to_string());
+            harness.render();
+            let initial = harness.app.version_info_hitbox.unwrap();
+            assert!(harness.app.version_info_line_count <= usize::from(initial.content.height));
+            assert!(initial.scrollbar.is_none());
+            assert!(
+                harness
+                    .frame()
+                    .snapshot_text()
+                    .contains("Short scrolling fixture.")
+            );
+            for key in [
+                KeyCode::Down,
+                KeyCode::PageDown,
+                KeyCode::End,
+                KeyCode::Up,
+                KeyCode::PageUp,
+                KeyCode::Home,
+            ] {
+                assert!(!harness.key(key));
+                assert_eq!(harness.app.version_info_offset, 0);
+            }
+            for control in [ControlId::VersionInfoDown, ControlId::VersionInfoUp] {
+                assert_only_shortcut_is_accented(&harness, control);
+                assert!(harness.click(control, ClickEdge::End));
+                assert_eq!(harness.app.version_info_offset, 0);
+            }
+            for kind in [MouseEventKind::ScrollDown, MouseEventKind::ScrollUp] {
+                assert!(mouse_at(
+                    &mut harness,
+                    kind,
+                    initial.content.x,
+                    initial.content.y,
+                ));
+                assert_eq!(harness.app.version_info_offset, 0);
+            }
+            let after = harness.app.version_info_hitbox.unwrap();
+            assert_eq!(after.content, initial.content);
+            assert_eq!(after.up, initial.up);
+            assert_eq!(after.down, initial.down);
+            assert_eq!(after.back, initial.back);
+            assert!(after.scrollbar.is_none());
+        }
+
+        let mut harness = version_harness(32, 14, theme);
+        harness.app.version_info_notes_override = Some(SHORT_NOTES.to_string());
+        harness.render();
+        harness.key(KeyCode::End);
+        assert!(harness.app.version_info_offset > 0);
+        harness.resize(120, 40);
+        assert_eq!(harness.app.version_info_offset, 0);
+        assert!(harness.app.version_info_hitbox.unwrap().scrollbar.is_none());
+    }
+}
+
+#[test]
 fn version_info_controls_style_exact_bindings_and_keep_geometry_in_both_themes() {
     for theme in [Theme::Dark, Theme::Light] {
         for (width, height) in SIZES {
             let mut harness = TuiHarness::from_fixture("normal", width, height, theme);
+            harness.app.version_info_notes_override = Some(long_release_notes());
             harness.key(KeyCode::Char('4'));
             assert_only_shortcut_is_accented(&harness, ControlId::VersionInfo);
             let entry = harness.control_rect(ControlId::VersionInfo);
@@ -178,6 +257,7 @@ fn version_info_entry_and_popup_controls_are_whole_label_clickable() {
     for (width, height) in SIZES {
         for edge in [ClickEdge::Start, ClickEdge::Middle, ClickEdge::End] {
             let mut harness = TuiHarness::from_fixture("normal", width, height, Theme::Dark);
+            harness.app.version_info_notes_override = Some(long_release_notes());
             harness.key(KeyCode::Char('4'));
             assert!(harness.click(ControlId::VersionInfo, edge));
             assert!(harness.app.version_info_visible);
@@ -395,7 +475,7 @@ fn version_info_shortcut_is_consumed_by_text_entry_and_existing_modals() {
 
 #[test]
 fn version_info_supports_keyboard_and_mouse_scroll_with_bounds() {
-    let mut harness = version_harness(60, 24, Theme::Dark);
+    let mut harness = scrolling_version_harness(60, 24, Theme::Dark);
     let viewport = usize::from(harness.app.version_info_hitbox.unwrap().content.height);
     let max_offset = harness.app.version_info_line_count.saturating_sub(viewport);
     assert!(max_offset > viewport, "release notes must exercise paging");
@@ -440,7 +520,7 @@ fn version_info_supports_keyboard_and_mouse_scroll_with_bounds() {
 #[test]
 fn version_info_resize_clamps_scroll_and_extremely_small_terminals_are_safe() {
     for theme in [Theme::Dark, Theme::Light] {
-        let mut harness = version_harness(32, 14, theme);
+        let mut harness = scrolling_version_harness(32, 14, theme);
         harness.key(KeyCode::End);
         let compact_offset = harness.app.version_info_offset;
         harness.resize(120, 40);
@@ -469,7 +549,7 @@ fn version_info_resize_clamps_scroll_and_extremely_small_terminals_are_safe() {
 fn version_info_scrollbar_tracks_keyboard_and_wheel_scrolling_in_both_themes() {
     for theme in [Theme::Dark, Theme::Light] {
         for (width, height) in SIZES {
-            let mut harness = version_harness(width, height, theme);
+            let mut harness = scrolling_version_harness(width, height, theme);
             let initial = visible_version_scrollbar(&harness);
             assert_eq!(initial.thumb.y, initial.track.y);
             harness.key(KeyCode::Down);
@@ -515,7 +595,7 @@ fn version_info_scrollbar_tracks_keyboard_and_wheel_scrolling_in_both_themes() {
 #[test]
 fn version_info_scrollbar_resizes_and_disappears_in_empty_viewports() {
     for theme in [Theme::Dark, Theme::Light] {
-        let mut harness = version_harness(32, 14, theme);
+        let mut harness = scrolling_version_harness(32, 14, theme);
         harness.key(KeyCode::End);
         let compact = visible_version_scrollbar(&harness);
         harness.resize(120, 40);
@@ -544,7 +624,7 @@ fn version_info_scrollbar_resizes_and_disappears_in_empty_viewports() {
 fn version_info_scrollbar_track_and_drag_are_bounded_and_isolated() {
     for theme in [Theme::Dark, Theme::Light] {
         for (width, height) in [(60, 24), (32, 14)] {
-            let mut harness = version_harness(width, height, theme);
+            let mut harness = scrolling_version_harness(width, height, theme);
             let underlying = harness.state();
             for _ in 0..3 {
                 harness.key(KeyCode::Down);
