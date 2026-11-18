@@ -1,7 +1,7 @@
 {
   "version": 1,
-  "estimatorRevision": 10,
-  "apiPricingCatalogRevision": 7,
+  "estimatorRevision": 11,
+  "apiPricingCatalogRevision": 8,
   "ratesAsOf": "2026-11-18",
   "sourceUrl": "https://developers.openai.com/api/docs/pricing",
   "longContextInputThreshold": 272000,
@@ -12,6 +12,7 @@
       "credit": {
         "standard": { "input": 200, "cachedInput": 10, "output": 1000 },
         "fast": { "input": 400, "cachedInput": 20, "output": 2000 },
+        "ultrafast": { "input": 1200, "cachedInput": 60, "output": 6000 },
         "longContextPricing": true
       },
       "api": {
@@ -28,6 +29,25 @@
             "mode": "published",
             "rates": { "input": 32, "cachedInput": "1.6", "cacheWrite": 40, "output": 120 }
           }
+        },
+        "ultrafast": {
+          "rates": {
+            "short": { "input": 48, "cachedInput": "2.4", "cacheWrite": 60, "output": 240 },
+            "long": {
+              "mode": "published",
+              "rates": { "input": 96, "cachedInput": "4.8", "cacheWrite": 120, "output": 360 }
+            }
+          },
+          "promotion": {
+            "endsAt": "2027-03-01T08:00:00Z",
+            "rates": {
+              "short": { "input": 24, "cachedInput": "1.2", "cacheWrite": 30, "output": 120 },
+              "long": {
+                "mode": "published",
+                "rates": { "input": 48, "cachedInput": "2.4", "cacheWrite": 60, "output": 180 }
+              }
+            }
+          }
         }
       }
     },
@@ -36,6 +56,7 @@
       "credit": {
         "standard": { "input": 50, "cachedInput": "2.5", "output": 250 },
         "fast": { "input": 100, "cachedInput": 5, "output": 500 },
+        "ultrafast": { "input": 300, "cachedInput": 15, "output": 1500 },
         "longContextPricing": true
       },
       "api": {
@@ -52,6 +73,25 @@
             "mode": "published",
             "rates": { "input": 8, "cachedInput": "0.4", "cacheWrite": 10, "output": 30 }
           }
+        },
+        "ultrafast": {
+          "rates": {
+            "short": { "input": 12, "cachedInput": "0.6", "cacheWrite": 15, "output": 60 },
+            "long": {
+              "mode": "published",
+              "rates": { "input": 24, "cachedInput": "1.2", "cacheWrite": 30, "output": 90 }
+            }
+          },
+          "promotion": {
+            "endsAt": "2027-03-01T08:00:00Z",
+            "rates": {
+              "short": { "input": 6, "cachedInput": "0.3", "cacheWrite": "7.5", "output": 30 },
+              "long": {
+                "mode": "published",
+                "rates": { "input": 12, "cachedInput": "0.6", "cacheWrite": 15, "output": 45 }
+              }
+            }
+          }
         }
       }
     },
@@ -60,6 +100,7 @@
       "credit": {
         "standard": { "input": 250, "cachedInput": 25, "output": 1250 },
         "fast": { "input": 625, "cachedInput": "62.5", "output": 3125 },
+        "ultrafast": { "input": 2000, "cachedInput": 200, "output": 10000 },
         "longContextPricing": true
       },
       "api": {
@@ -76,6 +117,15 @@
             "mode": "published",
             "rates": { "input": 40, "cachedInput": 4, "cacheWrite": 50, "output": 150 }
           }
+        },
+        "ultrafast": {
+          "rates": {
+            "short": { "input": 60, "cachedInput": 6, "cacheWrite": 75, "output": 300 },
+            "long": {
+              "mode": "published",
+              "rates": { "input": 120, "cachedInput": 12, "cacheWrite": 150, "output": 450 }
+            }
+          }
         }
       }
     },
@@ -84,6 +134,7 @@
       "credit": {
         "standard": { "input": 50, "cachedInput": "2.5", "output": 250 },
         "fast": { "input": 125, "cachedInput": "6.25", "output": 625 },
+        "ultrafast": { "input": 400, "cachedInput": 20, "output": 2000 },
         "longContextPricing": true
       },
       "api": {
@@ -99,6 +150,15 @@
           "long": {
             "mode": "published",
             "rates": { "input": 8, "cachedInput": "0.4", "cacheWrite": 10, "output": 30 }
+          }
+        },
+        "ultrafast": {
+          "rates": {
+            "short": { "input": 12, "cachedInput": "0.6", "cacheWrite": 15, "output": 60 },
+            "long": {
+              "mode": "published",
+              "rates": { "input": 24, "cachedInput": "1.2", "cacheWrite": 30, "output": 90 }
+            }
           }
         }
       }

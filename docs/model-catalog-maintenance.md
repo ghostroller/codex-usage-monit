@@ -15,9 +15,9 @@ Read these current documents before changing a mapping:
 
 | Source | Evidence to extract |
 | --- | --- |
-| [API pricing Markdown](https://developers.openai.com/api/docs/pricing.md) | USD per million tokens: Standard/Fast, short/long context, cached input, cache write, and output. |
+| [API pricing Markdown](https://developers.openai.com/api/docs/pricing.md) | USD per million tokens by service tier, short/long context, cached input, cache write, and output. Check effective dates for promotions. |
 | [Codex pricing Markdown](https://learn.chatgpt.com/docs/pricing.md) | Subscription credit rates per million tokens and plan-specific qualifications. |
-| [Speed](https://learn.chatgpt.com/docs/agent-configuration/speed) | Fast availability and the separate included-usage and purchased-credit multipliers. |
+| [Speed](https://learn.chatgpt.com/docs/agent-configuration/speed) | Fast and Ultrafast availability. Confirm included-usage and purchased-credit multipliers with the Codex pricing page. |
 | [Codex models](https://learn.chatgpt.com/docs/models) and [API models](https://developers.openai.com/api/docs/models) | Exact model IDs, availability, supported tiers, and model-specific context limits. |
 
 [App-server `model/list`](https://learn.chatgpt.com/docs/app-server#list-models-modellist)
@@ -83,28 +83,40 @@ GPT-5.6, GPT-5.5, and GPT-5.4 Fast multipliers are compatibility values. The
 GPT-5.6 Sol API promotion is listed through November 30, 2026, and its Codex
 credit promotion is listed at least through November 21, 2026.
 
-This update prices Standard and Fast. Ultrafast requires separate tier
-handling and a date-aware API rate for the GPT-6.2 models. The API promotion
-uses `3x` Standard through February 28, 2027 and switches to `6x` on March 1
-in Pacific time. Codex included usage uses `6x` and eligible purchased credits
-use the promotional `3x` before switching to `6x`. API equivalence leaves
-Ultrafast samples unpriced, and EST uses its existing Standard weighting for
-unrecognized tiers. The catalog uses 30-minute cache-write rates because
-rollout usage records a cache-write token count without retention. Image
-pricing needs modality evidence. Specialized trusted-access models are outside
-this update.
+The Ultrafast tier uses the official rows for four exact IDs. Every API
+multiplier applies to the corresponding Standard short or long rate, including
+cached input and 30-minute cache writes. [API Ultrafast guide](https://developers.openai.com/api/docs/guides/ultrafast-mode) · [API pricing](https://developers.openai.com/api/docs/pricing.md) · [Codex speed multipliers](https://learn.chatgpt.com/docs/pricing#speed-multipliers)
 
-Bundled revisions are estimator `9` and API catalog `6`. The complete
-example uses `10` and `7`. The full API and Codex matrices are in the
+| Exact IDs | API multiplier | Codex included | Eligible purchased credits / PAYG |
+| --- | --- | --- | --- |
+| `gpt-6.2-astra`, `gpt-6.2-sol` | `3x` during promotion, then `6x` | `6x` | `3x` during promotion, then `6x` |
+| `gpt-6-astra`, `gpt-6.1-sol` | `6x` | `8x` | `6x` |
+
+The GPT-6.2 promotion runs through February 28, 2027, Pacific time. The first
+list-price instant is midnight March 1 Pacific, `2027-03-01T08:00:00Z`. API
+equivalence selects rates from the recorded usage timestamp. A cumulative
+sample may include requests with different times, so its timestamp is the
+available basis for the estimate. The credit estimate uses the included rates.
+When a model has no Ultrafast row, API equivalence marks the sample unpriced
+and EST uses its partial rate fallback. The catalog uses 30-minute cache-write
+rates because rollout usage records cache-write token count without retention.
+Image pricing needs modality evidence. Specialized trusted-access models are
+outside this update.
+
+Bundled revisions are estimator `10` and API catalog `7`. The complete
+example uses `11` and `8`. The full API and Codex matrices are in the
 [data-capabilities reference](codex-data-capabilities.md).
 
 ## Rules to preserve
 
-- **Separate API prices from Codex credits.** API Fast prices, included
-  subscription Fast usage, and separately purchased-credit Fast usage are distinct
-  definitions. For example, included and purchased Fast can use `2.5x` and `2x`;
-  establish the applicable model and plan from Speed rather than generalizing.
-  Keep the estimator's included-subscription credit basis explicit.
+- **Separate API prices from Codex credits.** API prices, included subscription
+  usage, and purchased credits or PAYG use different definitions. Establish the
+  applicable model, plan, and tier from the official price tables. Keep the
+  estimator's included-subscription credit basis explicit.
+- **Keep promotional cutoffs explicit.** Confirm the effective time zone and
+  first instant of the list price. The API Ultrafast promotion's
+  `endsAt` is an exclusive UTC-normalized RFC 3339 timestamp. Use the usage
+  sample's timestamp so replaying retained rollout data preserves its rate.
 - **Verify IDs, aliases, and legacy support.** Model lookup is trim-normalized,
   case-insensitive exact matching. Add an alias only with evidence; preserve
   historical IDs and existing Daybreak mappings unless evidence warrants a
@@ -138,8 +150,8 @@ example uses `10` and `7`. The full API and Codex matrices are in the
 | --- | --- |
 | [`src/model_catalog.rs`](../src/model_catalog.rs) | `bundled_catalog()`, verified IDs/aliases, credit/API rates, tier/context support, bundled revision constants and metadata, and catalog tests. |
 | [`docs/model-catalog.example.json`](model-catalog.example.json) | Same mapping, rate, fallback, threshold, and metadata semantics as the bundled catalog; both revisions strictly above the bundled values. |
-| [`src/attribution.rs`](../src/attribution.rs) | Credit Standard/Fast matrix, exact decimals, Longx eligibility and request-boundary regressions. |
-| [`src/api_cost.rs`](../src/api_cost.rs) | API Standard/Fast short/long/cache-write matrix, unknown pricing, and boundary/range regressions. |
+| [`src/attribution.rs`](../src/attribution.rs) | Credit tier matrix, exact decimals, Longx eligibility and request-boundary regressions. |
+| [`src/api_cost.rs`](../src/api_cost.rs) | API tier, context and cache-write matrix, promotional cutoffs, unknown pricing, and boundary regressions. |
 | [`tests/model_catalog_config.rs`](../tests/model_catalog_config.rs) | Fresh-process configuration behavior and bundled metadata expectations. |
 | Both README files; [`codex-data-capabilities.md`](codex-data-capabilities.md), [`requirements.md`](requirements.md), [`implementation-plan.md`](implementation-plan.md), [`existing-tools.md`](existing-tools.md) | Current model list, prices, sources, dates, revisions, and changed assumptions. |
 
@@ -175,6 +187,8 @@ a reviewed runtime edit, restart recorder/TUI and use matching revisions and
 fingerprints on every synchronized host. Both external revisions must exceed
 those in the installed binary; a later bundled revision increase can invalidate
 an older override, so review its migration during an application upgrade.
+When upgrading an override to the Ultrafast-aware runtime, advance both of
+its previous revisions so older derived estimates are kept separate.
 Existing aggregated history cannot always be repriced without retained rollout
 evidence. See [catalog overrides](../README.md#model-catalog-overrides) and
 [application updates](remote-updates.md) for deployment and recovery details.

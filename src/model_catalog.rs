@@ -4,12 +4,13 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+use chrono::{DateTime, TimeZone, Utc};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 pub(crate) const MODEL_CATALOG_VERSION: u32 = 1;
-pub(crate) const BUNDLED_ESTIMATOR_REVISION: u32 = 9;
-pub(crate) const BUNDLED_API_PRICING_CATALOG_REVISION: u32 = 6;
+pub(crate) const BUNDLED_ESTIMATOR_REVISION: u32 = 10;
+pub(crate) const BUNDLED_API_PRICING_CATALOG_REVISION: u32 = 7;
 pub(crate) const BUNDLED_API_PRICING_RATES_AS_OF: &str = "2026-11-18";
 pub(crate) const BUNDLED_API_PRICING_SOURCE_URL: &str =
     "https://developers.openai.com/api/docs/pricing";
@@ -31,6 +32,28 @@ const CATALOG_FINGERPRINT_DOMAIN: &[u8] = b"codex-usage-monit/model-catalog/v1\0
 pub(crate) const MODEL_CATALOG_FINGERPRINT_PREFIX: &str = "model-catalog-sha256-v1-";
 
 static ACTIVE_CATALOG: OnceLock<CatalogState> = OnceLock::new();
+
+#[derive(Clone, Copy)]
+pub(crate) enum PricingTier {
+    Standard,
+    Fast,
+    Ultrafast,
+}
+
+impl PricingTier {
+    pub(crate) fn from_recorded(value: Option<&str>) -> Option<Self> {
+        let value = value?.trim();
+        if value.eq_ignore_ascii_case("default") || value.eq_ignore_ascii_case("standard") {
+            Some(Self::Standard)
+        } else if value.eq_ignore_ascii_case("fast") || value.eq_ignore_ascii_case("priority") {
+            Some(Self::Fast)
+        } else if value.eq_ignore_ascii_case("ultrafast") {
+            Some(Self::Ultrafast)
+        } else {
+            None
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct CreditTokenRates {
@@ -61,6 +84,7 @@ impl CreditTokenRates {
 pub(crate) struct CreditModelRates {
     pub(crate) standard: CreditTokenRates,
     pub(crate) fast: Option<CreditTokenRates>,
+    pub(crate) ultrafast: Option<CreditTokenRates>,
     pub(crate) long_context_pricing: bool,
 }
 
@@ -98,8 +122,44 @@ pub(crate) struct ApiTierRates {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ApiModelRates {
-    pub(crate) standard: ApiTierRates,
-    pub(crate) fast: Option<ApiTierRates>,
+    standard: ApiTierRates,
+    fast: Option<ApiTierRates>,
+    ultrafast: Option<ApiUltrafastRates>,
+}
+
+impl ApiModelRates {
+    pub(crate) fn rates_for(
+        &self,
+        tier: PricingTier,
+        observed_at: DateTime<Utc>,
+    ) -> Option<&ApiTierRates> {
+        match tier {
+            PricingTier::Standard => Some(&self.standard),
+            PricingTier::Fast => self.fast.as_ref(),
+            PricingTier::Ultrafast => {
+                let ultrafast = self.ultrafast.as_ref()?;
+                Some(
+                    ultrafast
+                        .promotion
+                        .as_ref()
+                        .filter(|promotion| observed_at < promotion.ends_at)
+                        .map_or(&ultrafast.rates, |promotion| &promotion.rates),
+                )
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ApiUltrafastRates {
+    rates: ApiTierRates,
+    promotion: Option<ApiTierPromotion>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ApiTierPromotion {
+    ends_at: DateTime<Utc>,
+    rates: ApiTierRates,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -164,23 +224,23 @@ pub(crate) fn initialize(path_override: Option<PathBuf>) -> io::Result<CatalogSt
     })
 }
 
-pub(crate) fn credit_rates(model: Option<&str>, fast: bool) -> Option<CreditTokenRates> {
+pub(crate) fn credit_rates(model: Option<&str>, tier: PricingTier) -> Option<CreditTokenRates> {
     let rates = lookup(model)?.credit?;
-    if fast {
-        rates.fast
-    } else {
-        Some(rates.standard)
+    match tier {
+        PricingTier::Standard => Some(rates.standard),
+        PricingTier::Fast => rates.fast,
+        PricingTier::Ultrafast => rates.ultrafast,
     }
 }
 
-pub(crate) fn fallback_credit_rates(fast: bool) -> CreditTokenRates {
+pub(crate) fn fallback_credit_rates(tier: PricingTier) -> CreditTokenRates {
     let catalog = active_catalog();
     let rates = catalog
         .models
         .get(&catalog.credit_fallback_model)
         .and_then(|entry| entry.credit)
         .expect("validated model catalog credit fallback is available");
-    if fast {
+    if matches!(tier, PricingTier::Fast) {
         rates
             .fast
             .expect("validated model catalog fast credit fallback is available")
@@ -195,8 +255,8 @@ pub(crate) fn model_supports_credit_long_context(model: Option<&str>) -> bool {
         .is_some_and(|rates| rates.long_context_pricing)
 }
 
-pub(crate) fn api_model_rates(model: Option<&str>) -> Option<ApiModelRates> {
-    lookup(model)?.api
+pub(crate) fn api_model_rates(model: Option<&str>) -> Option<&'static ApiModelRates> {
+    lookup(model)?.api.as_ref()
 }
 
 pub(crate) fn long_context_input_threshold() -> u64 {
@@ -223,12 +283,12 @@ pub(crate) fn model_catalog_fingerprint() -> &'static str {
     active_state().fingerprint.as_str()
 }
 
-fn lookup(model: Option<&str>) -> Option<ModelEntry> {
+fn lookup(model: Option<&str>) -> Option<&'static ModelEntry> {
     let normalized = normalize_model_name(model?);
     if normalized.is_empty() {
         return None;
     }
-    active_catalog().models.get(&normalized).copied()
+    active_catalog().models.get(&normalized)
 }
 
 fn active_catalog() -> &'static ModelCatalog {
@@ -535,13 +595,17 @@ impl CreditModelRates {
                 .fast
                 .map(|rates| CreditTokenRates::from_config(rates, "credit.fast"))
                 .transpose()?,
+            ultrafast: config
+                .ultrafast
+                .map(|rates| CreditTokenRates::from_config(rates, "credit.ultrafast"))
+                .transpose()?,
             long_context_pricing: config.long_context_pricing,
         };
         if rates.long_context_pricing
-            && (!rates.standard.output.is_multiple_of(2)
-                || rates
-                    .fast
-                    .is_some_and(|fast| !fast.output.is_multiple_of(2)))
+            && [Some(rates.standard), rates.fast, rates.ultrafast]
+                .into_iter()
+                .flatten()
+                .any(|tier| !tier.output.is_multiple_of(2))
         {
             return Err(invalid_config(
                 "credit long-context output rates must support an exact 1.5x multiplier",
@@ -591,7 +655,26 @@ impl ApiModelRates {
                 .fast
                 .map(|rates| ApiTierRates::from_config(rates, "api.fast"))
                 .transpose()?,
+            ultrafast: config
+                .ultrafast
+                .map(ApiUltrafastRates::from_config)
+                .transpose()?,
         })
+    }
+}
+
+impl ApiUltrafastRates {
+    fn from_config(config: ApiUltrafastConfig) -> io::Result<Self> {
+        let rates = ApiTierRates::from_config(config.rates, "api.ultrafast.rates")?;
+        let promotion = if let Some(promotion) = config.promotion {
+            Some(ApiTierPromotion {
+                ends_at: promotion.ends_at,
+                rates: ApiTierRates::from_config(promotion.rates, "api.ultrafast.promotion.rates")?,
+            })
+        } else {
+            None
+        };
+        Ok(Self { rates, promotion })
     }
 }
 
@@ -791,7 +874,7 @@ fn catalog_fingerprint(catalog: &ModelCatalog) -> String {
     for (name, entry) in &catalog.models {
         fingerprint_bytes(&mut digest, b"model-name", name.as_bytes());
         fingerprint_credit_model(&mut digest, entry.credit);
-        fingerprint_api_model(&mut digest, entry.api);
+        fingerprint_api_model(&mut digest, entry.api.as_ref());
     }
     format!("{MODEL_CATALOG_FINGERPRINT_PREFIX}{:x}", digest.finalize())
 }
@@ -811,6 +894,16 @@ fn fingerprint_credit_model(digest: &mut Sha256, rates: Option<CreditModelRates>
         b"credit-long-context-pricing",
         rates.long_context_pricing,
     );
+    // Even an absent Ultrafast rate has new semantics: explicit Ultrafast
+    // observations now use the partial fallback instead of Standard pricing.
+    fingerprint_bool(
+        digest,
+        b"credit-ultrafast-present",
+        rates.ultrafast.is_some(),
+    );
+    if let Some(ultrafast) = rates.ultrafast {
+        fingerprint_credit_rates(digest, b"credit-ultrafast", ultrafast);
+    }
 }
 
 fn fingerprint_credit_rates(digest: &mut Sha256, label: &[u8], rates: CreditTokenRates) {
@@ -820,7 +913,7 @@ fn fingerprint_credit_rates(digest: &mut Sha256, label: &[u8], rates: CreditToke
     fingerprint_u128(digest, b"credit-output", rates.output);
 }
 
-fn fingerprint_api_model(digest: &mut Sha256, rates: Option<ApiModelRates>) {
+fn fingerprint_api_model(digest: &mut Sha256, rates: Option<&ApiModelRates>) {
     fingerprint_bool(digest, b"api-present", rates.is_some());
     let Some(rates) = rates else {
         return;
@@ -829,6 +922,28 @@ fn fingerprint_api_model(digest: &mut Sha256, rates: Option<ApiModelRates>) {
     fingerprint_bool(digest, b"api-fast-present", rates.fast.is_some());
     if let Some(fast) = rates.fast {
         fingerprint_api_tier(digest, b"api-fast", fast);
+    }
+    fingerprint_bool(digest, b"api-ultrafast-present", rates.ultrafast.is_some());
+    if let Some(ultrafast) = &rates.ultrafast {
+        fingerprint_api_tier(digest, b"api-ultrafast", ultrafast.rates);
+        fingerprint_bool(
+            digest,
+            b"api-ultrafast-promotion-present",
+            ultrafast.promotion.is_some(),
+        );
+        if let Some(promotion) = &ultrafast.promotion {
+            fingerprint_bytes(
+                digest,
+                b"api-ultrafast-promotion-end-seconds",
+                &promotion.ends_at.timestamp().to_be_bytes(),
+            );
+            fingerprint_u32(
+                digest,
+                b"api-ultrafast-promotion-end-nanoseconds",
+                promotion.ends_at.timestamp_subsec_nanos(),
+            );
+            fingerprint_api_tier(digest, b"api-ultrafast-promotion", promotion.rates);
+        }
     }
 }
 
@@ -929,6 +1044,8 @@ struct CreditModelConfig {
     #[serde(default)]
     fast: Option<CreditTokenRatesConfig>,
     #[serde(default)]
+    ultrafast: Option<CreditTokenRatesConfig>,
+    #[serde(default)]
     long_context_pricing: bool,
 }
 
@@ -946,6 +1063,23 @@ struct ApiModelConfig {
     standard: ApiTierConfig,
     #[serde(default)]
     fast: Option<ApiTierConfig>,
+    #[serde(default)]
+    ultrafast: Option<ApiUltrafastConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ApiUltrafastConfig {
+    rates: ApiTierConfig,
+    #[serde(default)]
+    promotion: Option<ApiTierPromotionConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ApiTierPromotionConfig {
+    ends_at: DateTime<Utc>,
+    rates: ApiTierConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -992,11 +1126,13 @@ impl DecimalValue {
 fn credit_model(
     standard: CreditTokenRates,
     fast: Option<CreditTokenRates>,
+    ultrafast: Option<CreditTokenRates>,
     long_context_pricing: bool,
 ) -> Option<CreditModelRates> {
     Some(CreditModelRates {
         standard,
         fast,
+        ultrafast,
         long_context_pricing,
     })
 }
@@ -1025,6 +1161,7 @@ const fn luna_api_rates() -> ApiModelRates {
                 3_600_000,
             )),
         )),
+        ultrafast: None,
     }
 }
 
@@ -1039,14 +1176,21 @@ fn bundled_catalog() -> ModelCatalog {
         models: BTreeMap::new(),
     };
 
-    // The November 18 audit uses included-usage Fast multipliers and
-    // the 30-minute API cache-write rows. See docs/model-catalog-maintenance.md.
+    // The GPT-6.2 API promotion ends at midnight Pacific Standard Time.
+    let gpt_6_2_ultrafast_promotion_end = Utc
+        .with_ymd_and_hms(2027, 3, 1, 8, 0, 0)
+        .single()
+        .expect("published GPT-6.2 Ultrafast promotion cutoff");
+
+    // Credits use included-usage multipliers. API cache writes use the
+    // 30-minute rates. See docs/model-catalog-maintenance.md.
     catalog.insert_builtin(
         &["gpt-6.2-astra"],
         ModelEntry {
             credit: credit_model(
                 CreditTokenRates::new(1_600, 80, 8_000),
                 Some(CreditTokenRates::new(3_200, 160, 16_000)),
+                Some(CreditTokenRates::new(9_600, 480, 48_000)),
                 true,
             ),
             api: Some(ApiModelRates {
@@ -1068,6 +1212,34 @@ fn bundled_catalog() -> ModelCatalog {
                         120_000_000,
                     )),
                 )),
+                ultrafast: Some(ApiUltrafastRates {
+                    rates: api_tier(
+                        ApiTokenRates::new(48_000_000, 2_400_000, Some(60_000_000), 240_000_000),
+                        ApiLongContextRates::Published(ApiTokenRates::new(
+                            96_000_000,
+                            4_800_000,
+                            Some(120_000_000),
+                            360_000_000,
+                        )),
+                    ),
+                    promotion: Some(ApiTierPromotion {
+                        ends_at: gpt_6_2_ultrafast_promotion_end,
+                        rates: api_tier(
+                            ApiTokenRates::new(
+                                24_000_000,
+                                1_200_000,
+                                Some(30_000_000),
+                                120_000_000,
+                            ),
+                            ApiLongContextRates::Published(ApiTokenRates::new(
+                                48_000_000,
+                                2_400_000,
+                                Some(60_000_000),
+                                180_000_000,
+                            )),
+                        ),
+                    }),
+                }),
             }),
         },
     );
@@ -1077,6 +1249,7 @@ fn bundled_catalog() -> ModelCatalog {
             credit: credit_model(
                 CreditTokenRates::new(400, 20, 2_000),
                 Some(CreditTokenRates::new(800, 40, 4_000)),
+                Some(CreditTokenRates::new(2_400, 120, 12_000)),
                 true,
             ),
             api: Some(ApiModelRates {
@@ -1098,6 +1271,29 @@ fn bundled_catalog() -> ModelCatalog {
                         30_000_000,
                     )),
                 )),
+                ultrafast: Some(ApiUltrafastRates {
+                    rates: api_tier(
+                        ApiTokenRates::new(12_000_000, 600_000, Some(15_000_000), 60_000_000),
+                        ApiLongContextRates::Published(ApiTokenRates::new(
+                            24_000_000,
+                            1_200_000,
+                            Some(30_000_000),
+                            90_000_000,
+                        )),
+                    ),
+                    promotion: Some(ApiTierPromotion {
+                        ends_at: gpt_6_2_ultrafast_promotion_end,
+                        rates: api_tier(
+                            ApiTokenRates::new(6_000_000, 300_000, Some(7_500_000), 30_000_000),
+                            ApiLongContextRates::Published(ApiTokenRates::new(
+                                12_000_000,
+                                600_000,
+                                Some(15_000_000),
+                                45_000_000,
+                            )),
+                        ),
+                    }),
+                }),
             }),
         },
     );
@@ -1107,6 +1303,7 @@ fn bundled_catalog() -> ModelCatalog {
             credit: credit_model(
                 CreditTokenRates::new(2_000, 200, 10_000),
                 Some(CreditTokenRates::new(5_000, 500, 25_000)),
+                Some(CreditTokenRates::new(16_000, 1_600, 80_000)),
                 true,
             ),
             api: Some(ApiModelRates {
@@ -1128,6 +1325,18 @@ fn bundled_catalog() -> ModelCatalog {
                         150_000_000,
                     )),
                 )),
+                ultrafast: Some(ApiUltrafastRates {
+                    rates: api_tier(
+                        ApiTokenRates::new(60_000_000, 6_000_000, Some(75_000_000), 300_000_000),
+                        ApiLongContextRates::Published(ApiTokenRates::new(
+                            120_000_000,
+                            12_000_000,
+                            Some(150_000_000),
+                            450_000_000,
+                        )),
+                    ),
+                    promotion: None,
+                }),
             }),
         },
     );
@@ -1137,6 +1346,7 @@ fn bundled_catalog() -> ModelCatalog {
             credit: credit_model(
                 CreditTokenRates::new(400, 20, 2_000),
                 Some(CreditTokenRates::new(1_000, 50, 5_000)),
+                Some(CreditTokenRates::new(3_200, 160, 16_000)),
                 true,
             ),
             api: Some(ApiModelRates {
@@ -1158,6 +1368,18 @@ fn bundled_catalog() -> ModelCatalog {
                         30_000_000,
                     )),
                 )),
+                ultrafast: Some(ApiUltrafastRates {
+                    rates: api_tier(
+                        ApiTokenRates::new(12_000_000, 600_000, Some(15_000_000), 60_000_000),
+                        ApiLongContextRates::Published(ApiTokenRates::new(
+                            24_000_000,
+                            1_200_000,
+                            Some(30_000_000),
+                            90_000_000,
+                        )),
+                    ),
+                    promotion: None,
+                }),
             }),
         },
     );
@@ -1167,6 +1389,7 @@ fn bundled_catalog() -> ModelCatalog {
             credit: credit_model(
                 CreditTokenRates::new(200, 10, 1_000),
                 Some(CreditTokenRates::new(500, 25, 2_500)),
+                None,
                 true,
             ),
             api: Some(ApiModelRates {
@@ -1188,6 +1411,7 @@ fn bundled_catalog() -> ModelCatalog {
                         15_000_000,
                     )),
                 )),
+                ultrafast: None,
             }),
         },
     );
@@ -1197,6 +1421,7 @@ fn bundled_catalog() -> ModelCatalog {
             credit: credit_model(
                 CreditTokenRates::new(400, 40, 2_000),
                 Some(CreditTokenRates::new(1_000, 100, 5_000)),
+                None,
                 true,
             ),
             api: Some(ApiModelRates {
@@ -1218,6 +1443,7 @@ fn bundled_catalog() -> ModelCatalog {
                         30_000_000,
                     )),
                 )),
+                ultrafast: None,
             }),
         },
     );
@@ -1227,6 +1453,7 @@ fn bundled_catalog() -> ModelCatalog {
             credit: credit_model(
                 CreditTokenRates::new(20, 2, 100),
                 Some(CreditTokenRates::new(50, 5, 250)),
+                None,
                 true,
             ),
             api: Some(ApiModelRates {
@@ -1248,6 +1475,7 @@ fn bundled_catalog() -> ModelCatalog {
                         1_500_000,
                     )),
                 )),
+                ultrafast: None,
             }),
         },
     );
@@ -1262,6 +1490,7 @@ fn bundled_catalog() -> ModelCatalog {
             credit: credit_model(
                 CreditTokenRates::new(800, 80, 4_000),
                 Some(CreditTokenRates::new(2_000, 200, 10_000)),
+                None,
                 true,
             ),
             api: Some(ApiModelRates {
@@ -1283,6 +1512,7 @@ fn bundled_catalog() -> ModelCatalog {
                         60_000_000,
                     )),
                 )),
+                ultrafast: None,
             }),
         },
     );
@@ -1292,6 +1522,7 @@ fn bundled_catalog() -> ModelCatalog {
             credit: credit_model(
                 CreditTokenRates::new(400, 40, 2_400),
                 Some(CreditTokenRates::new(1_000, 100, 6_000)),
+                None,
                 true,
             ),
             api: Some(ApiModelRates {
@@ -1313,6 +1544,7 @@ fn bundled_catalog() -> ModelCatalog {
                         36_000_000,
                     )),
                 )),
+                ultrafast: None,
             }),
         },
     );
@@ -1322,6 +1554,7 @@ fn bundled_catalog() -> ModelCatalog {
             credit: credit_model(
                 CreditTokenRates::new(40, 4, 240),
                 Some(CreditTokenRates::new(100, 10, 600)),
+                None,
                 true,
             ),
             api: Some(luna_api_rates()),
@@ -1340,6 +1573,7 @@ fn bundled_catalog() -> ModelCatalog {
             credit: credit_model(
                 CreditTokenRates::new(1_000, 100, 6_000),
                 Some(CreditTokenRates::new(2_500, 250, 15_000)),
+                None,
                 true,
             ),
             api: Some(ApiModelRates {
@@ -1353,6 +1587,7 @@ fn bundled_catalog() -> ModelCatalog {
                     ApiTokenRates::new(12_500_000, 1_250_000, None, 75_000_000),
                     ApiLongContextRates::Unavailable,
                 )),
+                ultrafast: None,
             }),
         },
     );
@@ -1362,6 +1597,7 @@ fn bundled_catalog() -> ModelCatalog {
             credit: credit_model(
                 CreditTokenRates::new(500, 50, 3_000),
                 Some(CreditTokenRates::new(1_000, 100, 6_000)),
+                None,
                 true,
             ),
             api: Some(ApiModelRates {
@@ -1375,6 +1611,7 @@ fn bundled_catalog() -> ModelCatalog {
                     ApiTokenRates::new(5_000_000, 500_000, None, 30_000_000),
                     ApiLongContextRates::Unavailable,
                 )),
+                ultrafast: None,
             }),
         },
     );
@@ -1384,6 +1621,7 @@ fn bundled_catalog() -> ModelCatalog {
             credit: credit_model(
                 CreditTokenRates::new(150, 15, 904),
                 Some(CreditTokenRates::new(300, 30, 1_808)),
+                None,
                 false,
             ),
             api: Some(ApiModelRates {
@@ -1395,6 +1633,7 @@ fn bundled_catalog() -> ModelCatalog {
                     ApiTokenRates::new(1_500_000, 150_000, None, 9_000_000),
                     ApiLongContextRates::Flat,
                 )),
+                ultrafast: None,
             }),
         },
     );
@@ -1404,6 +1643,7 @@ fn bundled_catalog() -> ModelCatalog {
             credit: credit_model(
                 CreditTokenRates::new(350, 35, 2_800),
                 Some(CreditTokenRates::new(350, 35, 2_800)),
+                None,
                 false,
             ),
             api: Some(ApiModelRates {
@@ -1415,6 +1655,7 @@ fn bundled_catalog() -> ModelCatalog {
                     ApiTokenRates::new(3_500_000, 350_000, None, 28_000_000),
                     ApiLongContextRates::Flat,
                 )),
+                ultrafast: None,
             }),
         },
     );
@@ -1424,6 +1665,7 @@ fn bundled_catalog() -> ModelCatalog {
             credit: credit_model(
                 CreditTokenRates::new(350, 35, 2_800),
                 Some(CreditTokenRates::new(350, 35, 2_800)),
+                None,
                 false,
             ),
             api: Some(ApiModelRates {
@@ -1432,6 +1674,7 @@ fn bundled_catalog() -> ModelCatalog {
                     ApiLongContextRates::Flat,
                 ),
                 fast: None,
+                ultrafast: None,
             }),
         },
     );
@@ -1445,6 +1688,7 @@ fn bundled_catalog() -> ModelCatalog {
             credit: credit_model(
                 CreditTokenRates::new(2_500, 250, 15_000),
                 Some(CreditTokenRates::new(6_250, 625, 37_500)),
+                None,
                 true,
             ),
             api: Some(ApiModelRates {
@@ -1453,6 +1697,7 @@ fn bundled_catalog() -> ModelCatalog {
                     ApiLongContextRates::Unavailable,
                 ),
                 fast: None,
+                ultrafast: None,
             }),
         },
     );
@@ -1462,6 +1707,7 @@ fn bundled_catalog() -> ModelCatalog {
             credit: credit_model(
                 CreditTokenRates::new(2_500, 250, 15_000),
                 Some(CreditTokenRates::new(6_250, 625, 37_500)),
+                None,
                 false,
             ),
             api: Some(ApiModelRates {
@@ -1470,6 +1716,7 @@ fn bundled_catalog() -> ModelCatalog {
                     ApiLongContextRates::Unavailable,
                 ),
                 fast: None,
+                ultrafast: None,
             }),
         },
     );
@@ -1566,21 +1813,27 @@ mod tests {
         ];
         for (model, standard, fast, short, long, fast_short, fast_long) in cases {
             let entry = catalog.models.get(model).unwrap();
-            assert_eq!(entry.credit, credit_model(standard, Some(fast), true));
+            let credit = entry.credit.unwrap();
+            assert_eq!(credit.standard, standard, "{model}");
+            assert_eq!(credit.fast, Some(fast), "{model}");
+            assert!(credit.long_context_pricing, "{model}");
+            let api = entry.api.as_ref().unwrap();
             assert_eq!(
-                entry.api,
-                Some(ApiModelRates {
-                    standard: api_tier(short, ApiLongContextRates::Published(long)),
-                    fast: Some(api_tier(
-                        fast_short,
-                        ApiLongContextRates::Published(fast_long),
-                    )),
-                }),
+                api.standard,
+                api_tier(short, ApiLongContextRates::Published(long)),
+                "{model}",
+            );
+            assert_eq!(
+                api.fast,
+                Some(api_tier(
+                    fast_short,
+                    ApiLongContextRates::Published(fast_long),
+                )),
                 "{model}",
             );
             assert_eq!(
                 lookup(Some(&format!("  {}  ", model.to_uppercase()))),
-                Some(*entry)
+                Some(entry)
             );
         }
         for unlisted in [
@@ -1754,6 +2007,40 @@ mod tests {
             bundled.credit_fallback_model
         );
         assert_eq!(documented.models, bundled.models);
+    }
+
+    #[test]
+    fn configured_ultrafast_fingerprint_covers_rates_and_normalized_promotion_cutoff() {
+        let example = include_bytes!("../docs/model-catalog.example.json");
+        let base = catalog_fingerprint(&parse_catalog(example).unwrap());
+        let mut config: serde_json::Value = serde_json::from_slice(example).unwrap();
+        let astra_index = config["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|model| model["id"] == "gpt-6.2-astra")
+            .unwrap();
+        let fingerprint = |config: &serde_json::Value| {
+            catalog_fingerprint(&parse_catalog(&serde_json::to_vec(config).unwrap()).unwrap())
+        };
+
+        config["models"][astra_index]["api"]["ultrafast"]["promotion"]["endsAt"] =
+            "2027-03-01T00:00:00-08:00".into();
+        assert_eq!(fingerprint(&config), base);
+        config["models"][astra_index]["api"]["ultrafast"]["promotion"]["endsAt"] =
+            "2027-03-01T08:00:00.001Z".into();
+        let extended = fingerprint(&config);
+        assert_ne!(extended, base);
+        config["models"][astra_index]["api"]["ultrafast"]["promotion"]["rates"]["short"]["input"] =
+            25.into();
+        let api_changed = fingerprint(&config);
+        assert_ne!(api_changed, extended);
+        config["models"][astra_index]["credit"]["ultrafast"]["output"] = 6_001.into();
+        assert_ne!(fingerprint(&config), api_changed);
+
+        config["models"][astra_index]["credit"]["ultrafast"]["output"] = "6000.125".into();
+        let error = parse_catalog(&serde_json::to_vec(&config).unwrap()).unwrap_err();
+        assert!(error.to_string().contains("exact 1.5x multiplier"));
     }
 
     #[test]

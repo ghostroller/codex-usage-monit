@@ -58,13 +58,20 @@ fn write_custom_catalog(config_dir: &std::path::Path) {
 }
 
 fn write_catalog_rollout(codex_home: &std::path::Path) {
-    write_model_rollout(codex_home, " CUSTOM-MODEL-LATEST ", "unknown-model", false);
+    write_model_rollout(
+        codex_home,
+        " CUSTOM-MODEL-LATEST ",
+        "unknown-model",
+        "default",
+        false,
+    );
 }
 
 fn write_model_rollout(
     codex_home: &std::path::Path,
     first_model: &str,
     second_model: &str,
+    service_tier: &str,
     all_cached: bool,
 ) {
     let sessions = codex_home.join("sessions");
@@ -111,7 +118,7 @@ fn write_model_rollout(
             1,
             serde_json::json!({
                 "type": "thread_settings_applied",
-                "thread_settings": {"service_tier": "default"}
+                "thread_settings": {"service_tier": service_tier}
             }),
         ),
         event(
@@ -304,7 +311,7 @@ fn missing_catalog_uses_the_bundled_metadata() {
     let output = monitor_command(&config_dir, &codex_home).output().unwrap();
     assert!(output.status.success() || output.status.code() == Some(2));
     let document: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(document["apiPricing"]["catalogRevision"], 6);
+    assert_eq!(document["apiPricing"]["catalogRevision"], 7);
     assert_eq!(document["apiPricing"]["ratesAsOf"], "2026-11-18");
 }
 
@@ -316,11 +323,21 @@ fn bundled_gpt_6_models_are_priced_in_a_fresh_process_without_guessing_aliases()
         ("gpt-6.1-sol", 2.5, "200000000000"),
         ("gpt-6.1-terra", 1.25, "100000000000"),
     ] {
-        assert_bundled_model_pricing(model, cached_credit_rate, long_cached_pico_usd);
+        assert_bundled_model_pricing(model, "default", cached_credit_rate, long_cached_pico_usd);
     }
 }
 
-fn assert_bundled_model_pricing(model: &str, cached_credit_rate: f64, long_cached_pico_usd: &str) {
+#[test]
+fn rollout_ultrafast_tier_is_priced_in_a_fresh_process() {
+    assert_bundled_model_pricing("gpt-6.1-sol", " UlTrAfAsT ", 20.0, "1200000000000");
+}
+
+fn assert_bundled_model_pricing(
+    model: &str,
+    service_tier: &str,
+    cached_credit_rate: f64,
+    long_cached_pico_usd: &str,
+) {
     let directory = tempdir().unwrap();
     let config_dir = directory.path().join("empty-config");
     let codex_home = directory.path().join("codex");
@@ -329,6 +346,7 @@ fn assert_bundled_model_pricing(model: &str, cached_credit_rate: f64, long_cache
         &codex_home,
         &format!("  {}  ", model.to_ascii_uppercase()),
         &format!("{model}-latest"),
+        service_tier,
         true,
     );
 
@@ -346,7 +364,7 @@ fn assert_bundled_model_pricing(model: &str, cached_credit_rate: f64, long_cache
         .iter()
         .find(|analysis| analysis["durationMins"] == 300)
         .expect("fixture must produce a five-hour analysis");
-    assert_eq!(five_hour["apiPricing"]["catalogRevision"], 6);
+    assert_eq!(five_hour["apiPricing"]["catalogRevision"], 7);
     let turns = five_hour["turns"].as_array().unwrap();
     let usage_for = |turn_id: &str| {
         &turns

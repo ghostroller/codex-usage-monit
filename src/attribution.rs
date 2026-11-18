@@ -9,8 +9,8 @@ use crate::domain::{
     UsageCall, WindowAnalysis, WindowDescriptor, WindowUsage,
 };
 use crate::model_catalog::{
-    CreditTokenRates as TokenRates, credit_rates, fallback_credit_rates,
-    long_context_input_threshold, model_supports_credit_long_context,
+    PricingTier, credit_rates, fallback_credit_rates, long_context_input_threshold,
+    model_supports_credit_long_context,
 };
 
 const FIVE_HOURS_MINS: i64 = 300;
@@ -35,6 +35,7 @@ pub(crate) struct EstimatedUsageWeight {
     pub(crate) units: u128,
     /// Additional units produced only by the optional API long-context rule.
     pub(crate) api_long_context_extra_units: u128,
+    /// The model did not have an estimate for the selected tier.
     pub(crate) used_model_fallback: bool,
     pub(crate) used_token_breakdown_fallback: bool,
     pub(crate) used_long_context_pricing: bool,
@@ -97,8 +98,9 @@ struct SelectedWindow<'a> {
 /// Calculates raw local-token shares and low-confidence quota estimates for
 /// the current normal Codex five-hour and weekly rate-limit windows.
 ///
-/// Spark calls are excluded. EST uses the published Standard or Fast token
-/// credit rates, while raw token totals and TOKEN% shares remain unchanged.
+/// Spark calls are excluded. EST uses the published Standard, Fast, or Ultrafast
+/// token weights for included Codex usage. Raw token totals and TOKEN% shares
+/// are independent of those weights.
 pub fn analyze_windows(
     tasks: &[TaskRecord],
     _turns: &[TurnRecord],
@@ -520,9 +522,11 @@ fn cost_share(estimated_cost_units: u128, total_estimated_cost_units: u128) -> f
 }
 
 pub(crate) fn estimate_call_weight(call: &UsageCall) -> EstimatedUsageWeight {
-    let published_rates = codex_credit_rates(call.model.as_deref(), call.is_fast());
+    let tier =
+        PricingTier::from_recorded(call.service_tier.as_deref()).unwrap_or(PricingTier::Standard);
+    let published_rates = credit_rates(call.model.as_deref(), tier);
     let used_model_fallback = published_rates.is_none() && !call.tokens.is_zero();
-    let base_rates = published_rates.unwrap_or_else(|| fallback_credit_rates(call.is_fast()));
+    let base_rates = published_rates.unwrap_or_else(|| fallback_credit_rates(tier));
 
     let tokens = call.tokens;
     let used_token_breakdown_fallback = tokens.unclassified() > 0;
@@ -582,10 +586,6 @@ pub(crate) fn estimate_call_weight(call: &UsageCall) -> EstimatedUsageWeight {
 
 fn model_supports_long_context_pricing(model: Option<&str>) -> bool {
     model_supports_credit_long_context(model)
-}
-
-fn codex_credit_rates(model: Option<&str>, fast: bool) -> Option<TokenRates> {
-    credit_rates(model, fast)
 }
 
 fn model_name(call: &UsageCall) -> String {
@@ -906,6 +906,66 @@ mod tests {
             assert!(weight.used_model_fallback, "{model}");
             // Unknown slugs retain the GPT-5.6 Luna fallback's 0.5 cached rate.
             assert_eq!(weight.units, 4, "{model}");
+        }
+    }
+
+    #[test]
+    fn ultrafast_credits_use_included_usage_weights_across_the_api_price_change() {
+        let tokens = TokenUsage {
+            input_tokens: 272_001,
+            cached_input_tokens: 200_000,
+            cache_write_input_tokens: 50_000,
+            output_tokens: 1,
+            total_tokens: 272_002,
+            ..TokenUsage::default()
+        };
+        let api_price_change = DateTime::parse_from_rfc3339("2027-03-01T08:00:00Z")
+            .unwrap()
+            .to_utc();
+        for (model, included_multiplier) in [
+            ("gpt-6.2-astra", 6),
+            ("gpt-6.2-sol", 6),
+            ("gpt-6-astra", 8),
+            ("gpt-6.1-sol", 8),
+        ] {
+            let mut call = rated_call(model, false, tokens);
+            let standard = estimate_call_weight(&call);
+            call.service_tier = Some(" UlTrAfAsT ".to_owned());
+            for timestamp in [api_price_change - Duration::seconds(1), api_price_change] {
+                call.timestamp = timestamp;
+                let ultrafast = estimate_call_weight(&call);
+                assert_eq!(
+                    ultrafast.units,
+                    standard.units * included_multiplier,
+                    "{model}"
+                );
+                assert_eq!(
+                    ultrafast.units_with_api_long_context(),
+                    standard.units_with_api_long_context() * included_multiplier,
+                    "{model}"
+                );
+                assert!(ultrafast.used_long_context_pricing, "{model}");
+                assert!(!ultrafast.used_model_fallback, "{model}");
+            }
+        }
+    }
+
+    #[test]
+    fn missing_ultrafast_credit_rates_use_the_partial_standard_fallback() {
+        let tokens = TokenUsage {
+            input_tokens: 300_000,
+            total_tokens: 300_000,
+            ..TokenUsage::default()
+        };
+        let fallback = estimate_call_weight(&rated_call("gpt-5.6-luna", false, tokens));
+        for model in ["gpt-6.1-terra", "gpt-6.2-sol-latest"] {
+            let mut call = rated_call(model, false, tokens);
+            call.service_tier = Some("ultrafast".to_owned());
+            let ultrafast = estimate_call_weight(&call);
+            assert_eq!(ultrafast.units, fallback.units, "{model}");
+            assert!(ultrafast.used_model_fallback, "{model}");
+            assert!(!ultrafast.used_long_context_pricing, "{model}");
+            assert!(!ultrafast.used_long_context_detection_fallback, "{model}");
         }
     }
 

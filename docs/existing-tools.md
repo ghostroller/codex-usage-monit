@@ -37,7 +37,7 @@
 2. CodexBar 的只读 App Server 额度读取；
 3. codex-ops/ccusage 的 rollout token 重建。
 
-本项目增加的核心能力是把三条链路放进同一个 snapshot model，并把 exact/partial local token、账户级 `codex` gauge、Low-confidence estimated quota share、confidence 和 external risk 分开表达。`TOKEN%` 是原始非 Spark token share，`EST.Q` 才使用 `codex usedPercent × 模型/服务层 Codex token credit 费率加权用量占比`。2026-11-18 核对的内置目录包含 GPT-6.2 Astra/Sol、GPT-6.1 Sol/Terra、GPT-6 Astra/Sol/Luna 的精确 ID。GPT-6.2 Astra/Sol 的内含用量 Fast 倍率为 `2x`，GPT-6.1 Sol/Terra 和 GPT-6 Astra/Sol/Luna 为 `2.5x`。目录保留 GPT-5.6 Sol 的调价、Daybreak Blue/Red aliases 和旧模型的 rollout 兼容权重。EST 展示每个 task/turn 的额度估算。见[Codex 费率表与速度倍率](https://learn.chatgpt.com/docs/pricing)。
+本项目增加的核心能力是把三条链路放进同一个 snapshot model，并把 exact/partial local token、账户级 `codex` gauge、Low-confidence estimated quota share、confidence 和 external risk 分开表达。`TOKEN%` 是原始非 Spark token share，`EST.Q` 才使用 `codex usedPercent × 模型/服务层 Codex token credit 费率加权用量占比`。2026-11-18 核对的内置目录包含 GPT-6.2 Astra/Sol、GPT-6.1 Sol/Terra、GPT-6 Astra/Sol/Luna 的精确 ID。GPT-6.2 Astra/Sol 的内含用量 Fast 倍率为 `2x`，GPT-6.1 Sol/Terra 和 GPT-6 Astra/Sol/Luna 为 `2.5x`。Ultrafast 的内含用量倍率对 GPT-6.2 Astra/Sol 为 `6x`，对 GPT-6 Astra 和 GPT-6.1 Sol 为 `8x`。目录保留 GPT-5.6 Sol 的调价、Daybreak Blue/Red aliases 和旧模型的 rollout 兼容权重。EST 展示每个 task/turn 的额度估算。见[Codex 费率表与速度倍率](https://learn.chatgpt.com/docs/pricing)。
 
 ## Idle 后是否精确
 

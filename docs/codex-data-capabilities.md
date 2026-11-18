@@ -101,7 +101,7 @@ Token breakdown 包括：
 
 ### API 等价模型费用
 
-当前 5 小时和周 reset cycle 会独立计算 `API EQ.`。内置价格目录来自当前公开的 [OpenAI API pricing](https://developers.openai.com/api/docs/pricing)，当前为 API catalog revision 6、费率日期 2026-11-18；运行时使用的目录 revision、费率日期和来源 URL 一并输出。该结果与 Codex 额度 `~EST` 是两套互不影响的指标。计算只覆盖模型 token，不包含按次收取的工具调用费、容器、存储、搜索调用、税费、区域加价或协商合同价格；工具执行前后已经进入模型 input/output 的 token 仍按模型费率计算。
+当前 5 小时和周 reset cycle 会独立计算 `API EQ.`。内置价格目录来自当前公开的 [OpenAI API pricing](https://developers.openai.com/api/docs/pricing)，当前为 API catalog revision 7、费率日期 2026-11-18；运行时使用的目录 revision、费率日期和来源 URL 一并输出。该结果与 Codex 额度 `~EST` 是两套互不影响的指标。计算只覆盖模型 token，不包含按次收取的工具调用费、容器、存储、搜索调用、税费、区域加价或协商合同价格；工具执行前后已经进入模型 input/output 的 token 仍按模型费率计算。
 
 内置目录按精确 ID 匹配下列模型。费率依次为 input / cached input / 30 分钟 cache write / output，单位为美元 / 1M tokens。单次 input 严格大于 272000 tokens 时使用 long-context 费率。
 
@@ -115,13 +115,22 @@ Token breakdown 包括：
 | `gpt-6-sol` | 2 / 0.2 / 2.5 / 10 | 4 / 0.4 / 5 / 15 | 4 / 0.4 / 5 / 20 | 8 / 0.8 / 10 / 30 |
 | `gpt-6-luna` | 0.1 / 0.01 / 0.125 / 0.5 | 0.2 / 0.02 / 0.25 / 0.75 | 0.2 / 0.02 / 0.25 / 1 | 0.4 / 0.04 / 0.5 / 1.5 |
 
-目录涵盖 Standard 和 Fast。Ultrafast 的 API 用量保持未计价。rollout 的 cache-write token 数不含缓存时长，所以 API 等价值采用 30 分钟费率。GPT-5.6 Sol 的 API 促销价按 2026-11-18 核对结果持续到 2026-11-30。[API 费率表](https://developers.openai.com/api/docs/pricing.md)
+Ultrafast 同样按 input / cached input / 30 分钟 cache write / output 计价。GPT-6.2 的促销在美国太平洋时间 2027-03-01 零点结束，此时 UTC 为 `2027-03-01T08:00:00Z`。API 等价值根据用量记录时间选择费率，截止时刻起使用常规价。累计增量里的单次请求时间可能未知，仍以该条用量记录的时间选择费率。下表的常规价也适用于没有促销的 GPT-6 Astra 和 GPT-6.1 Sol。[API 费率表](https://developers.openai.com/api/docs/pricing.md) · [Ultrafast 支持型号](https://developers.openai.com/api/docs/guides/ultrafast-mode)
+
+| 模型 ID | Ultrafast 促销 short | Ultrafast 促销 long | Ultrafast 常规 short | Ultrafast 常规 long |
+| --- | --- | --- | --- | --- |
+| `gpt-6.2-astra` | 24 / 1.2 / 30 / 120 | 48 / 2.4 / 60 / 180 | 48 / 2.4 / 60 / 240 | 96 / 4.8 / 120 / 360 |
+| `gpt-6.2-sol` | 6 / 0.3 / 7.5 / 30 | 12 / 0.6 / 15 / 45 | 12 / 0.6 / 15 / 60 | 24 / 1.2 / 30 / 90 |
+| `gpt-6-astra` | — | — | 60 / 6 / 75 / 300 | 120 / 12 / 150 / 450 |
+| `gpt-6.1-sol` | — | — | 12 / 0.6 / 15 / 60 | 24 / 1.2 / 30 / 90 |
+
+未配置 Ultrafast 费率的调用保持未计价。rollout 的 cache-write token 数不含缓存时长，所以 API 等价值采用 30 分钟费率。GPT-5.6 Sol 的 API 促销价按 2026-11-18 核对结果持续到 2026-11-30。[API 费率表](https://developers.openai.com/api/docs/pricing.md)
 
 TUI 中的 Tasks 会话行与 Turns 对话行分别从当前选中的 5 小时或周 `WindowAnalysis` 取得独立 `API EQ.`，不是 lifetime 金额。所选普通 `codex` 窗口不存在或本地扫描完全不可用时显示 `-`，不得借用另一 scope 或把未知默认值显示成真实 `$0.0000`；完整窗口内已观察的零值仍明确显示 `$0.0000`。rollout 扫描或 lookback 覆盖不完整时，金额末尾追加 `+` 表示可能遗漏额外调用的下界。这套金额始终使用 API 价格目录，不随 `[L]EST Longx` 额度估算开关变化。
 
 每次调用按 `普通 input = input - cached input - cache-write input`、cached input、cache-write input 和 output 分项计价。`reasoningOutputTokens` 已包含在 output 中，不重复收费。金额以 pico-USD 整数累计并在 JSON 中序列化为十进制字符串，避免浮点和 JavaScript 大整数精度损失。
 
-准确的单次请求 input 严格大于 272K 时使用公开的 long-context 价格；只有一套平价费率的模型在其支持的上下文内继续使用同一价格。若累计增量大于阈值但无法确认请求边界，并且该模型同时有完整的 short/long 费率，则输出两种解释形成的金额区间。当前结构化的普通 ThreadSpawn subagent 只有在 metadata 明确记录 `agent_role=null`，且 child model 与经过 provenance gate 的 settings snapshot 完全匹配时，才还原其有效服务层；较新 snapshot 总会覆盖旧状态，并且只有在这条路径中省略或 null tier 才规范化为 API `default`。内置目录把 `codex-auto-review` 作为唯一明确的模型计价代理：为该独立 label 配置与 `gpt-5.6-luna` 相同的费率、保留已记录的 Standard/Fast tier、缺失 tier 按 Standard；只有活动目录中两者费率仍完全相同时才加入 `api_price_codex_auto_review_luna_proxy`。该代理是应用假设，不是官方 API alias。旧版或自定义 role 的 spawn、model 不匹配、其他缺失或未知的服务层、其他未知模型、缺少 Fast/long 行、缺少或互相矛盾的 token breakdown，以及出现 cache write 但该模型没有公开写入费率时，对应 token 保持未计价，并降低 `pricedTokens / observedTokens` 覆盖率，不会套用其他后备价格。`observedSamples` / `pricedSamples` 统计 rollout usage delta；非精确 sample 可能包含多个请求，不能解释为请求数。`modelBreakdown` 保留包括 Spark 在内的所有观察模型，使总覆盖率可以按模型对账。未计价 sample 或本地 rollout 覆盖不完整时，小计末尾显示 `+` 作为下界；极小正金额显示 `<$0.000001`，已知金额为零与完全无法计价分别显示为 `$0.0000` 和 `-`。
+准确的单次请求 input 严格大于 272K 时使用公开的 long-context 价格；只有一套平价费率的模型在其支持的上下文内继续使用同一价格。若累计增量大于阈值但无法确认请求边界，并且该模型同时有完整的 short/long 费率，则输出两种解释形成的金额区间。当前结构化的普通 ThreadSpawn subagent 只有在 metadata 明确记录 `agent_role=null`，且 child model 与经过 provenance gate 的 settings snapshot 完全匹配时，才还原其有效服务层；较新 snapshot 总会覆盖旧状态，并且只有在这条路径中省略或 null tier 才规范化为 API `default`。内置目录把 `codex-auto-review` 作为唯一明确的模型计价代理：为该独立 label 配置与 `gpt-5.6-luna` 相同的费率、保留已记录的 Standard/Fast tier、缺失 tier 按 Standard；只有活动目录中两者费率仍完全相同时才加入 `api_price_codex_auto_review_luna_proxy`。该代理是应用假设，不是官方 API alias。旧版或自定义 role 的 spawn、model 不匹配、其他缺失或未知的服务层、其他未知模型、缺少所用服务层或长上下文费率、缺少或互相矛盾的 token breakdown，以及出现 cache write 但该模型没有公开写入费率时，对应 token 保持未计价，并降低 `pricedTokens / observedTokens` 覆盖率，不会套用其他后备价格。`observedSamples` / `pricedSamples` 统计 rollout usage delta；非精确 sample 可能包含多个请求，不能解释为请求数。`modelBreakdown` 保留包括 Spark 在内的所有观察模型，使总覆盖率可以按模型对账。未计价 sample 或本地 rollout 覆盖不完整时，小计末尾显示 `+` 作为下界；极小正金额显示 `<$0.000001`，已知金额为零与完全无法计价分别显示为 `$0.0000` 和 `-`。
 
 Cyber 长上下文目前存在官方来源冲突：GPT-5.6 Cyber 模型页写有 `>272K` 的倍率说明，但通用价格表的 Cyber long-context 单元格仍为 `-`，且模型页同时列出 272K maximum input。实现以通用价格目录为准，将这种长调用保持未计价并降低 coverage，不猜测一个无法由公开价目表完整支持的金额。
 
@@ -131,7 +140,9 @@ Cyber 长上下文目前存在官方来源冲突：GPT-5.6 Cyber 模型页写有
 
 启动时程序会在常规配置目录中查找可选的 `model-catalog.json`：macOS 为 `~/Library/Application Support/codex-usage-monit`，Linux 为 `$XDG_CONFIG_HOME/codex-usage-monit` 或 `~/.config/codex-usage-monit`，Windows 为 `%LOCALAPPDATA%\codex-usage-monit`；`CODEX_USAGE_MONIT_CONFIG_DIR` 会覆盖该目录。文件不存在时才使用内置目录；文件存在但无法读取、过大或校验失败时，需要费率的命令直接报错，不得静默回退到内置值。
 
-外部文件是完整替换而非局部 patch，需同时定义模型 ID / aliases、Codex Standard/Fast credit 费率、`creditFallbackModel`、API Standard/Fast 短/长上下文费率、cache-write 支持、长上下文阈值和目录元数据。首次外部覆盖的 `estimatorRevision` 和 `apiPricingCatalogRevision` 必须分别大于内置的 9 和 6；后续修改对应口径时也必须递增。编辑后重启 TUI/recorder 即可生效，无需重新编译。远程协议 v5 同时比较 revision 与规范化目录 SHA-256 指纹；参与同步的各机器只要任一不一致就拒绝混用。完整示例见 [`model-catalog.example.json`](model-catalog.example.json)。
+外部文件会完整替换模型目录，包括模型 ID / aliases、Codex credit 费率、`creditFallbackModel`、API 短/长上下文费率、cache-write 支持、长上下文阈值和目录元数据。首次外部覆盖的 `estimatorRevision` 和 `apiPricingCatalogRevision` 必须分别大于内置的 10 和 7，后续修改对应口径时也必须递增。编辑后重启 TUI 和 recorder 生效。远程协议 v5 同时比较 revision 与规范化目录 SHA-256 指纹，两者都一致才能同步。[完整示例目录](model-catalog.example.json)
+
+可选的 `credit.ultrafast` 与其他 credit 服务层使用同一种 input、cachedInput、output 结构。可选的 `api.ultrafast.rates` 使用 API tier 的 `short`、`long` 结构。需要促销价时，在 `api.ultrafast.promotion` 中定义 `endsAt` 和同结构的 `rates`。`endsAt` 接收 RFC 3339 时间并规范化为 UTC。用量记录早于该时刻时使用促销价，从该时刻起使用 `api.ultrafast.rates`。[完整示例目录](model-catalog.example.json)
 
 Rollout JSONL 中可利用以下事件重建历史：
 
@@ -191,6 +202,8 @@ turn_token_share = turn_total_tokens / observed_local_window_total_tokens
 
 内置目录使用 Codex 官方费率及历史 rollout 的兼容权重。Standard 列为 credits / 1M tokens。Fast 列使用订阅内含用量倍率，GPT-6.2 Astra 和 Sol 为 `2x`，GPT-6.1 Sol 和 Terra、GPT-6 Astra、Sol 和 Luna 为 `2.5x`。这些模型另购 credits 的 Fast 倍率为 `2x`。GPT-5.6 和 GPT-5.5 保留早期 `2.5x` 倍率，GPT-5.4 保留早期 `2x` 倍率。GPT-5.6 Sol 的 credit 促销价至少持续到 2026-11-21。合法的 `model-catalog.json` 会完整替换下表的内置值。[Codex 费率表与速度倍率](https://learn.chatgpt.com/docs/pricing.md)
 
+订阅内含用量的 Ultrafast 倍率对 `gpt-6.2-astra` 和 `gpt-6.2-sol` 为 `6x`，对 `gpt-6-astra` 和 `gpt-6.1-sol` 为 `8x`。符合条件的另购 credits 与 PAYG 对 GPT-6.2 Astra 和 Sol 在促销期用 `3x`，在美国太平洋时间 2027-03-01 起用 `6x`。后两款的另购 credits 与 PAYG 为 `6x`。EST 使用订阅内含用量倍率。[Codex 速度倍率](https://learn.chatgpt.com/docs/pricing#speed-multipliers)
+
 | model id | Standard input | Standard cached input | Standard output | Fast multiplier (included usage) |
 | --- | ---: | ---: | ---: | ---: |
 | `gpt-6.2-astra` | 200 | 10 | 1,000 | 2x |
@@ -217,7 +230,7 @@ Longx 对 GPT-6.2 Astra 和 Sol、GPT-6.1 Sol 和 Terra、GPT-6 Astra、Sol 和 
 
 公告中的 GPT-Image-2.0 同时给出 image 与 text 两套计费行；当前 rollout `UsageCall` 不暴露足以区分这两种计费模态的字段，因此实现不会仅凭模型名套用其中任意一行。若该模型名出现在普通 token 调用中，EST 会使用激活目录的 `creditFallbackModel`（内置目录为 `gpt-5.6-luna`）并标记 partial；API 等价费用仍保持未计价，不会伪装成精确的 GPT-Image 费率。
 
-模型名采用去除首尾空白后的大小写不敏感精确匹配，不从未知后缀猜测基础模型。在额度 EST 中，`serviceTier=fast` 与本地登录态 rollout 中兼容的 `serviceTier=priority` 值都使用该模型适用的 ChatGPT Fast 倍率；缺失、`default` 或其他 service tier 使用 Standard。这里的 `priority` 是 rollout 兼容映射，不代表官方文档中另行计费的 API Priority。API 等价费用采用更严格的证据口径：只有按上述 ThreadSpawn 规则可靠还原后才把省略/null 字段解释为 `default`；除上述 `codex-auto-review` 策略例外外，其余缺失或未知 service tier 不假定 Standard，而是降低已计价覆盖率。GPT-5.3-Codex 和 GPT-5.2 没有列在 Speed 支持范围内，因此即使遇到异常的 Fast 标识，额度 EST 仍保留 Standard 费率。实现将表中小数按统一比例转成整数 credit units，比例在相对占比中抵消，避免浮点累计误差：
+模型名采用去除首尾空白后的大小写不敏感精确匹配，不从未知后缀猜测基础模型。在额度 EST 中，`serviceTier=fast` 与本地登录态 rollout 中兼容的 `serviceTier=priority` 值都使用该模型适用的 ChatGPT Fast 倍率；缺失、`default` 或其他未识别的 service tier 使用 Standard。识别为 `serviceTier=ultrafast` 时读取对应 Ultrafast 费率。这里的 `priority` 是 rollout 兼容映射，不代表官方文档中另行计费的 API Priority。API 等价费用采用更严格的证据口径：只有按上述 ThreadSpawn 规则可靠还原后才把省略/null 字段解释为 `default`；除上述 `codex-auto-review` 策略例外外，其余缺失或未知 service tier 不假定 Standard，而是降低已计价覆盖率。GPT-5.3-Codex 和 GPT-5.2 没有列在 Speed 支持范围内，因此即使遇到异常的 Fast 标识，额度 EST 仍保留 Standard 费率。实现将表中小数按统一比例转成整数 credit units，比例在相对占比中抵消，避免浮点累计误差：
 
 ```text
 local_share_percent = entity_non_spark_tokens / all_local_non_spark_tokens * 100
@@ -240,9 +253,9 @@ estimated_quota_percent = codex_used_percent * entity_selected_units / all_selec
 
 长上下文判断只使用与安全累计 delta 完全相等的 `last_token_usage`，不会把 turn、thread 或同一采样间隔内多个请求的累计 input 误当成一个请求。recorder 对每次观察同时保存基础 units 与可选 API 长上下文 extra，不根据当前 TUI 偏好改变采集结果。`[L]EST Longx` 默认关闭；关闭时使用基础口径，且无法核实请求边界的大聚合不会仅因该假设降低完整性。开启时，聚合 input 不超过 272K 可以证明所有组成请求都属于短上下文；聚合 input 超过 272K 则保留基础费率并增加 `long_context_usage_unknown` partial reason，不猜测附加倍率。`reasoning_output_tokens` 是 output 的子集，不能再次相加。`cache_write_input_tokens` 也已解析、累计并参与单次请求一致性校验，但它本身是 input 子集，不能再次加到 token 总数。当前 Codex credit 卡没有 cache-write 行，因此 credit 代理不额外增加 API 文档中的 cache-write charge；开启可选倍率且发生可核实的长上下文时，它作为 input 的一部分自然包含在 input `2x` 中。只有 `total_tokens` 而缺少 input/output breakdown 的旧记录按 uncached input 降级，并增加 `token_breakdown_missing` partial reason。
 
-缺失或不在费率映射中的非 Spark 模型仍保留 `TOKENS` / `TOKEN%`，并按激活目录的 `creditFallbackModel` 对应 Standard/Fast credit profile 降级（内置目录指向 `gpt-5.6-luna`），以免静默丢出分母；不会仅因为 fallback 选择了某个模型就推断未知模型适用长上下文加价。该窗口增加兼容的 `unpriced_model_rate_fallback` partial reason，不能把 fallback 解释为已识别实际基础模型。API 等价费用不使用该 credit fallback；外部目录未明确定义 API 费率的模型仍然未计价。原始 token 与 `TOKEN%` 应用同一个未加权分母，EST 则对 task、turn 和 model 使用同一个 credit-rate 分母；task/model EST 合计等于当前 `codex` 的 `usedPercent`，缺少 turn id 的调用会使 turn 行合计低于该值。所有可计算结果在数据模型/JSON 中仍标记为 Low；TUI/text 的实体行只用 `~` 表示近似、用 `-` 表示不可用，不再重复 confidence 标签。估算方法、`externalActivityPossible` 与具体 partial reasons 在每个 scope 摘要中统一展示。扫描不完整、lookback 不足、费率后备或状态 stale 只会降低可信度并标记 partial/stale，不会清空仍有分母的 EST。
+非 Spark 调用缺失模型、模型未映射或 Ultrafast 无对应费率时，仍保留 `TOKENS` / `TOKEN%`，并使用激活目录的 `creditFallbackModel`（内置为 `gpt-5.6-luna`）保留估算分母；不会仅因为 fallback 选择了某个模型就推断未知模型适用长上下文加价。该窗口增加兼容的 `unpriced_model_rate_fallback` partial reason，不能把 fallback 解释为已识别实际基础模型。API 等价费用不使用该 credit fallback；外部目录未明确定义 API 费率的模型仍然未计价。原始 token 与 `TOKEN%` 应用同一个未加权分母，EST 则对 task、turn 和 model 使用同一个 credit-rate 分母；task/model EST 合计等于当前 `codex` 的 `usedPercent`，缺少 turn id 的调用会使 turn 行合计低于该值。所有可计算结果在数据模型/JSON 中仍标记为 Low；TUI/text 的实体行只用 `~` 表示近似、用 `-` 表示不可用，不再重复 confidence 标签。估算方法、`externalActivityPossible` 与具体 partial reasons 在每个 scope 摘要中统一展示。扫描不完整、lookback 不足、费率后备或状态 stale 只会降低可信度并标记 partial/stale，不会清空仍有分母的 EST。
 
-内置双口径 token-based credit 映射定义为 estimator revision 9，API 价格目录为 revision 6，历史文件使用 metric revision 5；外部目录使用其声明的更高 revision。程序不会对任意持久化聚合直接重新定价；它只从仍处于配置扫描范围内的 rollout 调用重建重叠的本地桶与周数据点。revision-aware upsert 在新点的未加权 token/call/cache-write 证据不差于旧点时优先使用当前激活的 estimator revision，避免旧 `estimated_cost_units` 的大小阻止替换。已发布的 estimator revision 3 基础历史继续保留，但在重建前没有可选 API extra；短暂开发版本的 revision 4 把倍率混在单一值中，无法安全拆分，因此升级时丢弃。其他无法重建的旧 revision 继续隔离；包含混合 estimator revision 的窗口不得合并 EST，而是让 `~EST` unavailable 并报告 `estimator_revision_changed` partial reason。开启 `[L]EST Longx` 时，缺少 optional extra 的旧点还会报告 `api_long_context_history_unavailable`，不会把缺值当成零。已摄取远端 generation 的目录指纹若与当前目录不一致，查询仍保留其 token、call 和 observed coverage，但屏蔽旧目录生成的 EST/API 金额与 priced coverage，并报告 `remote_model_catalog_fingerprint_mismatch:<source-id>`，直到使用一致目录重新同步。
+内置双口径 token-based credit 映射定义为 estimator revision 10，API 价格目录为 revision 7，历史文件使用 metric revision 5；外部目录使用其声明的更高 revision。程序不会对任意持久化聚合直接重新定价；它只从仍处于配置扫描范围内的 rollout 调用重建重叠的本地桶与周数据点。revision-aware upsert 在新点的未加权 token/call/cache-write 证据不差于旧点时优先使用当前激活的 estimator revision，避免旧 `estimated_cost_units` 的大小阻止替换。已发布的 estimator revision 3 基础历史继续保留，但在重建前没有可选 API extra；短暂开发版本的 revision 4 把倍率混在单一值中，无法安全拆分，因此升级时丢弃。其他无法重建的旧 revision 继续隔离；包含混合 estimator revision 的窗口不得合并 EST，而是让 `~EST` unavailable 并报告 `estimator_revision_changed` partial reason。开启 `[L]EST Longx` 时，缺少 optional extra 的旧点还会报告 `api_long_context_history_unavailable`，不会把缺值当成零。已摄取远端 generation 的目录指纹若与当前目录不一致，查询仍保留其 token、call 和 observed coverage，但屏蔽旧目录生成的 EST/API 金额与 priced coverage，并报告 `remote_model_catalog_fingerprint_mismatch:<source-id>`，直到使用一致目录重新同步。
 
 该公式仍隐含“本机看到了足够多的账户活动”这一强假设。其他设备或云 task、特殊工具、服务端取整、窗口重置与缺失日志都可能让 EST 偏离真实贡献，所以它只能称为 `estimated quota share`，不能称为官方逐任务 credit 账单。Help Center 还说明少量 Enterprise workspace 尚未从 legacy 按消息费率迁移到 token-based 卡；工具无法从 rollout 判断 workspace 的迁移状态，这些 workspace 的 EST 不代表其适用费率卡。JSON v2 为兼容旧消费者保留既有 attribution 汇总字段，同时新增 `apiPricing` 和各窗口/实体的 `apiEquivalentCost`；后两者不会驱动当前实体 EST。
 
@@ -295,7 +308,7 @@ TUI 将主题、顶层视图、window scope、API 长上下文倍率开关、Tur
 
 ## 官方依据
 
-费率于 2026-11-18 核对，来源包括通过 OpenAI Docs 获取的官方 Markdown、模型页和 Speed 说明。GPT-6.2 Astra、GPT-6.2 Sol 和 GPT-6.1 Terra 的 API 矩阵以及 Standard credit 费率和 Fast 倍率均列于上文。维护步骤和计价范围见[模型目录维护流程](model-catalog-maintenance.md)。
+费率于 2026-11-18 核对，来源包括通过 OpenAI Docs 获取的官方 Markdown、模型页和 Speed 说明。GPT-6.2 Astra、GPT-6.2 Sol 和 GPT-6.1 Terra 的 API 矩阵以及 Standard credit 费率和 Fast 倍率均列于上文。四款支持 Ultrafast 的模型使用公开的短、长上下文价格及促销规则。维护步骤和计价范围见[模型目录维护流程](model-catalog-maintenance.md)。
 
 - [Codex pricing and token-based credit rate card](https://learn.chatgpt.com/docs/pricing.md)
 - [OpenAI API pricing and long-context rules](https://developers.openai.com/api/docs/pricing.md)
@@ -305,7 +318,7 @@ TUI 将主题、顶层视图、window scope、API 长上下文倍率开关、Tur
 - [GPT-6.1 Terra model pricing](https://developers.openai.com/api/docs/models/gpt-6.1-terra)
 - [GPT-6 Astra model pricing](https://developers.openai.com/api/docs/models/gpt-6-astra)
 - [GPT-5.6 Sol model pricing](https://developers.openai.com/api/docs/models/gpt-5.6-sol)
-- [Codex Speed / Fast mode](https://learn.chatgpt.com/docs/agent-configuration/speed)
+- [Codex Fast 与 Ultrafast](https://learn.chatgpt.com/docs/agent-configuration/speed)
 - [Daybreak Blue aliases](https://developers.openai.com/api/docs/models/gpt-daybreak-blue-latest)
 - [Daybreak Red aliases](https://developers.openai.com/api/docs/models/gpt-daybreak-red-latest)
 - [Codex App Server](https://developers.openai.com/codex/app-server)

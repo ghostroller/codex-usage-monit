@@ -9,6 +9,7 @@ All notable changes to this project are documented in this file.
 ### Added
 
 - Add exact pricing profiles for GPT-6.2 Astra, GPT-6.2 Sol, and GPT-6.1 Terra. The profiles cover Codex credit estimates and Standard/Fast API-equivalent pricing, including published long-context and 30-minute cache-write rates. See the [November pricing audit](docs/model-catalog-maintenance.md#pricing-audit-on-november-18-2026).
+- Price recorded Ultrafast usage for GPT-6.2 Astra and Sol, GPT-6 Astra, and GPT-6.1 Sol. The GPT-6.2 API-equivalent rate follows the promotion end at midnight Pacific on March 1, 2027. Included Codex credit estimates use the separate subscription multipliers.
 
 ### Security
 
@@ -16,7 +17,7 @@ All notable changes to this project are documented in this file.
 
 ### Compatibility
 
-- The bundled estimator revision is 9 and the API pricing catalog revision is 6. The complete external catalog example uses 10/7. Use matching catalog revisions and fingerprints across synchronized nodes.
+- The bundled estimator revision is 10 and the API pricing catalog revision is 7. The complete external catalog example uses 11/8. Use matching catalog revisions and fingerprints across synchronized nodes.
 
 ## [0.7.2] - 2026-10-27
 

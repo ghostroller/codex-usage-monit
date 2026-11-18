@@ -412,13 +412,15 @@ TUI 中的重置和 turn 时间使用本地时间；Collection/Snapshot 的 `asO
 
 对于识别为 ChatGPT Fast 的调用，EST 按订阅内含用量计价。GPT-6.2 Astra 和 Sol 使用 `2x`，GPT-6.1 Sol 和 Terra、GPT-6 Astra、Sol 和 Luna 使用 `2.5x`。这几款模型另购 credits 的 Fast 倍率为 `2x`。GPT-5.6 和 GPT-5.5 保留早期 `2.5x` 兼容倍率，GPT-5.4 保留早期 `2x` 兼容倍率。见[官方速度倍率](https://learn.chatgpt.com/docs/pricing#speed-multipliers)。
 
+对记录为 Ultrafast 的调用，订阅内含额度估算对 GPT-6.2 Astra 和 Sol 使用 Standard 的 `6x`，对 GPT-6 Astra 和 GPT-6.1 Sol 使用 `8x`。符合条件的另购 credits 和按量付费用量采用各自费率。[Codex Ultrafast 费率](https://learn.chatgpt.com/docs/pricing#speed-multipliers)
+
 本地登录态 rollout 中兼容的 `serviceTier=priority` 值在本归因中按 Fast 处理；它不是官方 Speed 页面另行说明的 API Priority 计费。精确匹配的 `gpt-5.3-codex-spark` 仍不参与归因，因为其 credit 费率尚处于 research preview；未列出或缺失的非 Spark 模型使用当前目录显式配置的 credit 后备模型，并把 scope 标为 partial。
 
 可选 Longx 投影**默认关闭**。在 TUI 中可用 `[L]EST Longx` 持久开启，也可在某次 CLI 查询中传入 `--long-context`。开启后，程序才会对支持的模型在 Codex 额度 `~EST` 投影中额外套用 OpenAI API 公布的长上下文规则。OpenAI 的 Codex 订阅 credit 卡只说明 context 会影响 credits，并未公布完全相同的逐请求公式，因此 Longx 只是可选代理假设，不是订阅制计费事实。TUI 开关会随其他偏好保存；CLI 参数不会读取或改变该偏好。recorder 始终同时保存基础权重与可选附加权重，因此在任一界面切换都无需重装后台服务。
 
-`API EQ.` 是独立计算，依据当前 [OpenAI API pricing 表](https://developers.openai.com/api/docs/pricing)。内置 API 目录为 revision 6。2026-11-18 核对并新增 GPT-6.2 Astra、Sol 和 GPT-6.1 Terra 的 Standard/Fast 短、长上下文价格。每次调用分别计算普通 input、cached input、30 分钟 cache write 和 output，其中 output 已含 reasoning token。Ultrafast 属于 API 未计价范围，每种服务层和上下文长度只采用一种 cache-write 费率。见[各模型 API 费率](docs/codex-data-capabilities.md#api-等价模型费用)。
+`API EQ.` 按内置 API 目录 revision 7 独立计算。目录包含 Standard、Fast，并为 GPT-6.2 Astra 和 Sol、GPT-6 Astra、GPT-6.1 Sol 提供 Ultrafast 费率。GPT-6.2 Astra 和 Sol 按用量记录时间选用费率，截至美国太平洋时间 2027-02-28 为 Standard 的 `3x`，从 2027-03-01 起为 `6x`。GPT-6 Astra 和 GPT-6.1 Sol 使用 `6x`。每次调用分别计算普通 input、cached input、30 分钟 cache write 和 output，其中 output 已含 reasoning token。[各模型 API 费率](docs/codex-data-capabilities.md#api-等价模型费用) · [OpenAI API 价格表](https://developers.openai.com/api/docs/pricing)
 
-单次准确请求的 input 超过 272K 且官方公布长上下文价格时应用该价格；只有一套平价费率的模型在其支持的上下文内继续使用同一价格。较大的累计增量如果无法还原请求边界，则显示短/长上下文费用区间。对于当前结构化的普通 ThreadSpawn subagent，只有 spawn metadata 明确记录未使用自定义 role，且 child model 与经过 provenance gate 的 settings snapshot 完全匹配时，parser 才还原其有效 tier；较新 snapshot 总会覆盖旧状态，并且只有在这条路径中省略或 null tier 才表示 API `default`。内置目录把 `codex-auto-review` 作为明确的应用计价代理：使用 `gpt-5.6-luna` 费率，保留已记录的 Standard/Fast tier，tier 缺失时按 Standard，界面与 model breakdown 仍保留 `codex-auto-review`；只有活动目录中两者的 API 费率仍完全相同时才报告 `api_price_codex_auto_review_luna_proxy`。这是应用的路由假设，不是官方 API model alias。旧版或自定义 role 的 spawn、model 不匹配、其他缺失或未知 tier、模型未知、缺少 Fast/long 价格行、token breakdown 缺失，以及存在 cache write 但没有公开费率时，会降低已计价覆盖率，而不会套用后备价格。按次收取的工具费用及其他非模型费用不在计算范围；工具执行前后进入模型 input/output 的 token 仍按模型价格换算。因此它表示按当前 API 费率换算的等价值，不是 API 账单，也不是 Codex 订阅实际扣费。
+单次准确请求的 input 超过 272K 且官方公布长上下文价格时应用该价格；只有一套平价费率的模型在其支持的上下文内继续使用同一价格。较大的累计增量如果无法还原请求边界，则显示短/长上下文费用区间。对于当前结构化的普通 ThreadSpawn subagent，只有 spawn metadata 明确记录未使用自定义 role，且 child model 与经过 provenance gate 的 settings snapshot 完全匹配时，parser 才还原其有效 tier；较新 snapshot 总会覆盖旧状态，并且只有在这条路径中省略或 null tier 才表示 API `default`。内置目录把 `codex-auto-review` 作为明确的应用计价代理：使用 `gpt-5.6-luna` 费率，保留已记录的 Standard/Fast tier，tier 缺失时按 Standard，界面与 model breakdown 仍保留 `codex-auto-review`；只有活动目录中两者的 API 费率仍完全相同时才报告 `api_price_codex_auto_review_luna_proxy`。这是应用的路由假设，不是官方 API model alias。旧版或自定义 role 的 spawn、model 不匹配、其他缺失或未知 tier、模型未知、缺少所用服务层或长上下文费率、token breakdown 缺失，以及存在 cache write 但没有公开费率时，会降低已计价覆盖率，而不会套用后备价格。按次收取的工具费用及其他非模型费用不在计算范围；工具执行前后进入模型 input/output 的 token 仍按模型价格换算。因此它表示按当前 API 费率换算的等价值，不是 API 账单，也不是 Codex 订阅实际扣费。
 
 GPT-Image-2.0 不会直接套用公告中的任一行：官方费率卡分别列出 image 和 text 两种计费，而 rollout 用量没有提供足够的模态信息来可靠选择。若普通 token 调用中出现该模型名，它会使用带 partial 标记的未知模型后备，而不会假装 image 费率是精确值。
 
@@ -428,7 +430,7 @@ GPT-Image-2.0 不会直接套用公告中的任一行：官方费率卡分别列
 
 每次进程启动时，程序会在常规配置目录查找 `model-catalog.json`：macOS 为 `~/Library/Application Support/codex-usage-monit`，Linux 为 `$XDG_CONFIG_HOME/codex-usage-monit` 或 `~/.config/codex-usage-monit`，Windows 为 `%LOCALAPPDATA%\codex-usage-monit`。`CODEX_USAGE_MONIT_CONFIG_DIR` 会和其他配置文件一样覆盖该目录。这个文件可选，程序不会自动创建：文件不存在时使用内置目录；文件存在但无法读取或校验失败时，需要计算价格或协商价格 revision 的命令会直接报错，不会静默切到另一套费率。
 
-可从[完整示例目录](docs/model-catalog.example.json)开始修改。外部文件会完整替换内置目录，其中包括模型别名、Codex Standard/Fast credit 费率、未知模型 credit 后备项、API Standard/Fast 短/长上下文价格、cache-write 支持、元数据和长上下文阈值。费率支持十进制字符串，从而精确表示 `31.25` 等数值。首次使用时，`estimatorRevision` 和 `apiPricingCatalogRevision` 必须高于内置 revision（目前分别为 9 和 6）；之后每次修改对应映射或费率都必须递增相应 revision。编辑后重启 TUI 和 recorder 即可，无需重新编译。参与同步的全部机器必须使用相同 revision 和规范化目录指纹；远程协议 v5 会在合并数据前拒绝任何不匹配。
+外部文件会完整替换内置目录，其中包括模型别名、Codex credit 费率、未知模型 credit 后备项、API 短/长上下文价格、cache-write 支持、元数据和长上下文阈值。Ultrafast 费率和 API 促销期可以单独配置。费率支持十进制字符串，从而精确表示 `31.25` 等数值。首次使用时，`estimatorRevision` 和 `apiPricingCatalogRevision` 必须高于内置 revision（目前分别为 10 和 7），之后每次修改对应映射或费率都必须递增相应 revision。编辑后重启 TUI 和 recorder 生效。参与同步的全部机器必须使用相同 revision 和规范化目录指纹，远程协议 v5 会在合并数据前拒绝任何不匹配。[完整示例目录](docs/model-catalog.example.json)
 
 新模型或费率变更的维护步骤与官方来源见[模型目录维护流程](docs/model-catalog-maintenance.md)。Agent 按最新文档核实规则，并同步更新内置代码、完整示例和相关测试；本机程序更新另行执行。
 
@@ -457,7 +459,7 @@ Task 状态证据和置信度是两个独立的 JSON 字段。Task 的 `statusPr
 | `15m Local Tokens` | 按调用完成观察时间放入 UTC 对齐 15 分钟桶的本地 token 增量。 |
 | `15m ~EST Usage` | 把同一周低置信度分配拆到这些 15 分钟 credit 费率权重桶。 |
 
-历史使用 UTC 保存、按本地时间显示。周累计样本使用原始调用时间，因此可以精确切在服务端给出的任意重置分钟。Summary 的项目拆分从新版本开始向前记录，`1h` 到 `1d` 图表桶均由同一份持久化 15 分钟观察聚合而来；切换粒度不会重新扫描 rollout，也不需要另一种 recorder 模式。首次在 TUI 选择历史不完整的近 30 天范围，或运行 `summary --range 30d` 时，共享覆盖策略会执行一次仅扫描本地数据的 31 天回填，并临时扩大文件上限；TUI 在后台执行，一次性命令则在输出前完成。日常 recorder 仍保持已配置的轻量 lookback。按 history namespace 保存的标记会避免部分回填在每次启动或调用时重复运行；覆盖仍不完整时，七天后可再次自动尝试。无法重建的桶继续显示为 `PARTIAL`，总量会明确标为已知下限，未知时间桶留空而不会当成零。EST 聚合会携带估算器 revision，避免静默混用不同权重定义。内置双权重映射对应 estimator revision 9；外部目录使用它自己声明的更高 revision。每次新的本地观察都会同时保存基础 Codex credit 代理值与可选 API 长上下文附加值。Longx 关闭时，无法核实请求边界的大聚合不会影响完整性；开启时仍保留基础费率，并标记 `long_context_usage_unknown`，不会猜测。SQLite 初始化保留配额采样，不导入旧派生用量；需要的用量从现存 Codex 日志按当前估算器重建，不静默复用不兼容的权重定义。混合 estimator revision 仍不会合并。由于计算采用最新周 gauge 和完整周期分母，新增本地调用、服务端样本、切换估算口径或升级估算器后，之前绘制的 `~EST` 柱可能被修订。跨越周重置边界的 `15m ~EST` 桶会被排除并标记为 partial，而不会混入相邻周期。
+历史使用 UTC 保存、按本地时间显示。周累计样本使用原始调用时间，因此可以精确切在服务端给出的任意重置分钟。Summary 的项目拆分从新版本开始向前记录，`1h` 到 `1d` 图表桶均由同一份持久化 15 分钟观察聚合而来；切换粒度不会重新扫描 rollout，也不需要另一种 recorder 模式。首次在 TUI 选择历史不完整的近 30 天范围，或运行 `summary --range 30d` 时，共享覆盖策略会执行一次仅扫描本地数据的 31 天回填，并临时扩大文件上限；TUI 在后台执行，一次性命令则在输出前完成。日常 recorder 仍保持已配置的轻量 lookback。按 history namespace 保存的标记会避免部分回填在每次启动或调用时重复运行；覆盖仍不完整时，七天后可再次自动尝试。无法重建的桶继续显示为 `PARTIAL`，总量会明确标为已知下限，未知时间桶留空而不会当成零。EST 聚合会携带估算器 revision，避免静默混用不同权重定义。内置双权重映射对应 estimator revision 10；外部目录使用它自己声明的更高 revision。每次新的本地观察都会同时保存基础 Codex credit 代理值与可选 API 长上下文附加值。Longx 关闭时，无法核实请求边界的大聚合不会影响完整性；开启时仍保留基础费率，并标记 `long_context_usage_unknown`，不会猜测。SQLite 初始化保留配额采样，不导入旧派生用量；需要的用量从现存 Codex 日志按当前估算器重建，不静默复用不兼容的权重定义。混合 estimator revision 仍不会合并。由于计算采用最新周 gauge 和完整周期分母，新增本地调用、服务端样本、切换估算口径或升级估算器后，之前绘制的 `~EST` 柱可能被修订。跨越周重置边界的 `15m ~EST` 桶会被排除并标记为 partial，而不会混入相邻周期。
 
 Trends 的 Inspect 直接显示所选观测点原始保存的准确时间戳和值，而不是从图表坐标反推。对于 Trends 中的 15 分钟柱，读数会以本地时间显示其准确的 UTC 对齐桶区间。Summary 的 Inspect 则显示当前 `1h` 到 `1d` 粒度下所选派生本地聚合桶的起点、区间和值；它不是原始事件时间戳。
 

@@ -6,7 +6,7 @@ use crate::domain::{
 };
 use crate::model_catalog::{
     ApiLongContextRates as LongContextRates, ApiModelRates as ModelRates,
-    ApiTokenRates as TokenRates, api_model_rates, api_pricing_catalog_revision,
+    ApiTokenRates as TokenRates, PricingTier, api_model_rates, api_pricing_catalog_revision,
     api_pricing_rates_as_of, api_pricing_source_url, long_context_input_threshold,
 };
 
@@ -29,12 +29,6 @@ const LONG_CONTEXT_AMBIGUOUS: &str = "api_price_long_context_ambiguous";
 
 pub fn current_api_pricing_catalog_revision() -> u32 {
     api_pricing_catalog_revision()
-}
-
-#[derive(Clone, Copy)]
-enum ServiceTier {
-    Standard,
-    Fast,
 }
 
 #[derive(Clone, Copy)]
@@ -225,20 +219,15 @@ fn price_call(call: &UsageCall) -> CallCost {
 
 fn price_call_inner(call: &UsageCall) -> CallCost {
     let observed_tokens = coverage_tokens(call.tokens);
-    let Some(model_rates) = model_rates(call.model.as_deref()) else {
+    let Some(model_rates) = api_model_rates(call.model.as_deref()) else {
         return unpriced(observed_tokens, MODEL_UNKNOWN);
     };
     let Some(service_tier) = service_tier_for_call(call) else {
         return unpriced(observed_tokens, SERVICE_TIER_UNKNOWN);
     };
-    let tier_rates = match service_tier {
-        ServiceTier::Standard => model_rates.standard,
-        ServiceTier::Fast => {
-            let Some(fast) = model_rates.fast else {
-                return unpriced(observed_tokens, SERVICE_TIER_UNAVAILABLE);
-            };
-            fast
-        }
+    // The rollout's usage timestamp selects any date-dependent price.
+    let Some(tier_rates) = model_rates.rates_for(service_tier, call.timestamp) else {
+        return unpriced(observed_tokens, SERVICE_TIER_UNAVAILABLE);
     };
     let tokens = call.tokens;
     if tokens.unclassified() > 0 {
@@ -355,26 +344,15 @@ fn unpriced(observed_tokens: u64, partial_reason: &'static str) -> CallCost {
     }
 }
 
-fn service_tier_for_call(call: &UsageCall) -> Option<ServiceTier> {
+fn service_tier_for_call(call: &UsageCall) -> Option<PricingTier> {
     let recorded = call
         .service_tier
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
     match recorded {
-        None if is_codex_auto_review(call.model.as_deref()) => Some(ServiceTier::Standard),
-        _ => service_tier(recorded),
-    }
-}
-
-fn service_tier(value: Option<&str>) -> Option<ServiceTier> {
-    let value = value.map(str::trim).filter(|value| !value.is_empty())?;
-    if value.eq_ignore_ascii_case("default") || value.eq_ignore_ascii_case("standard") {
-        Some(ServiceTier::Standard)
-    } else if value.eq_ignore_ascii_case("fast") || value.eq_ignore_ascii_case("priority") {
-        Some(ServiceTier::Fast)
-    } else {
-        None
+        None if is_codex_auto_review(call.model.as_deref()) => Some(PricingTier::Standard),
+        _ => PricingTier::from_recorded(recorded),
     }
 }
 
@@ -393,14 +371,14 @@ fn is_codex_auto_review(model: Option<&str>) -> bool {
 fn auto_review_uses_luna_api_rates(model: Option<&str>) -> bool {
     is_codex_auto_review(model)
         && api_rates_match_luna_proxy(
-            model_rates(Some("codex-auto-review")),
-            model_rates(Some("gpt-5.6-luna")),
+            api_model_rates(Some("codex-auto-review")),
+            api_model_rates(Some("gpt-5.6-luna")),
         )
 }
 
 fn api_rates_match_luna_proxy(
-    auto_review_rates: Option<ModelRates>,
-    luna_rates: Option<ModelRates>,
+    auto_review_rates: Option<&ModelRates>,
+    luna_rates: Option<&ModelRates>,
 ) -> bool {
     matches!(
         (auto_review_rates, luna_rates),
@@ -408,15 +386,30 @@ fn api_rates_match_luna_proxy(
     )
 }
 
-fn model_rates(model: Option<&str>) -> Option<ModelRates> {
-    api_model_rates(model)
-}
-
 #[cfg(test)]
 mod tests {
-    use chrono::Utc;
+    use chrono::{Duration, TimeZone, Utc};
 
     use super::*;
+
+    const MIXED_SHORT_TOKENS: TokenUsage = TokenUsage {
+        unclassified_tokens: 0,
+        input_tokens: 100_000,
+        cached_input_tokens: 20_000,
+        cache_write_input_tokens: 10_000,
+        output_tokens: 5_000,
+        reasoning_output_tokens: 3_000,
+        total_tokens: 105_000,
+    };
+    const MIXED_LONG_TOKENS: TokenUsage = TokenUsage {
+        unclassified_tokens: 0,
+        input_tokens: 300_000,
+        cached_input_tokens: 100_000,
+        cache_write_input_tokens: 50_000,
+        output_tokens: 20_000,
+        reasoning_output_tokens: 10_000,
+        total_tokens: 320_000,
+    };
 
     fn call(model: &str, service_tier: Option<&str>, tokens: TokenUsage) -> UsageCall {
         UsageCall {
@@ -438,17 +431,25 @@ mod tests {
         tokens: TokenUsage,
         expected_pico_usd: u128,
     ) {
-        let cost = price_call(&call(model, service_tier, tokens));
-        assert!(cost.priced, "{model} {service_tier:?} should be priced");
+        assert_exact_call_price(&call(model, service_tier, tokens), expected_pico_usd);
+    }
+
+    fn assert_exact_call_price(call: &UsageCall, expected_pico_usd: u128) {
+        let model = call.model.as_deref();
+        let service_tier = call.service_tier.as_deref();
+        let timestamp = call.timestamp;
+        let context = format!("{model:?} {service_tier:?} at {timestamp}");
+        let cost = price_call(call);
+        assert!(cost.priced, "{context} should be priced");
         assert_eq!(
             cost.minimum_pico_usd, expected_pico_usd,
-            "{model} {service_tier:?} minimum"
+            "{context} minimum"
         );
         assert_eq!(
             cost.maximum_pico_usd, expected_pico_usd,
-            "{model} {service_tier:?} maximum"
+            "{context} maximum"
         );
-        assert_eq!(cost.partial_reason, None, "{model} {service_tier:?} reason");
+        assert_eq!(cost.partial_reason, None, "{context} reason");
     }
 
     fn assert_unpriced_price(
@@ -468,19 +469,7 @@ mod tests {
 
     #[test]
     fn standard_sol_prices_each_disjoint_token_component() {
-        let priced = price_call(&call(
-            "gpt-5.6-sol",
-            None,
-            TokenUsage {
-                unclassified_tokens: 0,
-                input_tokens: 100_000,
-                cached_input_tokens: 20_000,
-                cache_write_input_tokens: 10_000,
-                output_tokens: 5_000,
-                reasoning_output_tokens: 3_000,
-                total_tokens: 105_000,
-            },
-        ));
+        let priced = price_call(&call("gpt-5.6-sol", None, MIXED_SHORT_TOKENS));
 
         // 70k regular input + 20k cached + 10k cache write + 5k output.
         assert_eq!(priced.minimum_pico_usd, 438_000_000_000);
@@ -489,22 +478,6 @@ mod tests {
 
     #[test]
     fn current_models_short_and_long_prices_match_the_published_matrix() {
-        let short = TokenUsage {
-            input_tokens: 100_000,
-            cached_input_tokens: 20_000,
-            cache_write_input_tokens: 10_000,
-            output_tokens: 5_000,
-            total_tokens: 105_000,
-            ..TokenUsage::default()
-        };
-        let long = TokenUsage {
-            input_tokens: 300_000,
-            cached_input_tokens: 100_000,
-            cache_write_input_tokens: 50_000,
-            output_tokens: 20_000,
-            total_tokens: 320_000,
-            ..TokenUsage::default()
-        };
         let cases = [
             (
                 "gpt-6.2-astra",
@@ -579,10 +552,54 @@ mod tests {
         ];
 
         for (model, standard_short, fast_short, standard_long, fast_long) in cases {
-            assert_exact_price(model, None, short, standard_short);
-            assert_exact_price(model, Some("priority"), short, fast_short);
-            assert_exact_price(model, None, long, standard_long);
-            assert_exact_price(model, Some("fast"), long, fast_long);
+            assert_exact_price(model, None, MIXED_SHORT_TOKENS, standard_short);
+            assert_exact_price(model, Some("priority"), MIXED_SHORT_TOKENS, fast_short);
+            assert_exact_price(model, None, MIXED_LONG_TOKENS, standard_long);
+            assert_exact_price(model, Some("fast"), MIXED_LONG_TOKENS, fast_long);
+        }
+    }
+
+    #[test]
+    fn ultrafast_prices_match_the_published_matrix_at_the_pacific_promotion_cutoff() {
+        // March 1 starts at 08:00 UTC in Pacific standard time in 2027.
+        let cutoff = Utc.with_ymd_and_hms(2027, 3, 1, 8, 0, 0).unwrap();
+        let cases = [
+            (
+                " GPT-6.2-ASTRA ",
+                [2_604_000_000_000, 14_040_000_000_000],
+                [5_208_000_000_000, 28_080_000_000_000],
+            ),
+            (
+                "gpt-6.2-sol",
+                [651_000_000_000, 3_510_000_000_000],
+                [1_302_000_000_000, 7_020_000_000_000],
+            ),
+            (
+                "gpt-6-astra",
+                [6_570_000_000_000, 35_700_000_000_000],
+                [6_570_000_000_000, 35_700_000_000_000],
+            ),
+            (
+                "gpt-6.1-sol",
+                [1_302_000_000_000, 7_020_000_000_000],
+                [1_302_000_000_000, 7_020_000_000_000],
+            ),
+        ];
+        for (model, before_cutoff, from_cutoff) in cases {
+            for (timestamp, prices) in [
+                (cutoff - Duration::nanoseconds(1), before_cutoff),
+                (cutoff, from_cutoff),
+                (cutoff + Duration::nanoseconds(1), from_cutoff),
+            ] {
+                for (tokens, expected) in [MIXED_SHORT_TOKENS, MIXED_LONG_TOKENS]
+                    .into_iter()
+                    .zip(prices)
+                {
+                    let mut request = call(model, Some(" ULTRAFAST "), tokens);
+                    request.timestamp = timestamp;
+                    assert_exact_call_price(&request, expected);
+                }
+            }
         }
     }
 
@@ -817,6 +834,12 @@ mod tests {
                 108_800_400_000,
                 54_400_200_000,
             ),
+            (
+                Some("ultrafast"),
+                163_200_000_000,
+                326_401_200_000,
+                163_200_600_000,
+            ),
         ] {
             let tokens = |input_tokens| TokenUsage {
                 input_tokens,
@@ -852,7 +875,14 @@ mod tests {
         ] {
             assert_exact_price(model, None, cached, standard);
             assert_exact_price(model, Some("priority"), cached, fast);
-            assert_unpriced_price(model, Some("ultrafast"), cached, SERVICE_TIER_UNKNOWN);
+        }
+        for model in [
+            "gpt-6.1-terra",
+            "gpt-6-sol",
+            "gpt-6-luna",
+            "codex-auto-review",
+        ] {
+            assert_unpriced_price(model, Some("ultrafast"), cached, SERVICE_TIER_UNAVAILABLE);
         }
         for model in [
             "gpt-6.2",
@@ -1009,16 +1039,15 @@ mod tests {
 
     #[test]
     fn auto_review_luna_proxy_assumption_requires_matching_active_rates() {
-        let luna = model_rates(Some("gpt-5.6-luna")).expect("bundled Luna API rates");
+        let luna = api_model_rates(Some("gpt-5.6-luna")).expect("bundled Luna API rates");
         let auto_review =
-            model_rates(Some("codex-auto-review")).expect("bundled auto-review API rates");
+            api_model_rates(Some("codex-auto-review")).expect("bundled auto-review API rates");
         assert!(api_rates_match_luna_proxy(Some(auto_review), Some(luna)));
 
-        let mut different_auto_review = auto_review;
-        different_auto_review.standard.short.input =
-            different_auto_review.standard.short.input.saturating_add(1);
+        let different_luna =
+            api_model_rates(Some("gpt-6-luna")).expect("bundled GPT-6 Luna API rates");
         assert!(!api_rates_match_luna_proxy(
-            Some(different_auto_review),
+            Some(different_luna),
             Some(luna)
         ));
         assert!(!api_rates_match_luna_proxy(None, Some(luna)));
