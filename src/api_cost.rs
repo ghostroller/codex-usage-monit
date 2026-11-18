@@ -388,7 +388,7 @@ fn api_rates_match_luna_proxy(
 
 #[cfg(test)]
 mod tests {
-    use chrono::{Duration, TimeZone, Utc};
+    use crate::time::{Duration, UtcTimestamp};
 
     use super::*;
 
@@ -413,7 +413,7 @@ mod tests {
 
     fn call(model: &str, service_tier: Option<&str>, tokens: TokenUsage) -> UsageCall {
         UsageCall {
-            timestamp: Utc::now(),
+            timestamp: UtcTimestamp::now(),
             thread_id: "thread".to_string(),
             turn_id: Some("turn".to_string()),
             usage_event_id: None,
@@ -562,7 +562,7 @@ mod tests {
     #[test]
     fn ultrafast_prices_match_the_published_matrix_at_the_pacific_promotion_cutoff() {
         // March 1 starts at 08:00 UTC in Pacific standard time in 2027.
-        let cutoff = Utc.with_ymd_and_hms(2027, 3, 1, 8, 0, 0).unwrap();
+        let cutoff = UtcTimestamp::from_utc(2027, 3, 1, 8, 0, 0).unwrap();
         let cases = [
             (
                 " GPT-6.2-ASTRA ",

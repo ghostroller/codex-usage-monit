@@ -29,12 +29,12 @@ fn every_available_estimate_is_marked_as_approximate() {
 
 #[test]
 fn attribution_text_describes_credit_rate_weighted_codex_gauge_estimate() {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let attribution = AttributionSummary {
         window: Some(WindowDescriptor {
             limit_id: "codex".to_string(),
             label: "week".to_string(),
-            starts_at: now - chrono::Duration::days(7),
+            starts_at: now - crate::time::Duration::days(7),
             ends_at: now,
             used_percent: 34.0,
         }),
@@ -86,8 +86,8 @@ fn attribution_text_explains_unavailable_inputs() {
         window: Some(WindowDescriptor {
             limit_id: "codex".to_string(),
             label: "5h".to_string(),
-            starts_at: Utc::now() - chrono::Duration::hours(5),
-            ends_at: Utc::now(),
+            starts_at: UtcTimestamp::now() - crate::time::Duration::hours(5),
+            ends_at: UtcTimestamp::now(),
             used_percent: 12.0,
         }),
         method: "codex_gauge_without_local_tokens".to_string(),
@@ -100,12 +100,12 @@ fn attribution_text_explains_unavailable_inputs() {
 
 #[test]
 fn zero_percent_codex_gauge_is_still_a_known_estimate() {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let attribution = AttributionSummary {
         window: Some(WindowDescriptor {
             limit_id: "codex".to_string(),
             label: "week".to_string(),
-            starts_at: now - chrono::Duration::days(7),
+            starts_at: now - crate::time::Duration::days(7),
             ends_at: now,
             used_percent: 0.0,
         }),
@@ -172,7 +172,7 @@ fn legacy_token_usage_json_defaults_missing_cache_write_to_zero() {
 
 #[test]
 fn partial_status_is_scoped_to_requested_sections() {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let window_usage = WindowUsage {
         token_usage: TokenUsage {
             total_tokens: 42,
@@ -211,7 +211,7 @@ fn partial_status_is_scoped_to_requested_sections() {
             primary: Some(LimitWindow::new(
                 10.0,
                 Some(300),
-                Some(now + chrono::Duration::hours(1)),
+                Some(now + crate::time::Duration::hours(1)),
             )),
             secondary: None,
             credits: None,
@@ -222,7 +222,7 @@ fn partial_status_is_scoped_to_requested_sections() {
         rate_limit_reset_credits: Some(RateLimitResetCreditsSnapshot {
             available_count: 3,
             credits: Some(vec![RateLimitResetCredit {
-                granted_at: now - chrono::Duration::hours(2),
+                granted_at: now - crate::time::Duration::hours(2),
                 expires_at: None,
                 status: "available".to_string(),
                 reset_type: "codexRateLimits".to_string(),
@@ -284,8 +284,8 @@ fn partial_status_is_scoped_to_requested_sections() {
             window: Some(WindowDescriptor {
                 limit_id: "codex".to_string(),
                 label: "5h".to_string(),
-                starts_at: now - chrono::Duration::hours(4),
-                ends_at: now + chrono::Duration::hours(1),
+                starts_at: now - crate::time::Duration::hours(4),
+                ends_at: now + crate::time::Duration::hours(1),
                 used_percent: 10.0,
             }),
             local_token_usage: window_usage.token_usage,
@@ -301,8 +301,8 @@ fn partial_status_is_scoped_to_requested_sections() {
                 window: Some(WindowDescriptor {
                     limit_id: "codex".to_string(),
                     label: "week".to_string(),
-                    starts_at: now - chrono::Duration::days(5),
-                    ends_at: now + chrono::Duration::days(2),
+                    starts_at: now - crate::time::Duration::days(5),
+                    ends_at: now + crate::time::Duration::days(2),
                     used_percent: 23.0,
                 }),
                 local_token_usage: window_usage.token_usage,
@@ -854,8 +854,8 @@ fn partial_status_is_scoped_to_requested_sections() {
     )
     .unwrap();
     assert!(windows_text.contains("week | codex | 10080m"));
-    assert!(windows_text.contains(&(now - chrono::Duration::days(5)).to_rfc3339()));
-    assert!(windows_text.contains(&(now + chrono::Duration::days(2)).to_rfc3339()));
+    assert!(windows_text.contains(&(now - crate::time::Duration::days(5)).to_rfc3339()));
+    assert!(windows_text.contains(&(now + crate::time::Duration::days(2)).to_rfc3339()));
     assert!(windows_text.contains("task"));
     assert!(windows_text.contains("gpt-test"));
     assert!(windows_text.contains("xhigh"));

@@ -8,8 +8,6 @@ use std::io::{self, Read, Write};
 use std::num::{NonZeroU32, NonZeroU64};
 use std::path::Path;
 
-use chrono::{DateTime, Utc};
-
 #[cfg(test)]
 use crate::api_cost::API_PRICING_CATALOG_REVISION;
 use crate::api_cost::current_api_pricing_catalog_revision;
@@ -36,6 +34,7 @@ use crate::remote_protocol::{
     read_remote_frame,
 };
 use crate::source_identity::{SourceIdentity, SourceIdentityStore};
+use crate::time::UtcTimestamp;
 
 type ProtocolResponse = RemoteSessionFactResponse;
 
@@ -51,7 +50,7 @@ where
 {
     let request =
         read_remote_frame::<RemoteExportRequest, _>(reader, RemoteFrameLimits::default())?;
-    let received_at = Utc::now();
+    let received_at = UtcTimestamp::now();
     let identity = identity_store.load_or_create()?;
     let revisions = current_revisions();
     let source = source_generation(&identity);
@@ -64,7 +63,7 @@ where
             &identity,
             &revisions,
             received_at,
-            Utc::now(),
+            UtcTimestamp::now(),
             failure(
                 RemoteFailureKind::IdentityMismatch,
                 "remote source identity or generation does not match the pinned source",
@@ -79,7 +78,7 @@ where
             &identity,
             &revisions,
             received_at,
-            Utc::now(),
+            UtcTimestamp::now(),
             failure(
                 RemoteFailureKind::VersionMismatch,
                 "remote data revisions are outside the accepted ranges",
@@ -104,7 +103,7 @@ where
                 &identity,
                 &revisions,
                 received_at,
-                Utc::now(),
+                UtcTimestamp::now(),
                 RemoteExportResponseBody::Probe(ProbeResult {
                     capabilities: vec![
                         RemoteCapability::DeltaJournal,
@@ -122,7 +121,7 @@ where
             )
         }
         RemoteExportRequestBody::Delta(delta) => {
-            let observed_at = Utc::now();
+            let observed_at = UtcTimestamp::now();
             match prepare_remote_delta_page(
                 config,
                 identity_store,
@@ -146,13 +145,13 @@ where
                     &identity,
                     &revisions,
                     received_at,
-                    Utc::now(),
+                    UtcTimestamp::now(),
                     failure_for_prepare_error(&error),
                 ),
             }
         }
         RemoteExportRequestBody::SessionFacts(facts) => {
-            let observed_at = Utc::now();
+            let observed_at = UtcTimestamp::now();
             match prepare_remote_fact_page(
                 config,
                 identity_store,
@@ -176,7 +175,7 @@ where
                     &identity,
                     &revisions,
                     received_at,
-                    Utc::now(),
+                    UtcTimestamp::now(),
                     failure_for_fact_prepare_error(&error),
                 ),
             }
@@ -260,7 +259,7 @@ fn write_prepared_delta<W: Write>(
     request: &RemoteExportRequest,
     identity: &SourceIdentity,
     revisions: &ProtocolRevisions,
-    received_at: DateTime<Utc>,
+    received_at: UtcTimestamp,
     prepared: &PreparedRemoteDeltaPage,
 ) -> anyhow::Result<()> {
     let mut entry_limit = prepared.entry_count();
@@ -278,7 +277,7 @@ fn write_prepared_delta<W: Write>(
                     identity,
                     revisions,
                     received_at,
-                    Utc::now(),
+                    UtcTimestamp::now(),
                     failure(
                         RemoteFailureKind::Internal,
                         "remote delta journal could not be decoded safely",
@@ -319,7 +318,7 @@ fn write_prepared_delta<W: Write>(
                     identity,
                     revisions,
                     received_at,
-                    Utc::now(),
+                    UtcTimestamp::now(),
                     failure(
                         RemoteFailureKind::InvalidRequest,
                         "maxPageBytes is too small for the next remote delta record",
@@ -334,7 +333,7 @@ fn write_prepared_delta<W: Write>(
                     identity,
                     revisions,
                     received_at,
-                    Utc::now(),
+                    UtcTimestamp::now(),
                     failure(
                         RemoteFailureKind::Internal,
                         "remote delta response failed protocol validation",
@@ -351,7 +350,7 @@ fn write_prepared_fact<W: Write>(
     request: &RemoteExportRequest,
     identity: &SourceIdentity,
     revisions: &ProtocolRevisions,
-    received_at: DateTime<Utc>,
+    received_at: UtcTimestamp,
     prepared: &PreparedRemoteFactPage,
 ) -> anyhow::Result<()> {
     let mut entry_limit = match prepared.safe_wire_entry_limit() {
@@ -363,7 +362,7 @@ fn write_prepared_fact<W: Write>(
                 identity,
                 revisions,
                 received_at,
-                Utc::now(),
+                UtcTimestamp::now(),
                 failure(
                     RemoteFailureKind::Internal,
                     "remote fact batch could not be bounded safely",
@@ -382,7 +381,7 @@ fn write_prepared_fact<W: Write>(
                     identity,
                     revisions,
                     received_at,
-                    Utc::now(),
+                    UtcTimestamp::now(),
                     failure(
                         RemoteFailureKind::Internal,
                         "remote fact batch could not be decoded safely",
@@ -431,7 +430,7 @@ fn write_prepared_fact<W: Write>(
                     identity,
                     revisions,
                     received_at,
-                    Utc::now(),
+                    UtcTimestamp::now(),
                     failure(
                         RemoteFailureKind::InvalidRequest,
                         "maxPageBytes is too small for the next remote fact record",
@@ -446,7 +445,7 @@ fn write_prepared_fact<W: Write>(
                     identity,
                     revisions,
                     received_at,
-                    Utc::now(),
+                    UtcTimestamp::now(),
                     failure(
                         RemoteFailureKind::Internal,
                         "remote fact response failed protocol validation",
@@ -464,8 +463,8 @@ fn write_response_body<W: Write>(
     request: &RemoteExportRequest,
     identity: &SourceIdentity,
     revisions: &ProtocolRevisions,
-    received_at: DateTime<Utc>,
-    observed_at: DateTime<Utc>,
+    received_at: UtcTimestamp,
+    observed_at: UtcTimestamp,
     result: RemoteExportResponseBody<DeltaPayload, RemoteSessionFactPayload>,
 ) -> anyhow::Result<()> {
     let response = protocol_response(
@@ -485,8 +484,8 @@ fn protocol_response(
     request: &RemoteExportRequest,
     identity: &SourceIdentity,
     revisions: &ProtocolRevisions,
-    received_at: DateTime<Utc>,
-    observed_at: DateTime<Utc>,
+    received_at: UtcTimestamp,
+    observed_at: UtcTimestamp,
     result: RemoteExportResponseBody<DeltaPayload, RemoteSessionFactPayload>,
 ) -> ProtocolResponse {
     protocol_response_at(
@@ -495,7 +494,7 @@ fn protocol_response(
         revisions,
         received_at,
         observed_at,
-        Utc::now(),
+        UtcTimestamp::now(),
         result,
     )
 }
@@ -505,9 +504,9 @@ fn protocol_response_at(
     request: &RemoteExportRequest,
     identity: &SourceIdentity,
     revisions: &ProtocolRevisions,
-    received_at: DateTime<Utc>,
-    observed_at: DateTime<Utc>,
-    sent_at: DateTime<Utc>,
+    received_at: UtcTimestamp,
+    observed_at: UtcTimestamp,
+    sent_at: UtcTimestamp,
     result: RemoteExportResponseBody<DeltaPayload, RemoteSessionFactPayload>,
 ) -> ProtocolResponse {
     // Wall clocks can move backwards while a short-lived SSH command is
@@ -597,7 +596,7 @@ mod tests {
     use std::io::Cursor;
     use std::num::{NonZeroU32, NonZeroU64};
 
-    use chrono::{Duration, Utc};
+    use crate::time::{Duration, UtcTimestamp};
     use serde_json::json;
 
     use super::*;
@@ -644,7 +643,7 @@ mod tests {
         config: &CollectConfig,
         identity: &SourceIdentity,
         thread_id: &crate::source_model::ThreadId,
-        observed_at: DateTime<Utc>,
+        observed_at: UtcTimestamp,
     ) -> Vec<SessionFactsDigestBinding> {
         let range = ExportRange {
             from: observed_at - Duration::days(35),
@@ -724,11 +723,11 @@ mod tests {
         output
     }
 
-    fn write_rollout(codex_home: &Path, project: &Path, now: DateTime<Utc>) {
+    fn write_rollout(codex_home: &Path, project: &Path, now: UtcTimestamp) {
         let event_at = now - Duration::hours(2);
         let sessions = codex_home
             .join("sessions")
-            .join(event_at.format("%Y/%m/%d").to_string());
+            .join(event_at.date_naive().strftime("%Y/%m/%d").to_string());
         fs::create_dir_all(&sessions).unwrap();
         let records = [
             json!({
@@ -889,7 +888,7 @@ mod tests {
         };
 
         request.expected_source = Some(source_generation(&store.load_or_create().unwrap()));
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         request.request = RemoteExportRequestBody::Delta(DeltaRequest {
             delta_cursor: None,
             range: ExportRange {
@@ -978,7 +977,7 @@ mod tests {
             SourceIdentityStore::at_path(directory.path().join("state/source-identity.json"));
         let identity = store.load_or_create().unwrap();
         let request = probe_request();
-        let received_at = Utc::now();
+        let received_at = UtcTimestamp::now();
         let response = protocol_response_at(
             &request,
             &identity,
@@ -1010,7 +1009,7 @@ mod tests {
             SourceIdentityStore::at_path(directory.path().join("state/source-identity.json"));
         let mut request = probe_request();
         request.expected_source = Some(source_generation(&store.load_or_create().unwrap()));
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         request.request = RemoteExportRequestBody::Delta(DeltaRequest {
             delta_cursor: None,
             range: ExportRange {
@@ -1036,7 +1035,7 @@ mod tests {
         let codex_home = directory.path().join("codex");
         let project = directory.path().join("project");
         fs::create_dir_all(&project).unwrap();
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         write_rollout(&codex_home, &project, now);
         let config = CollectConfig {
             codex_home,
@@ -1086,7 +1085,7 @@ mod tests {
         let codex_home = directory.path().join("codex");
         let project = directory.path().join("private-project-name");
         fs::create_dir_all(&project).unwrap();
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         write_rollout(&codex_home, &project, now);
         let config = CollectConfig {
             codex_home,

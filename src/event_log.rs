@@ -7,13 +7,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use chrono::Utc;
 use clap::ValueEnum;
 use serde::Serialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::diagnostic_log::{DIAGNOSTIC_LOG_MAX_BYTES, JsonlWriter, prune_event_sessions};
+use crate::time::UtcTimestamp;
 
 /// Event severity and the maximum verbosity accepted by an [`EventLog`].
 ///
@@ -98,7 +98,7 @@ impl EventLog {
         let state = crate::ui_state::default_ui_state_path()?;
         Some(state.parent()?.join("logs").join(format!(
             "tui-{}-{}.jsonl",
-            Utc::now().format("%Y%m%d%H%M%S%3f"),
+            UtcTimestamp::now().format("%Y%m%d%H%M%S%3f"),
             std::process::id()
         )))
     }
@@ -144,7 +144,9 @@ impl EventLog {
                 run_id: format!(
                     "{}-{}",
                     std::process::id(),
-                    Utc::now().timestamp_nanos_opt().unwrap_or_default()
+                    UtcTimestamp::now()
+                        .timestamp_nanos_opt()
+                        .unwrap_or_default()
                 ),
                 home: std::env::var(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
                     .ok()
@@ -210,7 +212,7 @@ impl EventLog {
         write(
             &mut state,
             json!({
-                "schemaVersion": 1, "event": "session_start", "at": Utc::now(),
+                "schemaVersion": 1, "event": "session_start", "at": UtcTimestamp::now(),
                 "level": "info", "kind": "lifecycle", "status": "started", "sequence": 0,
                 "runId": inner.run_id, "pid": std::process::id(),
                 "version": env!("CARGO_PKG_VERSION"), "os": std::env::consts::OS,
@@ -275,7 +277,7 @@ impl EventLog {
         write(
             &mut state,
             json!({
-                "schemaVersion": 1, "at": Utc::now(), "runId": inner.run_id,
+                "schemaVersion": 1, "at": UtcTimestamp::now(), "runId": inner.run_id,
                 "pid": std::process::id(), "sequence": sequence, "level": level,
                 "event": event, "message": message, "operationId": context.operation,
                 "sourceId": context.subject.map(fingerprint),
@@ -406,7 +408,9 @@ impl EventLog {
             id: format!(
                 "{}-{}",
                 std::process::id(),
-                Utc::now().timestamp_nanos_opt().unwrap_or_default()
+                UtcTimestamp::now()
+                    .timestamp_nanos_opt()
+                    .unwrap_or_default()
             ),
             started: Instant::now(),
         };

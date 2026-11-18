@@ -17,7 +17,6 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration as StdDuration;
 
-use chrono::{DateTime, Duration, NaiveDate, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::history::{LocalHalfHourBucket, QuotaPoint, WeeklyLocalPoint, is_current_local_bucket};
@@ -25,6 +24,7 @@ use crate::history_ownership::HistoryWriteAuthority;
 use crate::source_identity::NodeId;
 #[cfg(windows)]
 use crate::source_identity::{validate_windows_private_directory, validate_windows_private_file};
+use crate::time::{Duration, UtcDay, UtcTimestamp};
 
 mod session_evidence;
 mod sqlite_gc;
@@ -471,7 +471,7 @@ pub struct SourceHistoryRecordsData {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SourceBucketRecord {
-    starts_at: DateTime<Utc>,
+    starts_at: UtcTimestamp,
     revision: u64,
     change: SourceBucketChange,
 }
@@ -487,7 +487,7 @@ impl SourceBucketRecord {
         Ok(record)
     }
 
-    pub fn tombstone(starts_at: DateTime<Utc>, revision: u64) -> io::Result<Self> {
+    pub fn tombstone(starts_at: UtcTimestamp, revision: u64) -> io::Result<Self> {
         let record = Self {
             starts_at,
             revision,
@@ -497,7 +497,7 @@ impl SourceBucketRecord {
         Ok(record)
     }
 
-    pub fn starts_at(&self) -> DateTime<Utc> {
+    pub fn starts_at(&self) -> UtcTimestamp {
         self.starts_at
     }
 
@@ -540,8 +540,8 @@ pub enum SourceBucketChange {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SourceWeeklyRecord {
-    observed_at: DateTime<Utc>,
-    resets_at: DateTime<Utc>,
+    observed_at: UtcTimestamp,
+    resets_at: UtcTimestamp,
     revision: u64,
     change: SourceWeeklyChange,
 }
@@ -559,8 +559,8 @@ impl SourceWeeklyRecord {
     }
 
     pub fn tombstone(
-        observed_at: DateTime<Utc>,
-        resets_at: DateTime<Utc>,
+        observed_at: UtcTimestamp,
+        resets_at: UtcTimestamp,
         revision: u64,
     ) -> io::Result<Self> {
         let record = Self {
@@ -573,13 +573,13 @@ impl SourceWeeklyRecord {
         Ok(record)
     }
 
-    pub fn observed_at(&self) -> DateTime<Utc> {
+    pub fn observed_at(&self) -> UtcTimestamp {
         self.observed_at
     }
     pub fn revision(&self) -> u64 {
         self.revision
     }
-    pub fn resets_at(&self) -> DateTime<Utc> {
+    pub fn resets_at(&self) -> UtcTimestamp {
         self.resets_at
     }
     pub fn change(&self) -> &SourceWeeklyChange {
@@ -616,7 +616,7 @@ pub enum SourceWeeklyChange {
 pub struct SourceHistoryGcReport {
     pub shards_pruned: usize,
     pub pruning_deferred: bool,
-    pub trusted_at: Option<DateTime<Utc>>,
+    pub trusted_at: Option<UtcTimestamp>,
     /// More bounded work remains in this durable retention pass.
     pub work_pending: bool,
     pub records_examined: usize,
@@ -763,7 +763,7 @@ impl SourceHistoryWriter<'_, '_, '_> {
         self.transaction_fenced(|store| store.update_source_metadata_unfenced(source_id, update))
     }
 
-    pub fn garbage_collect(&self, observed_at: DateTime<Utc>) -> io::Result<SourceHistoryGcReport> {
+    pub fn garbage_collect(&self, observed_at: UtcTimestamp) -> io::Result<SourceHistoryGcReport> {
         let redaction_profile = self.redaction_profile();
         self.fenced(|store| {
             sqlite_gc::collect_unit(
@@ -786,7 +786,7 @@ impl SourceHistoryWriter<'_, '_, '_> {
     /// remains governed by the independent conservative retention clock.
     pub fn garbage_collect_if_due(
         &self,
-        observed_at: DateTime<Utc>,
+        observed_at: UtcTimestamp,
         minimum_interval: StdDuration,
     ) -> io::Result<Option<SourceHistoryGcReport>> {
         let redaction_profile = self.redaction_profile();
@@ -1062,7 +1062,7 @@ impl SourceHistoryStore {
     #[cfg(test)]
     pub(crate) fn garbage_collect(
         &self,
-        observed_at: DateTime<Utc>,
+        observed_at: UtcTimestamp,
     ) -> io::Result<SourceHistoryGcReport> {
         self.garbage_collect_unfenced(
             observed_at,
@@ -1073,7 +1073,7 @@ impl SourceHistoryStore {
     #[cfg(test)]
     pub(crate) fn garbage_collect_if_due(
         &self,
-        observed_at: DateTime<Utc>,
+        observed_at: UtcTimestamp,
         minimum_interval: StdDuration,
         redaction_profile: RedactionProfile,
     ) -> io::Result<Option<SourceHistoryGcReport>> {
@@ -1361,7 +1361,7 @@ impl SourceHistoryStore {
     pub fn load_included_sources_since(
         &self,
         redaction_profile: RedactionProfile,
-        since: DateTime<Utc>,
+        since: UtcTimestamp,
     ) -> io::Result<Vec<SourceHistoryData>> {
         let mut budget = SourceHistoryReadBudget::for_query();
         self.load_included_sources_since_with_budget(redaction_profile, since, &mut budget)
@@ -1370,7 +1370,7 @@ impl SourceHistoryStore {
     fn load_included_sources_since_with_budget(
         &self,
         redaction_profile: RedactionProfile,
-        since: DateTime<Utc>,
+        since: UtcTimestamp,
         budget: &mut SourceHistoryReadBudget,
     ) -> io::Result<Vec<SourceHistoryData>> {
         let mut sources = Vec::new();
@@ -1404,7 +1404,7 @@ impl SourceHistoryStore {
     #[cfg(test)]
     fn garbage_collect_unfenced(
         &self,
-        observed_at: DateTime<Utc>,
+        observed_at: UtcTimestamp,
         redaction_profiles: &[RedactionProfile],
     ) -> io::Result<SourceHistoryGcReport> {
         let database = self.sqlite_database().expect("SQLite history backend");
@@ -1484,14 +1484,14 @@ impl SourceHistoryStore {
         self.sqlite_record_weekly_changes(&database, source_id, redaction_profile, records)
     }
 
-    pub fn load_account_since(&self, since: DateTime<Utc>) -> io::Result<AccountHistoryData> {
+    pub fn load_account_since(&self, since: UtcTimestamp) -> io::Result<AccountHistoryData> {
         let mut budget = SourceHistoryReadBudget::for_query();
         self.load_account_since_with_budget(since, &mut budget)
     }
 
     pub(crate) fn load_account_since_with_budget(
         &self,
-        since: DateTime<Utc>,
+        since: UtcTimestamp,
         budget: &mut SourceHistoryReadBudget,
     ) -> io::Result<AccountHistoryData> {
         let database = self.sqlite_database().expect("SQLite history backend");
@@ -1532,7 +1532,7 @@ impl SourceHistoryStore {
         &self,
         source_id: &NodeId,
         redaction_profile: RedactionProfile,
-        since: DateTime<Utc>,
+        since: UtcTimestamp,
     ) -> io::Result<SourceHistoryRecordsData> {
         let mut budget = SourceHistoryReadBudget::for_query();
         self.load_source_records_since_with_budget(source_id, redaction_profile, since, &mut budget)
@@ -1542,7 +1542,7 @@ impl SourceHistoryStore {
         &self,
         source_id: &NodeId,
         redaction_profile: RedactionProfile,
-        since: DateTime<Utc>,
+        since: UtcTimestamp,
         budget: &mut SourceHistoryReadBudget,
     ) -> io::Result<SourceHistoryRecordsData> {
         budget.charge_source()?;
@@ -1558,7 +1558,7 @@ impl SourceHistoryStore {
         &self,
         source_id: &NodeId,
         redaction_profile: RedactionProfile,
-        since: DateTime<Utc>,
+        since: UtcTimestamp,
         budget: &mut SourceHistoryReadBudget,
     ) -> io::Result<SourceHistoryRecordsData> {
         self.with_source_metadata_shared(source_id, |source| {
@@ -1606,7 +1606,7 @@ impl SourceHistoryStore {
         &self,
         _source_id: &NodeId,
         redaction_profile: RedactionProfile,
-        since: DateTime<Utc>,
+        since: UtcTimestamp,
         directory: &Path,
         budget: &mut SourceHistoryReadBudget,
     ) -> io::Result<Vec<SourceBucketRecord>> {
@@ -1617,7 +1617,7 @@ impl SourceHistoryStore {
                 let namespace = database.namespace(directory)?;
                 let floor = since
                     .checked_sub_signed(Duration::seconds(SOURCE_BUCKET_SECONDS))
-                    .unwrap_or(DateTime::<Utc>::MIN_UTC);
+                    .unwrap_or(UtcTimestamp::MIN);
                 let values = database::records::<SourceBucketRecord>(
                     connection,
                     &namespace,
@@ -1645,7 +1645,7 @@ impl SourceHistoryStore {
         &self,
         source_id: &NodeId,
         redaction_profile: RedactionProfile,
-        since: DateTime<Utc>,
+        since: UtcTimestamp,
         budget: &mut SourceHistoryReadBudget,
     ) -> io::Result<Vec<SourceWeeklyRecord>> {
         let database = self.sqlite_database().expect("SQLite history backend");
@@ -1681,7 +1681,7 @@ impl SourceHistoryStore {
         &self,
         source_id: &NodeId,
         redaction_profile: RedactionProfile,
-        since: DateTime<Utc>,
+        since: UtcTimestamp,
     ) -> io::Result<SourceHistoryData> {
         let mut budget = SourceHistoryReadBudget::for_query();
         self.load_source_since_with_budget(source_id, redaction_profile, since, &mut budget)
@@ -1691,7 +1691,7 @@ impl SourceHistoryStore {
         &self,
         source_id: &NodeId,
         redaction_profile: RedactionProfile,
-        since: DateTime<Utc>,
+        since: UtcTimestamp,
         budget: &mut SourceHistoryReadBudget,
     ) -> io::Result<SourceHistoryData> {
         budget.charge_source()?;
@@ -1732,7 +1732,7 @@ impl SourceHistoryStore {
     fn sqlite_schedule_gc_if_due(
         &self,
         database: &database::HistoryDatabase,
-        observed_at: DateTime<Utc>,
+        observed_at: UtcTimestamp,
         minimum_interval: Duration,
         redaction_profile: RedactionProfile,
     ) -> io::Result<bool> {
@@ -1772,7 +1772,7 @@ impl SourceHistoryStore {
     fn sqlite_garbage_collect(
         &self,
         _database: &database::HistoryDatabase,
-        observed_at: DateTime<Utc>,
+        observed_at: UtcTimestamp,
         redactions: &[RedactionProfile],
     ) -> io::Result<SourceHistoryGcReport> {
         sqlite_gc::collect_unit(self, observed_at, redactions, || Ok(()))
@@ -1924,7 +1924,7 @@ impl SourceHistoryStore {
         }
         database.write(|connection| {
             let namespace = database.namespace(&self.account_directory())?;
-            let mut days = BTreeMap::<NaiveDate, bool>::new();
+            let mut days = BTreeMap::<UtcDay, bool>::new();
             for point in points {
                 let slot = point
                     .observed_at
@@ -1951,7 +1951,7 @@ impl SourceHistoryStore {
                 let previous = existing.clone();
                 let mut index = account_quota_point_index(&existing)?;
                 let changed = apply_account_quota_point(&mut existing, &mut index, point.clone())?;
-                *days.entry(point.observed_at.date_naive()).or_default() |= changed;
+                *days.entry(point.observed_at.utc_date()).or_default() |= changed;
                 if changed {
                     for old in &previous {
                         if !existing
@@ -2117,17 +2117,17 @@ impl SourceMetadataEnvelope {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RetentionClock {
-    trusted_at: DateTime<Utc>,
+    trusted_at: UtcTimestamp,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pending_started_at: Option<DateTime<Utc>>,
+    pending_started_at: Option<UtcTimestamp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pending_last_at: Option<DateTime<Utc>>,
+    pending_last_at: Option<UtcTimestamp>,
     #[serde(default)]
     pending_confirmations: u32,
 }
 
 impl RetentionClock {
-    fn current(trusted_at: DateTime<Utc>) -> Self {
+    fn current(trusted_at: UtcTimestamp) -> Self {
         Self {
             trusted_at,
             pending_started_at: None,
@@ -2136,7 +2136,7 @@ impl RetentionClock {
         }
     }
 
-    fn pending(trusted_at: DateTime<Utc>, observed_at: DateTime<Utc>) -> Self {
+    fn pending(trusted_at: UtcTimestamp, observed_at: UtcTimestamp) -> Self {
         Self {
             trusted_at,
             pending_started_at: Some(observed_at),
@@ -2181,14 +2181,14 @@ struct GarbageCollectionSchedule {
     format_version: u32,
     profile_id: HistoryProfileId,
     redaction_profile: RedactionProfile,
-    last_attempted_at: DateTime<Utc>,
+    last_attempted_at: UtcTimestamp,
 }
 
 impl GarbageCollectionSchedule {
     fn new(
         profile_id: HistoryProfileId,
         redaction_profile: RedactionProfile,
-        last_attempted_at: DateTime<Utc>,
+        last_attempted_at: UtcTimestamp,
     ) -> Self {
         Self {
             format_version: GARBAGE_COLLECTION_SCHEDULE_FORMAT_VERSION,
@@ -2226,7 +2226,7 @@ fn validate_source_bucket(bucket: &LocalHalfHourBucket) -> io::Result<()> {
     Ok(())
 }
 
-fn is_aligned_bucket_start(starts_at: DateTime<Utc>) -> bool {
+fn is_aligned_bucket_start(starts_at: UtcTimestamp) -> bool {
     starts_at.timestamp().rem_euclid(SOURCE_BUCKET_SECONDS) == 0
         && starts_at.timestamp_subsec_nanos() == 0
 }
@@ -2240,7 +2240,7 @@ struct AccountQuotaPointIndexKey {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct AccountQuotaResetCandidate {
-    resets_at: DateTime<Utc>,
+    resets_at: UtcTimestamp,
     position: usize,
 }
 
@@ -2343,11 +2343,11 @@ fn apply_account_quota_point(
     let reset_floor = incoming
         .resets_at
         .checked_sub_signed(Duration::seconds(ACCOUNT_QUOTA_RESET_DRIFT_SECONDS))
-        .unwrap_or(DateTime::<Utc>::MIN_UTC);
+        .unwrap_or(UtcTimestamp::MIN);
     let reset_ceiling = incoming
         .resets_at
         .checked_add_signed(Duration::seconds(ACCOUNT_QUOTA_RESET_DRIFT_SECONDS))
-        .unwrap_or(DateTime::<Utc>::MAX_UTC);
+        .unwrap_or(UtcTimestamp::MAX);
     let existing = point_index.get(&key).and_then(|candidates| {
         let start = candidates.partition_point(|candidate| candidate.resets_at < reset_floor);
         let end = candidates.partition_point(|candidate| candidate.resets_at <= reset_ceiling);
@@ -2427,7 +2427,7 @@ fn apply_account_quota_point(
 
 fn source_bucket_record_index(
     records: &[SourceBucketRecord],
-) -> io::Result<HashMap<DateTime<Utc>, usize>> {
+) -> io::Result<HashMap<UtcTimestamp, usize>> {
     let mut index = HashMap::new();
     index.try_reserve(records.len()).map_err(|error| {
         io::Error::other(format!(
@@ -2446,7 +2446,7 @@ fn source_bucket_record_index(
 
 fn apply_source_bucket_record(
     records: &mut Vec<SourceBucketRecord>,
-    record_index: &mut HashMap<DateTime<Utc>, usize>,
+    record_index: &mut HashMap<UtcTimestamp, usize>,
     incoming: SourceBucketRecord,
 ) -> io::Result<bool> {
     incoming.validate()?;
@@ -2486,7 +2486,7 @@ fn apply_source_bucket_record(
     }
 }
 
-type SourceWeeklyRecordKey = (DateTime<Utc>, DateTime<Utc>);
+type SourceWeeklyRecordKey = (UtcTimestamp, UtcTimestamp);
 type SourceWeeklyRecordIndex = HashMap<SourceWeeklyRecordKey, usize>;
 
 fn source_weekly_record_index(
@@ -2569,11 +2569,11 @@ fn validate_weekly_local_point(point: &WeeklyLocalPoint) -> io::Result<()> {
     Ok(())
 }
 
-fn source_record_intersects_since(record: &SourceBucketRecord, since: DateTime<Utc>) -> bool {
+fn source_record_intersects_since(record: &SourceBucketRecord, since: UtcTimestamp) -> bool {
     record
         .starts_at
-        .checked_add_signed(chrono::Duration::seconds(SOURCE_BUCKET_SECONDS))
-        .unwrap_or(DateTime::<Utc>::MAX_UTC)
+        .checked_add_signed(crate::time::Duration::seconds(SOURCE_BUCKET_SECONDS))
+        .unwrap_or(UtcTimestamp::MAX)
         > since
 }
 
@@ -2626,7 +2626,7 @@ fn redact_source_records(records: &mut [SourceBucketRecord]) {
 fn group_source_records_by_day(
     records: &[SourceBucketRecord],
     redaction_profile: RedactionProfile,
-) -> io::Result<BTreeMap<NaiveDate, Vec<SourceBucketRecord>>> {
+) -> io::Result<BTreeMap<UtcDay, Vec<SourceBucketRecord>>> {
     let mut result = BTreeMap::new();
     for record in records {
         record.validate()?;
@@ -2635,7 +2635,7 @@ fn group_source_records_by_day(
             redact_source_records(std::slice::from_mut(&mut record));
         }
         result
-            .entry(record.starts_at.date_naive())
+            .entry(record.starts_at.utc_date())
             .or_insert_with(Vec::new)
             .push(record);
     }
@@ -2644,12 +2644,12 @@ fn group_source_records_by_day(
 
 fn group_source_weekly_records_by_day(
     records: &[SourceWeeklyRecord],
-) -> io::Result<BTreeMap<NaiveDate, Vec<SourceWeeklyRecord>>> {
+) -> io::Result<BTreeMap<UtcDay, Vec<SourceWeeklyRecord>>> {
     let mut result = BTreeMap::new();
     for record in records {
         record.validate()?;
         result
-            .entry(record.observed_at.date_naive())
+            .entry(record.observed_at.utc_date())
             .or_insert_with(Vec::new)
             .push(record.clone());
     }
@@ -2658,8 +2658,8 @@ fn group_source_weekly_records_by_day(
 
 fn next_retention_clock(
     current: Option<RetentionClock>,
-    initial_anchor: Option<DateTime<Utc>>,
-    observed_at: DateTime<Utc>,
+    initial_anchor: Option<UtcTimestamp>,
+    observed_at: UtcTimestamp,
 ) -> (RetentionClock, bool) {
     let Some(mut clock) = current.or_else(|| initial_anchor.map(RetentionClock::current)) else {
         return (RetentionClock::current(observed_at), false);
@@ -2672,7 +2672,7 @@ fn next_retention_clock(
         .checked_add_signed(Duration::hours(
             RETENTION_CLOCK_MAX_UNCONFIRMED_FORWARD_HOURS,
         ))
-        .unwrap_or(DateTime::<Utc>::MAX_UTC);
+        .unwrap_or(UtcTimestamp::MAX);
     if observed_at <= maximum {
         return (RetentionClock::current(observed_at), false);
     }
@@ -2690,7 +2690,7 @@ fn next_retention_clock(
         .and_then(|started_at| {
             started_at.checked_add_signed(Duration::hours(RETENTION_CLOCK_CONFIRMATION_HOURS))
         })
-        .unwrap_or(DateTime::<Utc>::MAX_UTC);
+        .unwrap_or(UtcTimestamp::MAX);
     if observed_at >= stable_since
         && clock.pending_confirmations >= RETENTION_CLOCK_MIN_CONFIRMATIONS
     {
@@ -3384,7 +3384,7 @@ fn is_bidi_control(character: char) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use chrono::{Duration, TimeZone};
+    use crate::time::Duration;
     use serde_json::Value;
     use std::sync::{Arc, Barrier};
     use std::thread;
@@ -3399,10 +3399,8 @@ mod tests {
     const SOURCE_A: &str = "node-0123456789abcdef0123456789abcdef";
     const SOURCE_B: &str = "node-fedcba9876543210fedcba9876543210";
 
-    fn at(day: u32, hour: u32, minute: u32) -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 8, day, hour, minute, 0)
-            .single()
-            .unwrap()
+    fn at(day: u32, hour: u32, minute: u32) -> UtcTimestamp {
+        UtcTimestamp::from_utc(2026, 8, day, hour, minute, 0).unwrap()
     }
 
     fn store(root: &Path) -> SourceHistoryStore {
@@ -3421,7 +3419,7 @@ mod tests {
         SourceMetadata::new(source.parse().unwrap(), SourceKind::Local, label).unwrap()
     }
 
-    fn bucket(starts_at: DateTime<Utc>, total: u64) -> LocalHalfHourBucket {
+    fn bucket(starts_at: UtcTimestamp, total: u64) -> LocalHalfHourBucket {
         LocalHalfHourBucket {
             starts_at,
             ends_at: starts_at + Duration::minutes(15),
@@ -3445,7 +3443,7 @@ mod tests {
     }
 
     fn bucket_with_content(
-        starts_at: DateTime<Utc>,
+        starts_at: UtcTimestamp,
         title: &str,
         message_preview: &str,
     ) -> LocalHalfHourBucket {
@@ -3466,7 +3464,7 @@ mod tests {
         SourceBucketRecord::upsert(revision, bucket).unwrap()
     }
 
-    fn quota_point(observed_at: DateTime<Utc>) -> QuotaPoint {
+    fn quota_point(observed_at: UtcTimestamp) -> QuotaPoint {
         QuotaPoint {
             observed_at,
             limit_id: "codex".to_string(),
@@ -3479,9 +3477,9 @@ mod tests {
     }
 
     fn quota_point_with_identity(
-        observed_at: DateTime<Utc>,
+        observed_at: UtcTimestamp,
         limit_id: &str,
-        resets_at: DateTime<Utc>,
+        resets_at: UtcTimestamp,
         used_percent: f64,
     ) -> QuotaPoint {
         QuotaPoint {
@@ -3495,7 +3493,7 @@ mod tests {
         }
     }
 
-    fn weekly_point(observed_at: DateTime<Utc>, total: u64) -> WeeklyLocalPoint {
+    fn weekly_point(observed_at: UtcTimestamp, total: u64) -> WeeklyLocalPoint {
         WeeklyLocalPoint {
             observed_at,
             resets_at: observed_at + Duration::days(3),
@@ -5240,7 +5238,7 @@ mod tests {
         assert!(
             !store
                 .source_buckets_directory(&source, RedactionProfile::Redacted)
-                .join(format!("{}.json", starts_at.format("%Y-%m-%d")))
+                .join(format!("{}.json", starts_at.utc_date()))
                 .exists()
         );
     }

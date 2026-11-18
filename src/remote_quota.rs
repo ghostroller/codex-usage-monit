@@ -3,11 +3,11 @@
 use std::io;
 use std::num::NonZeroU64;
 
-use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::domain::Provenance;
 use crate::history::QuotaPoint;
+use crate::time::{UtcDay, UtcTimestamp};
 
 pub const MAX_QUOTA_POINTS_PER_DAY: usize = 4096;
 
@@ -36,10 +36,10 @@ impl<'de> Deserialize<'de> for QuotaPercentage {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RemoteQuotaPoint {
-    pub observed_at: DateTime<Utc>,
+    pub observed_at: UtcTimestamp,
     pub limit_id: String,
     pub duration_mins: i64,
-    pub resets_at: DateTime<Utc>,
+    pub resets_at: UtcTimestamp,
     pub used_percent: QuotaPercentage,
     pub remaining_percent: QuotaPercentage,
     pub provenance: Provenance,
@@ -71,7 +71,7 @@ impl RemoteQuotaPoint {
         }
     }
 
-    pub(crate) fn sort_key(&self) -> (DateTime<Utc>, &str, i64, DateTime<Utc>) {
+    pub(crate) fn sort_key(&self) -> (UtcTimestamp, &str, i64, UtcTimestamp) {
         (
             self.observed_at,
             &self.limit_id,
@@ -86,7 +86,7 @@ impl RemoteQuotaPoint {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RemoteQuotaDay {
-    pub day: NaiveDate,
+    pub day: UtcDay,
     pub points: Vec<RemoteQuotaPoint>,
 }
 
@@ -103,14 +103,14 @@ impl RemoteQuotaDay {
                 || (point.used_percent.0 + point.remaining_percent.0 - 100.0).abs() > 0.000_001
                 || point.observed_at >= point.resets_at
                 || point.resets_at.signed_duration_since(point.observed_at)
-                    > chrono::Duration::minutes(point.duration_mins)
-                        + chrono::Duration::seconds(120)
+                    > crate::time::Duration::minutes(point.duration_mins)
+                        + crate::time::Duration::seconds(120)
             {
                 return Err(invalid(
                     "remote quota observation is not a valid recorded Codex account window",
                 ));
             }
-            if point.observed_at.date_naive() != self.day {
+            if point.observed_at.utc_date() != self.day {
                 return Err(invalid("remote quota observation is outside its day"));
             }
         }
@@ -141,7 +141,7 @@ fn invalid(message: &str) -> io::Error {
 pub(crate) fn plan_local_quota_records(
     config: &crate::config::CollectConfig,
     identity: &crate::source_identity::SourceIdentityStore,
-    observed_at: DateTime<Utc>,
+    observed_at: UtcTimestamp,
 ) -> anyhow::Result<Vec<crate::remote_export_state::RemoteExportDesiredRecord>> {
     use crate::history_ownership::{HistoryOwnershipState, OwnershipManifestStatus};
     use crate::remote_delta_journal::{
@@ -192,7 +192,7 @@ pub(crate) fn plan_local_quota_records(
         crate::sqlite_history_initialization::validate_receipt(&database, &manifest)?;
         let account = runtime
             .source_history()
-            .load_account_since(observed_at - chrono::Duration::days(35))?;
+            .load_account_since(observed_at - crate::time::Duration::days(35))?;
         if runtime.ownership().load_manifest()?
             != OwnershipManifestStatus::Initialized(manifest.clone())
         {
@@ -203,13 +203,13 @@ pub(crate) fn plan_local_quota_records(
         }
         Ok(account)
     })?;
-    let mut days = std::collections::BTreeMap::<NaiveDate, Vec<RemoteQuotaPoint>>::new();
+    let mut days = std::collections::BTreeMap::<UtcDay, Vec<RemoteQuotaPoint>>::new();
     for point in account
         .quota_points
         .iter()
         .filter(|point| point.observed_at <= observed_at)
     {
-        days.entry(point.observed_at.date_naive())
+        days.entry(point.observed_at.utc_date())
             .or_default()
             .push(RemoteQuotaPoint::from_local(point)?);
     }
@@ -219,11 +219,9 @@ pub(crate) fn plan_local_quota_records(
         let quota = RemoteQuotaDay { day, points };
         quota.validate()?;
         let expires_at = day
-            .succ_opt()
-            .and_then(|next| next.and_hms_opt(0, 0, 0))
-            .ok_or_else(|| invalid("quota retention day overflow"))?
-            .and_utc()
-            + chrono::Duration::days(35);
+            .checked_next()
+            .and_then(|next| next.start().checked_add_days(35))
+            .ok_or_else(|| invalid("quota retention day overflow"))?;
         records.push(RemoteExportDesiredRecord::new(
             format!("quota-day-v1:{day}"),
             expires_at,
@@ -289,7 +287,7 @@ mod tests {
         let error = plan_local_quota_records(
             &config,
             &identity,
-            DateTime::from_timestamp(1_800_000_000, 0).unwrap(),
+            UtcTimestamp::from_timestamp(1_800_000_000, 0).unwrap(),
         )
         .unwrap_err();
         assert_eq!(
@@ -318,7 +316,7 @@ mod tests {
             let error = plan_local_quota_records(
                 &config,
                 &identity,
-                DateTime::from_timestamp(1_800_000_000, 0).unwrap(),
+                UtcTimestamp::from_timestamp(1_800_000_000, 0).unwrap(),
             )
             .unwrap_err();
             assert_eq!(
@@ -339,7 +337,7 @@ mod tests {
             plan_local_quota_records(
                 &config,
                 &identity,
-                DateTime::from_timestamp(1_800_000_000, 0).unwrap(),
+                UtcTimestamp::from_timestamp(1_800_000_000, 0).unwrap(),
             )
             .unwrap()
             .is_empty()
@@ -364,7 +362,7 @@ mod tests {
         let error = plan_local_quota_records(
             &config,
             &identity,
-            DateTime::from_timestamp(1_800_000_000, 0).unwrap(),
+            UtcTimestamp::from_timestamp(1_800_000_000, 0).unwrap(),
         )
         .unwrap_err();
         assert_eq!(
@@ -412,7 +410,7 @@ mod tests {
             let error = plan_local_quota_records(
                 &config,
                 &identity,
-                DateTime::from_timestamp(1_800_000_000, 0).unwrap(),
+                UtcTimestamp::from_timestamp(1_800_000_000, 0).unwrap(),
             )
             .unwrap_err();
             assert_eq!(
@@ -433,19 +431,19 @@ mod tests {
             assert!(QuotaPercentage::new(value).is_err());
         }
         assert!(serde_json::from_str::<QuotaPercentage>("101").is_err());
-        let observed_at = DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+        let observed_at = UtcTimestamp::from_timestamp(1_800_000_000, 0).unwrap();
         let point = RemoteQuotaPoint::from_local(&QuotaPoint {
             observed_at,
             limit_id: "codex".into(),
             duration_mins: 300,
-            resets_at: observed_at + chrono::Duration::hours(4),
+            resets_at: observed_at + crate::time::Duration::hours(4),
             used_percent: 12.3456,
             remaining_percent: 87.6544,
             provenance: Provenance::ServerSnapshot,
         })
         .unwrap();
         let mut day = RemoteQuotaDay {
-            day: observed_at.date_naive(),
+            day: observed_at.utc_date(),
             points: vec![point.clone()],
         };
         day.validate().unwrap();

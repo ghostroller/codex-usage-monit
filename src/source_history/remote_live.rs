@@ -2,7 +2,6 @@ use std::collections::BTreeSet;
 use std::io;
 use std::num::NonZeroU64;
 
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -14,6 +13,7 @@ use crate::remote_protocol::{
     SourceGeneration,
 };
 use crate::source_identity::NodeId;
+use crate::time::UtcTimestamp;
 
 const REMOTE_LIVE_FORMAT_VERSION: u32 = 2;
 const REMOTE_LIVE_FILE: &str = "remote-live.json";
@@ -35,8 +35,8 @@ pub struct SourceRemoteLiveSnapshot {
     pub live_revision: NonZeroU64,
     pub snapshot: RemoteLiveSnapshot,
     pub project_descriptors: Vec<RemoteProjectDescriptor>,
-    pub remote_observed_at: DateTime<Utc>,
-    pub received_at: DateTime<Utc>,
+    pub remote_observed_at: UtcTimestamp,
+    pub received_at: UtcTimestamp,
     pub range_complete: bool,
     pub partial_reasons: Vec<String>,
     pub warning_codes: Vec<String>,
@@ -57,8 +57,8 @@ struct StoredRemoteLiveSnapshot {
     live_revision: NonZeroU64,
     snapshot: RemoteLiveSnapshot,
     project_descriptors: Vec<RemoteProjectDescriptor>,
-    remote_observed_at: DateTime<Utc>,
-    received_at: DateTime<Utc>,
+    remote_observed_at: UtcTimestamp,
+    received_at: UtcTimestamp,
     range_complete: bool,
     partial_reasons: Vec<String>,
     warning_codes: Vec<String>,
@@ -133,8 +133,8 @@ impl SourceHistoryWriter<'_, '_, '_> {
         allow_journal_replacement: bool,
         live: &RemoteLiveState,
         project_descriptors: &[RemoteProjectDescriptor],
-        remote_observed_at: DateTime<Utc>,
-        received_at: DateTime<Utc>,
+        remote_observed_at: UtcTimestamp,
+        received_at: UtcTimestamp,
         range_complete: bool,
         partial_reasons: &[String],
         warning_codes: &[String],
@@ -242,8 +242,8 @@ impl SourceHistoryStore {
         allow_journal_replacement: bool,
         live: &RemoteLiveState,
         project_descriptors: &[RemoteProjectDescriptor],
-        remote_observed_at: DateTime<Utc>,
-        received_at: DateTime<Utc>,
+        remote_observed_at: UtcTimestamp,
+        received_at: UtcTimestamp,
         range_complete: bool,
         partial_reasons: &[String],
         warning_codes: &[String],
@@ -418,13 +418,11 @@ fn validate_quality_reasons(reasons: &[String], subject: &str) -> io::Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{Duration, TimeZone};
+    use crate::time::Duration;
     use tempfile::tempdir;
 
-    fn at(hour: u32, minute: u32) -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 8, 30, hour, minute, 0)
-            .single()
-            .unwrap()
+    fn at(hour: u32, minute: u32) -> UtcTimestamp {
+        UtcTimestamp::from_utc(2026, 8, 30, hour, minute, 0).unwrap()
     }
 
     fn source() -> SourceGeneration {
@@ -434,7 +432,7 @@ mod tests {
         }
     }
 
-    fn full_live(revision: u64, captured_at: DateTime<Utc>) -> RemoteLiveState {
+    fn full_live(revision: u64, captured_at: UtcTimestamp) -> RemoteLiveState {
         RemoteLiveState {
             live_revision: NonZeroU64::new(revision).unwrap(),
             snapshot: Some(RemoteLiveSnapshot {

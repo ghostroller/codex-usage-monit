@@ -15,7 +15,6 @@ use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use chrono::{DateTime, Days, NaiveDate, TimeZone, Utc};
 use sha2::{Digest, Sha256};
 
 use crate::api_cost::ApiCostAccumulator;
@@ -40,6 +39,7 @@ use crate::source_history::{
 };
 use crate::source_identity::SourceIdentity;
 use crate::source_model::{ObservedProjectKey, ProjectDisplayLabel, SessionReplicaKey, ThreadId};
+use crate::time::{UtcDay, UtcTimestamp};
 use crate::trace::{TraceFields, TraceOutcome, process_trace_log};
 
 const SESSION_DIGEST_DOMAIN: &[u8] = b"codex-usage-monit/session-digest/v1\0";
@@ -114,14 +114,14 @@ pub struct MaterializedSessionFacts {
 /// retained in this value.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LocalSessionDigestEvidence {
-    observed_at: DateTime<Utc>,
+    observed_at: UtcTimestamp,
     scan_complete: bool,
     digests: Vec<RemoteSessionDigest>,
     failed_sessions: Vec<String>,
 }
 
 impl LocalSessionDigestEvidence {
-    pub fn empty(observed_at: DateTime<Utc>) -> Self {
+    pub fn empty(observed_at: UtcTimestamp) -> Self {
         Self {
             observed_at,
             scan_complete: false,
@@ -130,7 +130,7 @@ impl LocalSessionDigestEvidence {
         }
     }
 
-    pub fn observed_at(&self) -> DateTime<Utc> {
+    pub fn observed_at(&self) -> UtcTimestamp {
         self.observed_at
     }
 
@@ -154,7 +154,7 @@ impl LocalSessionDigestEvidence {
 pub fn materialize_local_session_digest_evidence(
     calls: &[UsageCall],
     buckets: &[LocalHalfHourBucket],
-    observed_at: DateTime<Utc>,
+    observed_at: UtcTimestamp,
     scan_complete: bool,
 ) -> io::Result<LocalSessionDigestEvidence> {
     let batch = materialize_session_digest_batch(calls, buckets, observed_at, scan_complete)?;
@@ -299,7 +299,7 @@ pub fn materialize_session_facts(
     identity: &SourceIdentity,
     requested_thread: &ThreadId,
     retention_days: u16,
-    observed_at: DateTime<Utc>,
+    observed_at: UtcTimestamp,
     tasks: &[TaskRecord],
     turns: &[TurnRecord],
     interactions: &[AgentInteraction],
@@ -394,7 +394,7 @@ fn session_fact_inventory_limit_error() -> io::Error {
 pub(crate) fn materialize_session_facts_from_normalized_observation(
     requested_thread: &ThreadId,
     retention_days: u16,
-    observed_at: DateTime<Utc>,
+    observed_at: UtcTimestamp,
     normalized_observation: &HistoryObservation,
     calls: &[UsageCall],
     collection_partial_reasons: &[String],
@@ -419,7 +419,7 @@ pub(crate) fn materialize_session_facts_from_normalized_observation(
 pub(crate) fn materialize_session_facts_from_normalized_observation_bounded<F>(
     requested_thread: &ThreadId,
     retention_days: u16,
-    observed_at: DateTime<Utc>,
+    observed_at: UtcTimestamp,
     normalized_observation: &HistoryObservation,
     calls: &[UsageCall],
     collection_partial_reasons: &[String],
@@ -437,11 +437,11 @@ where
         ));
     }
     let retention_start = observed_at
-        .checked_sub_days(Days::new(u64::from(retention_days)))
-        .unwrap_or(DateTime::<Utc>::MIN_UTC);
+        .checked_sub_days(u64::from(retention_days))
+        .unwrap_or(UtcTimestamp::MIN);
 
     let mut groups =
-        BTreeMap::<(DateTime<Utc>, String, Option<String>), &LocalProjectUsageGroup>::new();
+        BTreeMap::<(UtcTimestamp, String, Option<String>), &LocalProjectUsageGroup>::new();
     for bucket in &normalized_observation.half_hour_buckets {
         for group in bucket
             .project_groups
@@ -706,7 +706,7 @@ pub fn materialize_live_snapshot(
     redaction_profile: RedactionProfile,
     tasks: &[TaskRecord],
     turns: &[TurnRecord],
-    captured_at: DateTime<Utc>,
+    captured_at: UtcTimestamp,
 ) -> io::Result<MaterializedLiveSnapshot> {
     let mut git = GitProjectEvidenceResolver::default();
     git.begin_collection();
@@ -725,7 +725,7 @@ pub(crate) fn materialize_live_snapshot_with_git_resolver(
     redaction_profile: RedactionProfile,
     tasks: &[TaskRecord],
     turns: &[TurnRecord],
-    captured_at: DateTime<Utc>,
+    captured_at: UtcTimestamp,
     git: &mut GitProjectEvidenceResolver,
 ) -> io::Result<MaterializedLiveSnapshot> {
     let mut descriptors = BTreeMap::<ObservedProjectKey, ProjectDisplayLabel>::new();
@@ -1024,9 +1024,9 @@ struct BucketApiCosts {
 
 fn api_costs_by_bucket(
     calls: &[UsageCall],
-    observed_at: DateTime<Utc>,
-) -> BTreeMap<DateTime<Utc>, BucketApiCosts> {
-    let mut result = BTreeMap::<DateTime<Utc>, BucketApiCosts>::new();
+    observed_at: UtcTimestamp,
+) -> BTreeMap<UtcTimestamp, BucketApiCosts> {
+    let mut result = BTreeMap::<UtcTimestamp, BucketApiCosts>::new();
     for call in calls {
         if call.timestamp > observed_at {
             continue;
@@ -1045,9 +1045,9 @@ fn api_costs_by_bucket(
     result
 }
 
-fn bucket_start(timestamp: DateTime<Utc>) -> Option<DateTime<Utc>> {
+fn bucket_start(timestamp: UtcTimestamp) -> Option<UtcTimestamp> {
     let seconds = timestamp.timestamp().div_euclid(15 * 60) * 15 * 60;
-    Utc.timestamp_opt(seconds, 0).single()
+    UtcTimestamp::from_timestamp(seconds, 0)
 }
 
 fn materialize_bucket(
@@ -1408,7 +1408,7 @@ struct SessionDigestAccumulator<'call> {
 }
 
 struct DigestCoverage {
-    covered_through: DateTime<Utc>,
+    covered_through: UtcTimestamp,
     complete: bool,
     partial_reasons: BTreeSet<String>,
 }
@@ -1416,7 +1416,7 @@ struct DigestCoverage {
 fn materialize_session_digests(
     calls: &[UsageCall],
     buckets: &[LocalHalfHourBucket],
-    observed_at: DateTime<Utc>,
+    observed_at: UtcTimestamp,
     scan_complete: bool,
 ) -> io::Result<(Vec<RemoteSessionDigest>, usize, usize)> {
     let batch = materialize_session_digest_batch(calls, buckets, observed_at, scan_complete)?;
@@ -1441,7 +1441,7 @@ struct SessionDigestBatch {
 fn materialize_session_digest_batch(
     calls: &[UsageCall],
     buckets: &[LocalHalfHourBucket],
-    observed_at: DateTime<Utc>,
+    observed_at: UtcTimestamp,
     scan_complete: bool,
 ) -> io::Result<SessionDigestBatch> {
     let trace = process_trace_log();
@@ -1449,14 +1449,14 @@ fn materialize_session_digest_batch(
         TraceFields::new().usize("buckets", buckets.len())
     });
     let retention_start = observed_at
-        .checked_sub_days(Days::new(SESSION_DIGEST_RETENTION_DAYS))
-        .unwrap_or(DateTime::<Utc>::MIN_UTC);
-    let mut project_keys = BTreeMap::<(ThreadId, NaiveDate), BTreeSet<ObservedProjectKey>>::new();
-    let mut bucket_partial_reasons = BTreeMap::<(ThreadId, NaiveDate), BTreeSet<String>>::new();
+        .checked_sub_days(SESSION_DIGEST_RETENTION_DAYS)
+        .unwrap_or(UtcTimestamp::MIN);
+    let mut project_keys = BTreeMap::<(ThreadId, UtcDay), BTreeSet<ObservedProjectKey>>::new();
+    let mut bucket_partial_reasons = BTreeMap::<(ThreadId, UtcDay), BTreeSet<String>>::new();
     let mut project_breakdown_groups =
-        BTreeMap::<(ThreadId, NaiveDate), Vec<(DateTime<Utc>, &LocalProjectUsageGroup)>>::new();
+        BTreeMap::<(ThreadId, UtcDay), Vec<(UtcTimestamp, &LocalProjectUsageGroup)>>::new();
     for bucket in buckets {
-        let day = bucket.starts_at.date_naive();
+        let day = bucket.starts_at.utc_date();
         let reasons = normalized_partial_reasons(&bucket.partial_reasons);
         for group in bucket
             .project_groups
@@ -1496,7 +1496,7 @@ fn materialize_session_digest_batch(
     let call_trace = trace.span_with("source_export.session_digest.call_index", || {
         TraceFields::new().usize("calls", calls.len())
     });
-    let mut accumulators = HashMap::<(&str, NaiveDate), SessionDigestAccumulator<'_>>::new();
+    let mut accumulators = HashMap::<(&str, UtcDay), SessionDigestAccumulator<'_>>::new();
     let mut valid_thread_ids = HashMap::<&str, bool>::new();
     let mut missing_event_identities = 0_usize;
     let mut invalid_threads = 0_usize;
@@ -1511,7 +1511,7 @@ fn materialize_session_digest_batch(
             invalid_threads = invalid_threads.saturating_add(1);
             continue;
         }
-        let key = (call.thread_id.as_str(), call.timestamp.date_naive());
+        let key = (call.thread_id.as_str(), call.timestamp.utc_date());
         let accumulator = accumulators
             .entry(key)
             .or_insert_with(|| SessionDigestAccumulator {
@@ -1596,7 +1596,7 @@ fn materialize_session_digest_batch(
     let revisions = current_revisions();
     let mut digests = Vec::with_capacity(accumulators.len());
     let mut failed_sessions = Vec::new();
-    let mut coverage_by_day = BTreeMap::<NaiveDate, DigestCoverage>::new();
+    let mut coverage_by_day = BTreeMap::<UtcDay, DigestCoverage>::new();
     for ((thread_id, day), mut accumulator) in accumulators {
         if let Some(error) = accumulator
             .events
@@ -1608,8 +1608,8 @@ fn materialize_session_digest_batch(
         }
         let thread_id = ThreadId::from_str(thread_id)
             .expect("session digest accumulators contain validated thread IDs");
-        let range_start = utc_day_start(day)?;
-        let range_end = range_start.checked_add_days(Days::new(1)).ok_or_else(|| {
+        let range_start = day.start();
+        let range_end = range_start.checked_add_days(1).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "session digest day overflows")
         })?;
         let coverage = coverage_by_day.entry(day).or_insert_with(|| {
@@ -1745,9 +1745,9 @@ fn replace_digest_project_attribution(
     digests: &mut [RemoteSessionDigest],
     buckets: &[LocalHalfHourBucket],
 ) -> io::Result<()> {
-    let mut project_keys = BTreeMap::<(ThreadId, NaiveDate), BTreeSet<ObservedProjectKey>>::new();
+    let mut project_keys = BTreeMap::<(ThreadId, UtcDay), BTreeSet<ObservedProjectKey>>::new();
     for bucket in buckets {
-        let day = bucket.starts_at.date_naive();
+        let day = bucket.starts_at.utc_date();
         for group in bucket
             .project_groups
             .iter()
@@ -1771,7 +1771,7 @@ fn replace_digest_project_attribution(
 
     for digest in digests {
         digest.observed_project_keys = project_keys
-            .remove(&(digest.thread_id.clone(), digest.range_start.date_naive()))
+            .remove(&(digest.thread_id.clone(), digest.range_start.utc_date()))
             .unwrap_or_default()
             .into_iter()
             .collect();
@@ -1864,10 +1864,10 @@ fn local_source_session_digest(
 }
 
 fn digest_coverage(
-    range_start: DateTime<Utc>,
-    range_end: DateTime<Utc>,
+    range_start: UtcTimestamp,
+    range_end: UtcTimestamp,
     buckets: &[LocalHalfHourBucket],
-    observed_at: DateTime<Utc>,
+    observed_at: UtcTimestamp,
     scan_complete: bool,
 ) -> DigestCoverage {
     let target = observed_at.max(range_start).min(range_end);
@@ -1933,13 +1933,6 @@ fn is_hard_coverage_reason(reason: &str) -> bool {
     )
 }
 
-fn utc_day_start(day: NaiveDate) -> io::Result<DateTime<Utc>> {
-    let naive = day.and_hms_opt(0, 0, 0).ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidData, "session digest day is invalid")
-    })?;
-    Ok(Utc.from_utc_datetime(&naive))
-}
-
 fn digest_event_semantic_hash(call: &UsageCall) -> [u8; 32] {
     digest_event_semantic_hash_fields(
         &call.thread_id,
@@ -1954,7 +1947,7 @@ fn digest_event_semantic_hash(call: &UsageCall) -> [u8; 32] {
 
 fn digest_event_semantic_hash_fields(
     thread_id: &str,
-    timestamp: DateTime<Utc>,
+    timestamp: UtcTimestamp,
     turn_id: Option<&str>,
     model: Option<&str>,
     service_tier: Option<&str>,
@@ -1989,8 +1982,8 @@ fn canonical_digest_optional_text(value: Option<&str>) -> Option<&str> {
 
 fn digest_fingerprint(
     thread_id: &ThreadId,
-    range_start: DateTime<Utc>,
-    range_end: DateTime<Utc>,
+    range_start: UtcTimestamp,
+    range_end: UtcTimestamp,
     events: &HashMap<Cow<'_, str>, DigestEvent<'_>>,
 ) -> io::Result<RemoteSessionDigestFingerprint> {
     let mut events = events
@@ -2005,8 +1998,8 @@ fn digest_fingerprint(
 
 fn digest_fingerprint_value<'a>(
     thread_id: &ThreadId,
-    range_start: DateTime<Utc>,
-    range_end: DateTime<Utc>,
+    range_start: UtcTimestamp,
+    range_end: UtcTimestamp,
     events: impl IntoIterator<Item = (&'a str, [u8; 32])>,
 ) -> String {
     let mut digest = Sha256::new();
@@ -2023,8 +2016,8 @@ fn digest_fingerprint_value<'a>(
 
 fn project_breakdown_fingerprint(
     thread_id: &ThreadId,
-    range_start: DateTime<Utc>,
-    range_end: DateTime<Utc>,
+    range_start: UtcTimestamp,
+    range_end: UtcTimestamp,
     buckets: &[LocalHalfHourBucket],
 ) -> io::Result<RemoteSessionDigestFingerprint> {
     let groups = buckets
@@ -2043,9 +2036,9 @@ fn project_breakdown_fingerprint(
 
 fn project_breakdown_fingerprint_from_groups<'a>(
     thread_id: &ThreadId,
-    range_start: DateTime<Utc>,
-    range_end: DateTime<Utc>,
-    groups: impl IntoIterator<Item = (DateTime<Utc>, &'a LocalProjectUsageGroup)>,
+    range_start: UtcTimestamp,
+    range_end: UtcTimestamp,
+    groups: impl IntoIterator<Item = (UtcTimestamp, &'a LocalProjectUsageGroup)>,
 ) -> io::Result<RemoteSessionDigestFingerprint> {
     let fingerprint =
         project_breakdown_fingerprint_value(thread_id, range_start, range_end, groups);
@@ -2055,9 +2048,9 @@ fn project_breakdown_fingerprint_from_groups<'a>(
 
 fn project_breakdown_fingerprint_value<'a>(
     thread_id: &ThreadId,
-    range_start: DateTime<Utc>,
-    range_end: DateTime<Utc>,
-    groups: impl IntoIterator<Item = (DateTime<Utc>, &'a LocalProjectUsageGroup)>,
+    range_start: UtcTimestamp,
+    range_end: UtcTimestamp,
+    groups: impl IntoIterator<Item = (UtcTimestamp, &'a LocalProjectUsageGroup)>,
 ) -> String {
     let mut groups = groups.into_iter().collect::<Vec<_>>();
     groups.sort_by(|(left_at, left), (right_at, right)| {
@@ -2200,7 +2193,7 @@ pub(crate) fn validate_fact_digest_bindings_against_facts(
     replica: &SessionReplicaKey,
     facts: &[&UsageEventFact],
     bindings: &[FactDigestBinding],
-    retained_since: Option<DateTime<Utc>>,
+    retained_since: Option<UtcTimestamp>,
 ) -> io::Result<()> {
     let mut facts = facts.to_vec();
     facts.sort_by(|left, right| {
@@ -2264,18 +2257,13 @@ pub(crate) fn validate_fact_digest_bindings_against_facts(
 
 fn canonical_fact_fingerprint_values(
     replica: &SessionReplicaKey,
-    range_start: DateTime<Utc>,
-    range_end: DateTime<Utc>,
+    range_start: UtcTimestamp,
+    range_end: UtcTimestamp,
     facts: &[&UsageEventFact],
 ) -> io::Result<(String, String)> {
     let mut events = BTreeMap::<String, [u8; 32]>::new();
     let mut project_groups = BTreeMap::<
-        (
-            DateTime<Utc>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-        ),
+        (UtcTimestamp, Option<String>, Option<String>, Option<String>),
         LocalProjectUsageGroup,
     >::new();
     for fact in facts {
@@ -2393,8 +2381,8 @@ fn canonical_fact_fingerprint_values(
 #[cfg(test)]
 pub(crate) fn canonical_fact_fingerprints_for_test(
     replica: &SessionReplicaKey,
-    range_start: DateTime<Utc>,
-    range_end: DateTime<Utc>,
+    range_start: UtcTimestamp,
+    range_end: UtcTimestamp,
     facts: &[&UsageEventFact],
 ) -> io::Result<(SessionDigestFingerprint, SessionDigestFingerprint)> {
     let (event, project) =
@@ -2576,7 +2564,7 @@ fn merge_parent_claim(
 
 #[cfg(test)]
 mod tests {
-    use chrono::{Duration, TimeZone, Utc};
+    use crate::time::{Duration, UtcTimestamp};
     use tempfile::tempdir;
 
     use super::*;
@@ -2592,6 +2580,34 @@ mod tests {
 
     fn identity(node: &str, secret: &str) -> SourceIdentity {
         SourceIdentity::from_test_parts(node.parse::<NodeId>().unwrap(), secret)
+    }
+
+    #[test]
+    fn usage_digest_keeps_existing_hash_for_fractional_timestamp() {
+        let timestamp = UtcTimestamp::parse_from_rfc3339("2026-08-30T01:02:03.12Z").unwrap();
+        let tokens = TokenUsage {
+            input_tokens: 12,
+            cached_input_tokens: 3,
+            cache_write_input_tokens: 2,
+            output_tokens: 4,
+            reasoning_output_tokens: 1,
+            unclassified_tokens: 0,
+            total_tokens: 16,
+        };
+        let hash = digest_event_semantic_hash_fields(
+            "thread-a",
+            timestamp,
+            Some("turn-1"),
+            Some("gpt-6.2-sol"),
+            None,
+            tokens,
+            true,
+        );
+
+        assert_eq!(
+            lower_hex(&hash),
+            "eb8b20eddc7f5eacb973dddc8115ce22a11d94ffc813bac7b93ef1c16ab06227"
+        );
     }
 
     fn task(thread_id: &str, parent: Option<&str>, cwd: Option<PathBuf>) -> TaskRecord {
@@ -2618,7 +2634,7 @@ mod tests {
     }
 
     fn observation(groups: Vec<LocalProjectUsageGroup>) -> HistoryObservation {
-        let starts_at = Utc.with_ymd_and_hms(2026, 8, 30, 12, 0, 0).unwrap();
+        let starts_at = UtcTimestamp::from_utc(2026, 8, 30, 12, 0, 0).unwrap();
         HistoryObservation {
             observed_at: starts_at + Duration::minutes(15),
             half_hour_buckets: vec![LocalHalfHourBucket {
@@ -2652,7 +2668,7 @@ mod tests {
     }
 
     fn usage_call(
-        timestamp: DateTime<Utc>,
+        timestamp: UtcTimestamp,
         event_id: Option<&str>,
         model: &str,
         total_tokens: u64,
@@ -2681,7 +2697,7 @@ mod tests {
 
     #[test]
     fn partial_token_evidence_preserves_known_detail_and_isolates_bad_sessions() {
-        let at = Utc.with_ymd_and_hms(2026, 9, 6, 12, 0, 0).unwrap();
+        let at = UtcTimestamp::from_utc(2026, 9, 6, 12, 0, 0).unwrap();
         let good = usage_call(at, Some("known"), "gpt-5.6-luna", 100);
         let mut missing = usage_call(at, Some("missing"), "gpt-5.6-luna", 50);
         missing.tokens = TokenUsage {
@@ -2729,7 +2745,7 @@ mod tests {
         );
     }
 
-    fn turn(thread_id: &str, message: &str, captured_at: DateTime<Utc>) -> TurnRecord {
+    fn turn(thread_id: &str, message: &str, captured_at: UtcTimestamp) -> TurnRecord {
         TurnRecord {
             thread_id: thread_id.to_owned(),
             turn_id: "turn-1".to_owned(),
@@ -2754,7 +2770,7 @@ mod tests {
     fn session_fact_request_is_physical_thread_scoped_but_preserves_root_turn_lineage() {
         let directory = tempdir().unwrap();
         let canonical = fs::canonicalize(directory.path()).unwrap();
-        let observed_at = Utc.with_ymd_and_hms(2026, 8, 30, 12, 0, 0).unwrap();
+        let observed_at = UtcTimestamp::from_utc(2026, 8, 30, 12, 0, 0).unwrap();
         let tasks = vec![
             task("root", None, Some(canonical)),
             task("child", Some("root"), None),
@@ -2815,7 +2831,7 @@ mod tests {
     fn bounded_session_fact_materialization_stops_before_growing_past_limits() {
         let directory = tempdir().unwrap();
         let canonical = fs::canonicalize(directory.path()).unwrap();
-        let observed_at = Utc.with_ymd_and_hms(2026, 8, 30, 12, 0, 0).unwrap();
+        let observed_at = UtcTimestamp::from_utc(2026, 8, 30, 12, 0, 0).unwrap();
         let tasks = vec![task("root", None, Some(canonical))];
         let turns = vec![turn("root", "private prompt", observed_at)];
         let calls = vec![
@@ -2897,7 +2913,7 @@ mod tests {
     fn local_digest_sidecar_collapses_root_and_subagent_without_content_or_paths() {
         let directory = tempdir().unwrap();
         let canonical = fs::canonicalize(directory.path()).unwrap();
-        let observed_at = Utc.with_ymd_and_hms(2026, 8, 30, 12, 0, 0).unwrap();
+        let observed_at = UtcTimestamp::from_utc(2026, 8, 30, 12, 0, 0).unwrap();
         let tasks = vec![
             task("root", None, Some(canonical)),
             task("child", Some("root"), None),
@@ -2970,10 +2986,10 @@ mod tests {
     }
 
     fn observed_usage(
-        observed_at: DateTime<Utc>,
+        observed_at: UtcTimestamp,
         calls: &[UsageCall],
         tasks: &[TaskRecord],
-        coverage_starts_at: DateTime<Utc>,
+        coverage_starts_at: UtcTimestamp,
     ) -> HistoryObservation {
         HistoryObservation::from_sources_with_tasks_and_coverage(
             observed_at,
@@ -3328,7 +3344,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let canonical = fs::canonicalize(directory.path()).unwrap();
         let tasks = vec![task("root", None, Some(canonical))];
-        let day = Utc.with_ymd_and_hms(2026, 8, 29, 0, 0, 0).unwrap();
+        let day = UtcTimestamp::from_utc(2026, 8, 29, 0, 0, 0).unwrap();
         let calls = vec![
             usage_call(
                 day + Duration::hours(1),
@@ -3383,7 +3399,7 @@ mod tests {
 
     #[test]
     fn duplicate_events_dedupe_and_conflicts_are_order_independent() {
-        let day = Utc.with_ymd_and_hms(2026, 8, 29, 0, 0, 0).unwrap();
+        let day = UtcTimestamp::from_utc(2026, 8, 29, 0, 0, 0).unwrap();
         let base = usage_call(
             day + Duration::hours(1),
             Some("native-event-1"),
@@ -3450,7 +3466,7 @@ mod tests {
             None,
             Some(fs::canonicalize(directory.path()).unwrap()),
         )];
-        let day = Utc.with_ymd_and_hms(2026, 8, 29, 0, 0, 0).unwrap();
+        let day = UtcTimestamp::from_utc(2026, 8, 29, 0, 0, 0).unwrap();
         let call = usage_call(
             day + Duration::hours(1),
             Some("native-event-1"),
@@ -3516,7 +3532,7 @@ mod tests {
 
     #[test]
     fn missing_event_identity_is_stable_and_explicitly_partial() {
-        let day = Utc.with_ymd_and_hms(2026, 8, 29, 0, 0, 0).unwrap();
+        let day = UtcTimestamp::from_utc(2026, 8, 29, 0, 0, 0).unwrap();
         let call = usage_call(day + Duration::hours(1), None, "gpt-5.6-luna", 1_000);
         let observation = observed_usage(
             day + Duration::hours(2),
@@ -3559,7 +3575,7 @@ mod tests {
             None,
             Some(fs::canonicalize(directory.path()).unwrap()),
         )];
-        let day = Utc.with_ymd_and_hms(2026, 8, 29, 0, 0, 0).unwrap();
+        let day = UtcTimestamp::from_utc(2026, 8, 29, 0, 0, 0).unwrap();
         let call = usage_call(
             day + Duration::hours(1),
             Some("native-spark-event"),
@@ -3605,7 +3621,7 @@ mod tests {
     #[test]
     fn live_snapshot_redacts_content_and_never_exports_absolute_paths() {
         let directory = tempdir().unwrap();
-        let captured_at = Utc.with_ymd_and_hms(2026, 8, 30, 12, 0, 0).unwrap();
+        let captured_at = UtcTimestamp::from_utc(2026, 8, 30, 12, 0, 0).unwrap();
         let mut root = task(
             "root",
             None,

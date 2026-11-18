@@ -7,8 +7,6 @@
 
 use std::io;
 
-use chrono::{DateTime, Days, Utc};
-
 use crate::config::CollectConfig;
 use crate::history_ownership::{HistoryOwnershipState, OwnershipManifestStatus, TryWriterLease};
 use crate::history_runtime::HistoryRuntime;
@@ -35,6 +33,7 @@ use crate::source_history::{
     PrevalidatedFactPublication, SourceKind, UsageEventFact, UsageEventFactRecord,
 };
 use crate::source_model::SessionReplicaKey;
+use crate::time::UtcTimestamp;
 
 const FACT_RETENTION_DAYS: u16 = 35;
 const REMOTE_FRAME_HEADER_BYTES: usize = 20;
@@ -307,7 +306,7 @@ pub(crate) fn prepare_replica_fact_followup(
     selected: &RemoteSyncHostSnapshot,
     runtime: &HistoryRuntime,
     health_store: &RemoteSyncHealthStore,
-    observed_at: DateTime<Utc>,
+    observed_at: UtcTimestamp,
 ) -> Result<PreparedReplicaFactFollowup, ReplicaFactFollowupReport> {
     let Some(selected_source) = selected.host().expected_source() else {
         return Err(ReplicaFactFollowupReport::local_attention(&io::Error::new(
@@ -380,7 +379,7 @@ pub(crate) fn execute_prepared_replica_fact_followup(
     health_store: &RemoteSyncHealthStore,
     collect_config: &CollectConfig,
     transport: &mut impl RemoteFactTransport,
-    observed_at: DateTime<Utc>,
+    observed_at: UtcTimestamp,
     remote_limits: Option<RemoteFactSyncLimits>,
 ) -> ReplicaFactFollowupReport {
     let PreparedReplicaFactFollowup { plan, resume_after } = prepared;
@@ -526,7 +525,7 @@ fn materialize_local_thread_facts(
     runtime: &HistoryRuntime,
     collect_config: &CollectConfig,
     plan: &PlannedReplicaFactSync,
-    observed_at: DateTime<Utc>,
+    observed_at: UtcTimestamp,
 ) -> Result<FactActivationReport, LocalFactMaterializationFailure> {
     let thread_id = plan.thread_id();
     let digest = plan.digest();
@@ -545,8 +544,8 @@ fn materialize_local_thread_facts(
         || {
             let range = ExportRange {
                 from: observed_at
-                    .checked_sub_days(Days::new(REMOTE_COLLECTION_MAX_LOOKBACK_DAYS as u64))
-                    .unwrap_or(DateTime::<Utc>::MIN_UTC),
+                    .checked_sub_days(REMOTE_COLLECTION_MAX_LOOKBACK_DAYS as u64)
+                    .unwrap_or(UtcTimestamp::MIN),
                 to: observed_at,
             };
             let collection = collect_remote_rollouts(
@@ -588,7 +587,7 @@ fn materialize_local_thread_fact_batch(
     runtime: &HistoryRuntime,
     thread_id: &crate::source_model::ThreadId,
     expected_digests: &[crate::source_history::FactDigestBinding],
-    observed_at: DateTime<Utc>,
+    observed_at: UtcTimestamp,
     collection: crate::remote_collection::RemoteCollection,
 ) -> Result<CompleteFactBatch, LocalFactMaterializationFailure> {
     if !collection.scan_complete {
@@ -1001,9 +1000,9 @@ mod tests {
         std::fs::create_dir_all(codex_home.join("sessions")).unwrap();
         let project = directory.path().join("project");
         std::fs::create_dir(&project).unwrap();
-        let anchor = Utc::now() - chrono::Duration::hours(2);
-        let original = DateTime::parse_from_rfc3339("2026-07-12T04:00:00.000Z").unwrap();
-        fn retime(value: &mut serde_json::Value, shift: chrono::Duration) {
+        let anchor = UtcTimestamp::now() - crate::time::Duration::hours(2);
+        let original = UtcTimestamp::parse_from_rfc3339("2026-07-12T04:00:00.000Z").unwrap();
+        fn retime(value: &mut serde_json::Value, shift: crate::time::Duration) {
             match value {
                 serde_json::Value::Object(fields) => {
                     for value in fields.values_mut() {
@@ -1016,7 +1015,8 @@ mod tests {
                     }
                 }
                 serde_json::Value::String(value) if value.starts_with("2026-07-12T") => {
-                    *value = (DateTime::parse_from_rfc3339(value).unwrap() + shift).to_rfc3339();
+                    *value =
+                        (UtcTimestamp::parse_from_rfc3339(value).unwrap() + shift).to_rfc3339();
                 }
                 _ => {}
             }
@@ -1056,7 +1056,7 @@ mod tests {
         runtime.flush_staged().unwrap();
         let now = collected.snapshot.as_of;
         let range = ExportRange {
-            from: now - chrono::Duration::days(35),
+            from: now - crate::time::Duration::days(35),
             to: now,
         };
         let records = runtime

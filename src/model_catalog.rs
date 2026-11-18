@@ -4,9 +4,10 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use chrono::{DateTime, TimeZone, Utc};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+
+use crate::time::UtcTimestamp;
 
 pub(crate) const MODEL_CATALOG_VERSION: u32 = 1;
 pub(crate) const BUNDLED_ESTIMATOR_REVISION: u32 = 10;
@@ -131,7 +132,7 @@ impl ApiModelRates {
     pub(crate) fn rates_for(
         &self,
         tier: PricingTier,
-        observed_at: DateTime<Utc>,
+        observed_at: UtcTimestamp,
     ) -> Option<&ApiTierRates> {
         match tier {
             PricingTier::Standard => Some(&self.standard),
@@ -158,7 +159,7 @@ struct ApiUltrafastRates {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ApiTierPromotion {
-    ends_at: DateTime<Utc>,
+    ends_at: UtcTimestamp,
     rates: ApiTierRates,
 }
 
@@ -1078,7 +1079,7 @@ struct ApiUltrafastConfig {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ApiTierPromotionConfig {
-    ends_at: DateTime<Utc>,
+    ends_at: UtcTimestamp,
     rates: ApiTierConfig,
 }
 
@@ -1177,9 +1178,7 @@ fn bundled_catalog() -> ModelCatalog {
     };
 
     // The GPT-6.2 API promotion ends at midnight Pacific Standard Time.
-    let gpt_6_2_ultrafast_promotion_end = Utc
-        .with_ymd_and_hms(2027, 3, 1, 8, 0, 0)
-        .single()
+    let gpt_6_2_ultrafast_promotion_end = UtcTimestamp::from_utc(2027, 3, 1, 8, 0, 0)
         .expect("published GPT-6.2 Ultrafast promotion cutoff");
 
     // Credits use included-usage multipliers. API cache writes use the

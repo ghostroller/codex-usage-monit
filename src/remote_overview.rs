@@ -8,8 +8,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use chrono::{DateTime, Duration, Utc};
-
 #[cfg(test)]
 use crate::api_cost::API_PRICING_CATALOG_REVISION;
 use crate::api_cost::current_api_pricing_catalog_revision;
@@ -24,6 +22,7 @@ use crate::history::{
 };
 use crate::history_query::WEEKLY_HISTORY_PROJECTION_UNAVAILABLE_WARNING;
 use crate::source_identity::NodeId;
+use crate::time::{Duration, UtcTimestamp};
 
 const LOGICAL_THREAD_PREFIX: &str = "logical-thread:";
 
@@ -49,7 +48,7 @@ impl RemoteOverviewHistory {
     pub(crate) fn from_unified(
         history: &HistoryData,
         remote_sources: impl IntoIterator<Item = (NodeId, String)>,
-        as_of: DateTime<Utc>,
+        as_of: UtcTimestamp,
     ) -> Self {
         let remote_sources = remote_sources
             .into_iter()
@@ -57,7 +56,7 @@ impl RemoteOverviewHistory {
             .collect::<BTreeMap<_, _>>();
         let since = as_of
             .checked_sub_signed(Duration::days(8))
-            .unwrap_or(DateTime::<Utc>::MIN_UTC);
+            .unwrap_or(UtcTimestamp::MIN);
         let missing_project_breakdown = history.half_hour_buckets.iter().any(|bucket| {
             bucket.ends_at > since
                 && bucket.sampled_at <= as_of
@@ -578,8 +577,8 @@ struct TaskMetadata {
     source: Option<String>,
     title: Option<String>,
     project_label: Option<String>,
-    created_at: Option<DateTime<Utc>>,
-    updated_at: Option<DateTime<Utc>>,
+    created_at: Option<UtcTimestamp>,
+    updated_at: Option<UtcTimestamp>,
     turns: BTreeSet<String>,
     usage: UsageAggregate,
 }
@@ -589,7 +588,7 @@ struct TurnMetadata {
     thread_id: String,
     turn_id: String,
     message_preview: Option<String>,
-    started_at: Option<DateTime<Utc>>,
+    started_at: Option<UtcTimestamp>,
     usage: UsageAggregate,
 }
 
@@ -603,7 +602,7 @@ struct ClassifiedThread {
 pub(crate) fn project_remote_overview_history(
     history: &RemoteOverviewHistory,
     analyses: &[WindowAnalysis],
-    as_of: DateTime<Utc>,
+    as_of: UtcTimestamp,
 ) -> RemoteOverviewProjection {
     let windows = analyses
         .iter()
@@ -1176,20 +1175,14 @@ fn turn_record(turn: TurnMetadata) -> TurnRecord {
     }
 }
 
-fn min_timestamp(
-    left: Option<DateTime<Utc>>,
-    right: Option<DateTime<Utc>>,
-) -> Option<DateTime<Utc>> {
+fn min_timestamp(left: Option<UtcTimestamp>, right: Option<UtcTimestamp>) -> Option<UtcTimestamp> {
     match (left, right) {
         (Some(left), Some(right)) => Some(left.min(right)),
         (left, right) => left.or(right),
     }
 }
 
-fn max_timestamp(
-    left: Option<DateTime<Utc>>,
-    right: Option<DateTime<Utc>>,
-) -> Option<DateTime<Utc>> {
+fn max_timestamp(left: Option<UtcTimestamp>, right: Option<UtcTimestamp>) -> Option<UtcTimestamp> {
     match (left, right) {
         (Some(left), Some(right)) => Some(left.max(right)),
         (left, right) => left.or(right),
@@ -1206,14 +1199,14 @@ fn short_thread_id(thread_id: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use chrono::{Duration, TimeZone};
+    use crate::time::Duration;
 
     use super::*;
     use crate::domain::{AttributionSummary, WindowDescriptor};
     use crate::history::{HISTORY_PROJECT_BREAKDOWN_REVISION, LocalHalfHourBucket};
 
-    fn at(hour: u32, minute: u32) -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 8, 31, hour, minute, 0).unwrap()
+    fn at(hour: u32, minute: u32) -> UtcTimestamp {
+        UtcTimestamp::from_utc(2026, 8, 31, hour, minute, 0).unwrap()
     }
 
     fn usage(tokens: u64) -> TokenUsage {
@@ -1252,7 +1245,7 @@ mod tests {
         }
     }
 
-    fn bucket(start: DateTime<Utc>, groups: Vec<LocalProjectUsageGroup>) -> LocalHalfHourBucket {
+    fn bucket(start: UtcTimestamp, groups: Vec<LocalProjectUsageGroup>) -> LocalHalfHourBucket {
         let mut token_usage = TokenUsage::default();
         for group in &groups {
             token_usage.add_assign(group.token_usage);
@@ -1275,7 +1268,7 @@ mod tests {
         }
     }
 
-    fn analysis(duration_mins: i64, starts_at: DateTime<Utc>) -> WindowAnalysis {
+    fn analysis(duration_mins: i64, starts_at: UtcTimestamp) -> WindowAnalysis {
         WindowAnalysis {
             duration_mins,
             attribution: AttributionSummary {

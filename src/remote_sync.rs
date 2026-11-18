@@ -14,7 +14,6 @@ use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::time::{Duration as StdDuration, Instant};
 
-use chrono::{DateTime, Duration, Utc};
 use sha2::{Digest, Sha256};
 
 use crate::history_ownership::{
@@ -44,6 +43,7 @@ use crate::remotes_config::{RemoteHostConfig, RemotesConfig, RemotesConfigStore,
 use crate::source_history::{HistoryProfileId, RedactionProfile, SourceHistoryStore};
 #[cfg(windows)]
 use crate::source_identity::{validate_windows_private_directory, validate_windows_private_file};
+use crate::time::{Duration, UtcTimestamp};
 
 const REMOTE_SYNC_WINDOW_MINUTES: u32 = 31 * 24 * 60;
 const REMOTE_SYNC_OVERLAP_MINUTES: u16 = 60;
@@ -525,7 +525,7 @@ pub trait RemoteDeltaLocalPhases {
     fn recover_and_position(
         &mut self,
         binding: &RemoteDeltaIngestBinding,
-        observed_at: DateTime<Utc>,
+        observed_at: UtcTimestamp,
     ) -> io::Result<RemoteDeltaNextRequestPosition>;
 
     /// Starts a fresh bootstrap after a validated cursor expiry, but only if
@@ -534,7 +534,7 @@ pub trait RemoteDeltaLocalPhases {
         &mut self,
         binding: &RemoteDeltaIngestBinding,
         expired_request: &RemoteExportRequest,
-        observed_at: DateTime<Utc>,
+        observed_at: UtcTimestamp,
     ) -> io::Result<RemoteDeltaNextRequestPosition>;
 
     /// Performs every potentially expensive page-local preparation without a
@@ -545,7 +545,7 @@ pub trait RemoteDeltaLocalPhases {
         binding: &RemoteDeltaIngestBinding,
         request: &RemoteExportRequest,
         response: &RemoteDeltaResponse,
-        received_at: DateTime<Utc>,
+        received_at: UtcTimestamp,
     ) -> io::Result<Self::PreparedPage>;
 
     /// Performs only the short, nonblocking publication CAS while the exact
@@ -570,13 +570,13 @@ pub trait RemoteDeltaLocalPhases {
         request: &RemoteExportRequest,
         response: &RemoteDeltaResponse,
         prepared: Self::PreparedPage,
-        observed_at: DateTime<Utc>,
+        observed_at: UtcTimestamp,
     ) -> io::Result<RemoteDeltaNextRequestPosition>;
 }
 
 pub struct SqliteRemoteDeltaPreparedPage {
     project_mapping: Option<PreparedProjectMappingBatch>,
-    received_at: DateTime<Utc>,
+    received_at: UtcTimestamp,
 }
 
 /// SQLite local phases used by manual and automatic synchronization.
@@ -723,7 +723,7 @@ impl<'a> SqliteRemoteDeltaLocalPhases<'a> {
     fn recover_locked(
         session: &mut crate::remote_ingest_state::RemoteDeltaIngestSession<'_>,
         writer: &crate::source_history::SourceHistoryWriter<'_, '_, '_>,
-        observed_at: DateTime<Utc>,
+        observed_at: UtcTimestamp,
     ) -> io::Result<()> {
         let _ = activate_remote_delta_bootstrap(session, writer, observed_at)?;
         let _ = retry_deferred_remote_generation_cleanup(session, writer)?;
@@ -794,7 +794,7 @@ impl RemoteDeltaLocalPhases for SqliteRemoteDeltaLocalPhases<'_> {
     fn recover_and_position(
         &mut self,
         binding: &RemoteDeltaIngestBinding,
-        observed_at: DateTime<Utc>,
+        observed_at: UtcTimestamp,
     ) -> io::Result<RemoteDeltaNextRequestPosition> {
         self.with_session(binding, |session, writer| {
             Self::recover_locked(session, writer, observed_at)?;
@@ -810,7 +810,7 @@ impl RemoteDeltaLocalPhases for SqliteRemoteDeltaLocalPhases<'_> {
         &mut self,
         binding: &RemoteDeltaIngestBinding,
         expired_request: &RemoteExportRequest,
-        observed_at: DateTime<Utc>,
+        observed_at: UtcTimestamp,
     ) -> io::Result<RemoteDeltaNextRequestPosition> {
         self.with_session(binding, |session, writer| {
             Self::recover_locked(session, writer, observed_at)?;
@@ -825,7 +825,7 @@ impl RemoteDeltaLocalPhases for SqliteRemoteDeltaLocalPhases<'_> {
         binding: &RemoteDeltaIngestBinding,
         request: &RemoteExportRequest,
         response: &RemoteDeltaResponse,
-        received_at: DateTime<Utc>,
+        received_at: UtcTimestamp,
     ) -> io::Result<Self::PreparedPage> {
         if self.published_project_mapping.is_some() {
             return Err(io::Error::other(
@@ -844,7 +844,7 @@ impl RemoteDeltaLocalPhases for SqliteRemoteDeltaLocalPhases<'_> {
         request: &RemoteExportRequest,
         response: &RemoteDeltaResponse,
         prepared: Self::PreparedPage,
-        observed_at: DateTime<Utc>,
+        observed_at: UtcTimestamp,
     ) -> io::Result<RemoteDeltaNextRequestPosition> {
         debug_assert!(prepared.project_mapping.is_none());
         let received_at = prepared.received_at;
@@ -887,7 +887,7 @@ pub fn sync_remote_delta_bounded(
     profile_id: HistoryProfileId,
     local: &mut impl RemoteDeltaLocalPhases,
     transport: &mut impl RemoteDeltaTransport,
-    started_at: DateTime<Utc>,
+    started_at: UtcTimestamp,
     limits: RemoteSyncLimits,
 ) -> Result<RemoteSyncReport, RemoteSyncError> {
     let limits = limits.validate()?;
@@ -938,7 +938,7 @@ pub fn sync_remote_delta_bounded(
         let exchange_timeout = limits.exchange_timeout.min(remaining_run_time);
         let exchange = transport.exchange_host(host, &request, exchange_timeout)?;
         report.exchanges = report.exchanges.saturating_add(1);
-        let received_at = Utc::now();
+        let received_at = UtcTimestamp::now();
         let next_total = report
             .response_bytes
             .checked_add(exchange.response_bytes)
@@ -967,7 +967,13 @@ pub fn sync_remote_delta_bounded(
                     .finish_page_publication()
                     .map_err(RemoteSyncError::Local)?;
                 let commit = try_with_current_config(config_store, selected, || {
-                    local.commit_page(&binding, &request, &exchange.response, prepared, Utc::now())
+                    local.commit_page(
+                        &binding,
+                        &request,
+                        &exchange.response,
+                        prepared,
+                        UtcTimestamp::now(),
+                    )
                 });
                 position = commit?;
                 ensure_committed_position(&position, &request, page, payload)?;
@@ -1014,7 +1020,7 @@ pub fn sync_remote_delta_bounded(
                     validate_bound_envelope(&binding, &request, &exchange.response)?;
                     ensure_config_is_current(config_store, selected)?;
                     position = with_current_config(config_store, selected, || {
-                        local.restart_bootstrap(&binding, &request, Utc::now())
+                        local.restart_bootstrap(&binding, &request, UtcTimestamp::now())
                     })?;
                     ensure_cursorless_bootstrap_position(&position)?;
                     report.completion = RemoteSyncCompletion::BootstrapRestarted(position.clone());
@@ -1071,7 +1077,7 @@ pub(crate) fn preflight_remote_delta_position(
     selected: &RemoteSyncHostSnapshot,
     binding: &RemoteDeltaIngestBinding,
     local: &mut impl RemoteDeltaLocalPhases,
-    observed_at: DateTime<Utc>,
+    observed_at: UtcTimestamp,
 ) -> Result<RemoteDeltaNextRequestPosition, RemoteSyncError> {
     // A captured selection is not itself an authorization to mutate forever.
     // Fence the short recovery phase with the exact current host snapshot.
@@ -1108,7 +1114,7 @@ fn build_delta_request(
     })
 }
 
-fn rolling_range(to: DateTime<Utc>) -> Result<ExportRange, RemoteSyncError> {
+fn rolling_range(to: UtcTimestamp) -> Result<ExportRange, RemoteSyncError> {
     let from = to
         .checked_sub_signed(Duration::minutes(i64::from(REMOTE_SYNC_WINDOW_MINUTES)))
         .ok_or(RemoteSyncError::InvalidStartedAt)?;
@@ -1387,7 +1393,6 @@ mod tests {
     use std::sync::mpsc;
     use std::thread;
 
-    use chrono::TimeZone;
     use tempfile::TempDir;
 
     use super::*;
@@ -1410,10 +1415,8 @@ mod tests {
     // file publication part of the lock-order contract.
     const TEST_THREAD_WATCHDOG: StdDuration = StdDuration::from_secs(30);
 
-    fn at(day: u32, hour: u32) -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 8, day, hour, 0, 0)
-            .single()
-            .unwrap()
+    fn at(day: u32, hour: u32) -> UtcTimestamp {
+        UtcTimestamp::from_utc(2026, 8, day, hour, 0, 0).unwrap()
     }
 
     fn source(node_id: &str) -> SourceGeneration {
@@ -1552,7 +1555,7 @@ mod tests {
         fn recover_and_position(
             &mut self,
             binding: &RemoteDeltaIngestBinding,
-            _observed_at: DateTime<Utc>,
+            _observed_at: UtcTimestamp,
         ) -> io::Result<RemoteDeltaNextRequestPosition> {
             assert_eq!(
                 binding.range_policy().window_minutes().get(),
@@ -1572,7 +1575,7 @@ mod tests {
             &mut self,
             _binding: &RemoteDeltaIngestBinding,
             expired_request: &RemoteExportRequest,
-            _observed_at: DateTime<Utc>,
+            _observed_at: UtcTimestamp,
         ) -> io::Result<RemoteDeltaNextRequestPosition> {
             self.local(|| ());
             if self.advance_before_restart {
@@ -1597,7 +1600,7 @@ mod tests {
             _binding: &RemoteDeltaIngestBinding,
             _request: &RemoteExportRequest,
             _response: &RemoteDeltaResponse,
-            _received_at: DateTime<Utc>,
+            _received_at: UtcTimestamp,
         ) -> io::Result<Self::PreparedPage> {
             self.local(|| ());
             Ok(())
@@ -1609,7 +1612,7 @@ mod tests {
             request: &RemoteExportRequest,
             response: &RemoteDeltaResponse,
             (): Self::PreparedPage,
-            _observed_at: DateTime<Utc>,
+            _observed_at: UtcTimestamp,
         ) -> io::Result<RemoteDeltaNextRequestPosition> {
             self.local(|| ());
             let RemoteExportRequestBody::Delta(delta) = &request.request else {
@@ -1666,7 +1669,7 @@ mod tests {
                 payload.quota_changes = vec![crate::remote_quota::RemoteQuotaChange {
                     sequence: NonZeroU64::new(1).unwrap(),
                     quota: crate::remote_quota::RemoteQuotaDay {
-                        day: delta.range.to.date_naive(),
+                        day: delta.range.to.utc_date(),
                         points: Vec::new(),
                     },
                 }];
@@ -2844,7 +2847,7 @@ mod tests {
         assert!(matches!(error, RemoteSyncError::InvalidLimits(_)));
 
         assert!(matches!(
-            rolling_range(DateTime::<Utc>::MIN_UTC).unwrap_err(),
+            rolling_range(UtcTimestamp::MIN).unwrap_err(),
             RemoteSyncError::InvalidStartedAt
         ));
     }

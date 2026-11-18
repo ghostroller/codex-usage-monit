@@ -13,11 +13,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
-use chrono::Utc;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::diagnostic_log::{DIAGNOSTIC_LOG_MAX_BYTES, JsonlWriter};
+use crate::time::UtcTimestamp;
 
 const TRACE_LOG_SCHEMA_VERSION: u32 = 1;
 const OPAQUE_ID_HEX_BYTES: usize = 8;
@@ -170,7 +170,7 @@ impl TraceLog {
         trace.write(json!({
             "schemaVersion": TRACE_LOG_SCHEMA_VERSION,
             "event": "trace_start",
-            "at": Utc::now(),
+            "at": UtcTimestamp::now(),
             "pid": std::process::id(),
             "version": env!("CARGO_PKG_VERSION"),
             "targetOs": std::env::consts::OS,
@@ -240,7 +240,7 @@ impl TraceLog {
         let value = json!({
             "schemaVersion": TRACE_LOG_SCHEMA_VERSION,
             "event": "span_start",
-            "at": Utc::now(),
+            "at": UtcTimestamp::now(),
             "atUs": duration_us(inner.origin.elapsed()),
             "spanId": span_id,
             "stage": stage,
@@ -278,7 +278,7 @@ impl TraceLog {
             let value = json!({
                 "schemaVersion": TRACE_LOG_SCHEMA_VERSION,
                 "event": "span_finish",
-                "at": Utc::now(),
+                "at": UtcTimestamp::now(),
                 "atUs": duration_us(inner.origin.elapsed()),
                 "spanId": span_id,
                 "stage": span.stage,
@@ -291,7 +291,7 @@ impl TraceLog {
         let value = json!({
             "schemaVersion": TRACE_LOG_SCHEMA_VERSION,
             "event": "trace_finish",
-            "at": Utc::now(),
+            "at": UtcTimestamp::now(),
             "atUs": duration_us(inner.origin.elapsed()),
         });
         write_json_line(&mut state, &value);
@@ -342,7 +342,7 @@ impl TraceLog {
         let value = json!({
             "schemaVersion": TRACE_LOG_SCHEMA_VERSION,
             "event": "span_finish",
-            "at": Utc::now(),
+            "at": UtcTimestamp::now(),
             "atUs": duration_us(inner.origin.elapsed()),
             "spanId": span_id,
             "stage": stage,

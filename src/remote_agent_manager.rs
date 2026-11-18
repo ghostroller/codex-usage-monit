@@ -940,8 +940,10 @@ impl Drop for LocalStaging {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::cell::RefCell;
+
+    use super::*;
+    use crate::time::UtcTimestamp;
 
     fn output(code: u32, stdout: &[u8], stderr: &[u8]) -> Output {
         #[cfg(unix)]
@@ -1091,7 +1093,7 @@ mod tests {
                 build_id: AgentInfo::local().build_id,
                 enabled: true,
                 pid: Some(123),
-                last_history_heartbeat: Some(chrono::Utc::now()),
+                last_history_heartbeat: Some(UtcTimestamp::now()),
                 diagnostic: None,
             };
             match case {
@@ -1173,7 +1175,7 @@ mod tests {
                 build_id: local.build_id,
                 enabled: true,
                 pid: Some(123),
-                last_history_heartbeat: Some(chrono::Utc::now()),
+                last_history_heartbeat: Some(UtcTimestamp::now()),
                 diagnostic: None,
             },
             cli: crate::update::CliUpdateReport {

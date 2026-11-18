@@ -6,8 +6,9 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration as StdDuration, Instant};
 
-use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
+
+use crate::time::{Duration, UtcTimestamp};
 
 mod shared_series;
 
@@ -51,29 +52,29 @@ const RESET_DRIFT_SECS: i64 = 120;
 const MAX_RETENTION_CLOCK_STEP_DAYS: i64 = HISTORY_RETENTION_DAYS;
 const PROJECT_TITLE_MAX_CHARS: usize = 160;
 
-fn datetime_saturating_add(timestamp: DateTime<Utc>, duration: Duration) -> DateTime<Utc> {
+fn datetime_saturating_add(timestamp: UtcTimestamp, duration: Duration) -> UtcTimestamp {
     timestamp.checked_add_signed(duration).unwrap_or_else(|| {
         if duration < Duration::zero() {
-            DateTime::<Utc>::MIN_UTC
+            UtcTimestamp::MIN
         } else {
-            DateTime::<Utc>::MAX_UTC
+            UtcTimestamp::MAX
         }
     })
 }
 
-fn datetime_saturating_sub(timestamp: DateTime<Utc>, duration: Duration) -> DateTime<Utc> {
+fn datetime_saturating_sub(timestamp: UtcTimestamp, duration: Duration) -> UtcTimestamp {
     timestamp.checked_sub_signed(duration).unwrap_or_else(|| {
         if duration < Duration::zero() {
-            DateTime::<Utc>::MAX_UTC
+            UtcTimestamp::MAX
         } else {
-            DateTime::<Utc>::MIN_UTC
+            UtcTimestamp::MIN
         }
     })
 }
 
 fn timestamps_within(
-    timestamp: DateTime<Utc>,
-    reference: DateTime<Utc>,
+    timestamp: UtcTimestamp,
+    reference: UtcTimestamp,
     tolerance: Duration,
 ) -> bool {
     timestamp >= datetime_saturating_sub(reference, tolerance)
@@ -83,10 +84,10 @@ fn timestamps_within(
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QuotaPoint {
-    pub observed_at: DateTime<Utc>,
+    pub observed_at: UtcTimestamp,
     pub limit_id: String,
     pub duration_mins: i64,
-    pub resets_at: DateTime<Utc>,
+    pub resets_at: UtcTimestamp,
     pub used_percent: f64,
     pub remaining_percent: f64,
     pub provenance: Provenance,
@@ -150,7 +151,7 @@ pub struct LocalProjectUsageGroup {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message_preview: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub turn_started_at: Option<DateTime<Utc>>,
+    pub turn_started_at: Option<UtcTimestamp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -175,9 +176,9 @@ pub struct LocalProjectUsageGroup {
 /// The type and serialized collection keep their original "half hour" names
 /// so format-1 shards can preserve non-bucket history during migration.
 pub struct LocalHalfHourBucket {
-    pub starts_at: DateTime<Utc>,
-    pub ends_at: DateTime<Utc>,
-    pub sampled_at: DateTime<Utc>,
+    pub starts_at: UtcTimestamp,
+    pub ends_at: UtcTimestamp,
+    pub sampled_at: UtcTimestamp,
     pub token_usage: TokenUsage,
     pub estimated_cost_units: u128,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -207,8 +208,8 @@ pub struct LocalHalfHourBucket {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WeeklyLocalPoint {
-    pub observed_at: DateTime<Utc>,
-    pub resets_at: DateTime<Utc>,
+    pub observed_at: UtcTimestamp,
+    pub resets_at: UtcTimestamp,
     pub token_usage: TokenUsage,
     pub estimated_cost_units: u128,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -223,7 +224,7 @@ pub struct WeeklyLocalPoint {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct HistoryObservation {
-    pub observed_at: DateTime<Utc>,
+    pub observed_at: UtcTimestamp,
     pub quota_points: Vec<QuotaPoint>,
     pub half_hour_buckets: Vec<LocalHalfHourBucket>,
     pub weekly_local_points: Vec<WeeklyLocalPoint>,
@@ -231,7 +232,7 @@ pub struct HistoryObservation {
 
 impl HistoryObservation {
     pub fn from_sources(
-        observed_at: DateTime<Utc>,
+        observed_at: UtcTimestamp,
         calls: &[UsageCall],
         limits: &[LimitBucket],
         partial_reasons: &[String],
@@ -240,11 +241,11 @@ impl HistoryObservation {
     }
 
     pub fn from_sources_with_coverage(
-        observed_at: DateTime<Utc>,
+        observed_at: UtcTimestamp,
         calls: &[UsageCall],
         limits: &[LimitBucket],
         partial_reasons: &[String],
-        local_coverage_starts_at: Option<DateTime<Utc>>,
+        local_coverage_starts_at: Option<UtcTimestamp>,
     ) -> Self {
         Self::from_sources_with_tasks_and_coverage(
             observed_at,
@@ -257,12 +258,12 @@ impl HistoryObservation {
     }
 
     pub fn from_sources_with_tasks_and_coverage(
-        observed_at: DateTime<Utc>,
+        observed_at: UtcTimestamp,
         calls: &[UsageCall],
         tasks: &[TaskRecord],
         limits: &[LimitBucket],
         partial_reasons: &[String],
-        local_coverage_starts_at: Option<DateTime<Utc>>,
+        local_coverage_starts_at: Option<UtcTimestamp>,
     ) -> Self {
         Self::from_sources_with_tasks_turns_and_interactions_and_coverage(
             observed_at,
@@ -278,14 +279,14 @@ impl HistoryObservation {
 
     #[allow(clippy::too_many_arguments)]
     pub fn from_sources_with_tasks_turns_and_interactions_and_coverage(
-        observed_at: DateTime<Utc>,
+        observed_at: UtcTimestamp,
         calls: &[UsageCall],
         tasks: &[TaskRecord],
         turns: &[TurnRecord],
         agent_interactions: &[AgentInteraction],
         limits: &[LimitBucket],
         partial_reasons: &[String],
-        local_coverage_starts_at: Option<DateTime<Utc>>,
+        local_coverage_starts_at: Option<UtcTimestamp>,
     ) -> Self {
         let weekly_local_points = weekly_local_points_from_sources(
             observed_at,
@@ -321,19 +322,19 @@ pub struct HistoryData {
     /// Most recent project-history reconstruction attempt for the current
     /// metric, estimator, pricing, and bucket revisions in this Codex-home
     /// namespace. Actual bucket coverage remains the source of truth.
-    pub(crate) summary_backfill_attempted_at: Option<DateTime<Utc>>,
+    pub(crate) summary_backfill_attempted_at: Option<UtcTimestamp>,
     pub(crate) summary_backfill_attempt_complete: Option<bool>,
 }
 
 impl HistoryData {
     pub fn remaining_series(&self, duration_mins: i64) -> Vec<QuotaPoint> {
-        self.remaining_series_as_of(duration_mins, DateTime::<Utc>::MAX_UTC)
+        self.remaining_series_as_of(duration_mins, UtcTimestamp::MAX)
     }
 
     pub fn remaining_series_as_of(
         &self,
         duration_mins: i64,
-        as_of: DateTime<Utc>,
+        as_of: UtcTimestamp,
     ) -> Vec<QuotaPoint> {
         self.quota_points
             .iter()
@@ -358,11 +359,11 @@ impl HistoryData {
         })
     }
 
-    pub fn latest_weekly_reset(&self) -> Option<DateTime<Utc>> {
-        self.latest_weekly_reset_as_of(DateTime::<Utc>::MAX_UTC)
+    pub fn latest_weekly_reset(&self) -> Option<UtcTimestamp> {
+        self.latest_weekly_reset_as_of(UtcTimestamp::MAX)
     }
 
-    pub fn latest_weekly_reset_as_of(&self, as_of: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    pub fn latest_weekly_reset_as_of(&self, as_of: UtcTimestamp) -> Option<UtcTimestamp> {
         self.quota_points
             .iter()
             .filter(|point| point.duration_mins == WEEK_MINS && point.observed_at <= as_of)
@@ -379,35 +380,35 @@ impl HistoryData {
 
     pub fn estimated_half_hour_series(
         &self,
-        weekly_resets_at: DateTime<Utc>,
+        weekly_resets_at: UtcTimestamp,
     ) -> Vec<HalfHourSeriesPoint> {
-        self.estimated_half_hour_series_as_of(weekly_resets_at, DateTime::<Utc>::MAX_UTC)
+        self.estimated_half_hour_series_as_of(weekly_resets_at, UtcTimestamp::MAX)
     }
 
     pub fn estimated_half_hour_series_as_of(
         &self,
-        weekly_resets_at: DateTime<Utc>,
-        as_of: DateTime<Utc>,
+        weekly_resets_at: UtcTimestamp,
+        as_of: UtcTimestamp,
     ) -> Vec<HalfHourSeriesPoint> {
         self.estimated_half_hour_series_with_api_long_context_as_of(weekly_resets_at, as_of, false)
     }
 
     pub fn estimated_half_hour_series_with_api_long_context(
         &self,
-        weekly_resets_at: DateTime<Utc>,
+        weekly_resets_at: UtcTimestamp,
         api_long_context: bool,
     ) -> Vec<HalfHourSeriesPoint> {
         self.estimated_half_hour_series_with_api_long_context_as_of(
             weekly_resets_at,
-            DateTime::<Utc>::MAX_UTC,
+            UtcTimestamp::MAX,
             api_long_context,
         )
     }
 
     pub fn estimated_half_hour_series_with_api_long_context_as_of(
         &self,
-        weekly_resets_at: DateTime<Utc>,
-        as_of: DateTime<Utc>,
+        weekly_resets_at: UtcTimestamp,
+        as_of: UtcTimestamp,
         api_long_context: bool,
     ) -> Vec<HalfHourSeriesPoint> {
         if !self.weekly_projection_available() {
@@ -464,35 +465,35 @@ impl HistoryData {
 
     pub fn weekly_cumulative_series(
         &self,
-        weekly_resets_at: DateTime<Utc>,
+        weekly_resets_at: UtcTimestamp,
     ) -> Vec<WeeklyCumulativePoint> {
-        self.weekly_cumulative_series_as_of(weekly_resets_at, DateTime::<Utc>::MAX_UTC)
+        self.weekly_cumulative_series_as_of(weekly_resets_at, UtcTimestamp::MAX)
     }
 
     pub fn weekly_cumulative_series_as_of(
         &self,
-        weekly_resets_at: DateTime<Utc>,
-        as_of: DateTime<Utc>,
+        weekly_resets_at: UtcTimestamp,
+        as_of: UtcTimestamp,
     ) -> Vec<WeeklyCumulativePoint> {
         self.weekly_cumulative_series_with_api_long_context_as_of(weekly_resets_at, as_of, false)
     }
 
     pub fn weekly_cumulative_series_with_api_long_context(
         &self,
-        weekly_resets_at: DateTime<Utc>,
+        weekly_resets_at: UtcTimestamp,
         api_long_context: bool,
     ) -> Vec<WeeklyCumulativePoint> {
         self.weekly_cumulative_series_with_api_long_context_as_of(
             weekly_resets_at,
-            DateTime::<Utc>::MAX_UTC,
+            UtcTimestamp::MAX,
             api_long_context,
         )
     }
 
     pub fn weekly_cumulative_series_with_api_long_context_as_of(
         &self,
-        weekly_resets_at: DateTime<Utc>,
-        as_of: DateTime<Utc>,
+        weekly_resets_at: UtcTimestamp,
+        as_of: UtcTimestamp,
         api_long_context: bool,
     ) -> Vec<WeeklyCumulativePoint> {
         if !self.weekly_projection_available() {
@@ -508,8 +509,8 @@ impl HistoryData {
 
     fn recorded_weekly_cumulative_series(
         &self,
-        weekly_resets_at: DateTime<Utc>,
-        as_of: DateTime<Utc>,
+        weekly_resets_at: UtcTimestamp,
+        as_of: UtcTimestamp,
         api_long_context: bool,
     ) -> Option<Vec<WeeklyCumulativePoint>> {
         let cycle_starts_at =
@@ -646,8 +647,8 @@ impl HistoryData {
 
     fn derived_weekly_cumulative_series(
         &self,
-        weekly_resets_at: DateTime<Utc>,
-        as_of: DateTime<Utc>,
+        weekly_resets_at: UtcTimestamp,
+        as_of: UtcTimestamp,
         api_long_context: bool,
     ) -> Vec<WeeklyCumulativePoint> {
         let cycle_starts_at =
@@ -710,8 +711,8 @@ impl HistoryData {
 
     fn latest_weekly_used_percent(
         &self,
-        weekly_resets_at: DateTime<Utc>,
-        as_of: DateTime<Utc>,
+        weekly_resets_at: UtcTimestamp,
+        as_of: UtcTimestamp,
     ) -> Option<f64> {
         self.quota_points
             .iter()
@@ -730,8 +731,8 @@ impl HistoryData {
 
     fn weekly_cycle_buckets(
         &self,
-        weekly_resets_at: DateTime<Utc>,
-        as_of: DateTime<Utc>,
+        weekly_resets_at: UtcTimestamp,
+        as_of: UtcTimestamp,
     ) -> Vec<&LocalHalfHourBucket> {
         let starts_at = datetime_saturating_sub(weekly_resets_at, Duration::minutes(WEEK_MINS));
         self.half_hour_buckets
@@ -750,8 +751,8 @@ impl HistoryData {
 
     fn estimate_context(
         &self,
-        weekly_resets_at: DateTime<Utc>,
-        as_of: DateTime<Utc>,
+        weekly_resets_at: UtcTimestamp,
+        as_of: UtcTimestamp,
         buckets: &[&LocalHalfHourBucket],
         api_long_context: bool,
     ) -> EstimateContext {
@@ -816,8 +817,8 @@ impl HistoryData {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct HalfHourSeriesPoint {
-    pub starts_at: DateTime<Utc>,
-    pub ends_at: DateTime<Utc>,
+    pub starts_at: UtcTimestamp,
+    pub ends_at: UtcTimestamp,
     pub token_usage: TokenUsage,
     pub estimated_cost_units: u128,
     pub estimated_quota_percent: Option<f64>,
@@ -827,8 +828,8 @@ pub struct HalfHourSeriesPoint {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct WeeklyCumulativePoint {
-    pub at: DateTime<Utc>,
-    pub sampled_at: Option<DateTime<Utc>>,
+    pub at: UtcTimestamp,
+    pub sampled_at: Option<UtcTimestamp>,
     pub token_usage: TokenUsage,
     pub estimated_cost_units: u128,
     pub estimated_quota_percent: Option<f64>,
@@ -877,12 +878,12 @@ impl EstimateContext {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SummaryBackfillAttempt {
-    pub completed_at: DateTime<Utc>,
+    pub completed_at: UtcTimestamp,
     pub complete: bool,
 }
 
 impl SummaryBackfillAttempt {
-    pub fn completed_at(&self) -> DateTime<Utc> {
+    pub fn completed_at(&self) -> UtcTimestamp {
         self.completed_at
     }
 
@@ -967,7 +968,7 @@ impl HistoryStore {
         true
     }
 
-    pub(crate) fn load_since_with_staged(&mut self, since: DateTime<Utc>) -> HistoryData {
+    pub(crate) fn load_since_with_staged(&mut self, since: UtcTimestamp) -> HistoryData {
         let mut data = HistoryData {
             read_only: true,
             ..HistoryData::default()
@@ -977,7 +978,7 @@ impl HistoryStore {
     }
     pub(crate) fn reload_since_if_stale_with_staged(
         &mut self,
-        since: DateTime<Utc>,
+        since: UtcTimestamp,
     ) -> Option<HistoryData> {
         Some(self.load_since_with_staged(since))
     }
@@ -1063,7 +1064,7 @@ impl HistoryStore {
         })
     }
 
-    pub(crate) fn overlay_staged_since(&self, data: &mut HistoryData, since: DateTime<Utc>) {
+    pub(crate) fn overlay_staged_since(&self, data: &mut HistoryData, since: UtcTimestamp) {
         if let Some(observation) = self.staged_observation.as_ref() {
             merge_observation_into_history(data, observation, since);
         }
@@ -1123,7 +1124,7 @@ fn redact_project_group_titles(groups: &mut [LocalProjectUsageGroup]) {
 fn merge_observation_into_history(
     data: &mut HistoryData,
     observation: &HistoryObservation,
-    since: DateTime<Utc>,
+    since: UtcTimestamp,
 ) {
     for point in &observation.quota_points {
         if point.observed_at >= since {
@@ -1200,11 +1201,11 @@ fn quota_points_from_limits(limits: &[LimitBucket]) -> Vec<QuotaPoint> {
 }
 
 fn weekly_local_points_from_sources(
-    observed_at: DateTime<Utc>,
+    observed_at: UtcTimestamp,
     calls: &[UsageCall],
     limits: &[LimitBucket],
     partial_reasons: &[String],
-    local_coverage_starts_at: Option<DateTime<Utc>>,
+    local_coverage_starts_at: Option<UtcTimestamp>,
 ) -> Vec<WeeklyLocalPoint> {
     let mut selected = None;
     for bucket in limits {
@@ -1234,7 +1235,7 @@ fn weekly_local_points_from_sources(
             }
             let candidate = (bucket.as_of, resets_at, bucket.provenance);
             if selected.is_none_or(
-                |(selected_as_of, _, _): (DateTime<Utc>, DateTime<Utc>, Provenance)| {
+                |(selected_as_of, _, _): (UtcTimestamp, UtcTimestamp, Provenance)| {
                     candidate.0 > selected_as_of
                 },
             ) {
@@ -1246,7 +1247,7 @@ fn weekly_local_points_from_sources(
         return Vec::new();
     };
     let starts_at = datetime_saturating_sub(resets_at, Duration::minutes(WEEK_MINS));
-    let mut buckets = BTreeMap::<DateTime<Utc>, WeeklyAccumulator>::new();
+    let mut buckets = BTreeMap::<UtcTimestamp, WeeklyAccumulator>::new();
     let mut first_call_bucket = None;
     for call in calls {
         if call.timestamp < starts_at
@@ -1258,7 +1259,7 @@ fn weekly_local_points_from_sources(
         }
         let bucket_starts_at = floor_weekly_sample(call.timestamp);
         first_call_bucket = Some(
-            first_call_bucket.map_or(bucket_starts_at, |first: DateTime<Utc>| {
+            first_call_bucket.map_or(bucket_starts_at, |first: UtcTimestamp| {
                 first.min(bucket_starts_at)
             }),
         );
@@ -1428,18 +1429,18 @@ struct ProjectCallAttribution {
     session_thread_id: String,
     session_turn_id: Option<String>,
     message_preview: Option<String>,
-    turn_started_at: Option<DateTime<Utc>>,
+    turn_started_at: Option<UtcTimestamp>,
     missing_subagent_turn_attribution: bool,
 }
 
 fn local_buckets_from_calls(
-    observed_at: DateTime<Utc>,
+    observed_at: UtcTimestamp,
     calls: &[UsageCall],
     tasks: &[TaskRecord],
     turns: &[TurnRecord],
     agent_interactions: &[AgentInteraction],
     partial_reasons: &[String],
-    local_coverage_starts_at: Option<DateTime<Utc>>,
+    local_coverage_starts_at: Option<UtcTimestamp>,
 ) -> Vec<LocalHalfHourBucket> {
     let tasks_by_thread = tasks
         .iter()
@@ -1452,7 +1453,7 @@ fn local_buckets_from_calls(
     let spawn_turns = exact_spawn_turns_by_edge(agent_interactions);
     let lineage_index = thread_lineage_index(&tasks_by_thread, &spawn_turns);
     let project_group_templates = project_group_templates(&tasks_by_thread, &lineage_index, calls);
-    let mut buckets: BTreeMap<DateTime<Utc>, BucketAccumulator> = BTreeMap::new();
+    let mut buckets: BTreeMap<UtcTimestamp, BucketAccumulator> = BTreeMap::new();
     for call in calls {
         if call.timestamp > observed_at {
             continue;
@@ -2049,17 +2050,17 @@ fn is_zero_u32(value: &u32) -> bool {
     *value == 0
 }
 
-fn floor_local_bucket(timestamp: DateTime<Utc>) -> DateTime<Utc> {
+fn floor_local_bucket(timestamp: UtcTimestamp) -> UtcTimestamp {
     let seconds = timestamp.timestamp().div_euclid(LOCAL_BUCKET_SECS) * LOCAL_BUCKET_SECS;
-    DateTime::from_timestamp(seconds, 0).unwrap_or(DateTime::<Utc>::MIN_UTC)
+    UtcTimestamp::from_timestamp(seconds, 0).unwrap_or(UtcTimestamp::MIN)
 }
 
-fn floor_weekly_sample(timestamp: DateTime<Utc>) -> DateTime<Utc> {
+fn floor_weekly_sample(timestamp: UtcTimestamp) -> UtcTimestamp {
     let seconds = timestamp.timestamp().div_euclid(WEEKLY_SAMPLE_SECS) * WEEKLY_SAMPLE_SECS;
-    DateTime::from_timestamp(seconds, 0).unwrap_or(DateTime::<Utc>::MIN_UTC)
+    UtcTimestamp::from_timestamp(seconds, 0).unwrap_or(UtcTimestamp::MIN)
 }
 
-fn is_exact_weekly_sample_boundary(timestamp: DateTime<Utc>) -> bool {
+fn is_exact_weekly_sample_boundary(timestamp: UtcTimestamp) -> bool {
     timestamp.timestamp().rem_euclid(WEEKLY_SAMPLE_SECS) == 0
         && timestamp.timestamp_subsec_nanos() == 0
 }
@@ -3404,7 +3405,6 @@ fn stable_hash(bytes: &[u8]) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use chrono::TimeZone;
     use tempfile::tempdir;
 
     use super::*;
@@ -3413,10 +3413,8 @@ mod tests {
         TurnStatus, UsageCall,
     };
 
-    fn at(year: i32, month: u32, day: u32, hour: u32, minute: u32, second: u32) -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(year, month, day, hour, minute, second)
-            .single()
-            .unwrap()
+    fn at(year: i32, month: u32, day: u32, hour: u32, minute: u32, second: u32) -> UtcTimestamp {
+        UtcTimestamp::from_utc(year, month, day, hour, minute, second).unwrap()
     }
 
     fn usage(total: u64) -> TokenUsage {
@@ -3428,7 +3426,7 @@ mod tests {
     }
 
     fn call(
-        timestamp: DateTime<Utc>,
+        timestamp: UtcTimestamp,
         model: &str,
         service_tier: Option<&str>,
         total: u64,
@@ -3451,7 +3449,7 @@ mod tests {
         parent_thread_id: Option<&str>,
         cwd: Option<&str>,
         title: &str,
-        timestamp: DateTime<Utc>,
+        timestamp: UtcTimestamp,
     ) -> TaskRecord {
         TaskRecord {
             thread_id: thread_id.to_string(),
@@ -3479,7 +3477,7 @@ mod tests {
         thread_id: &str,
         turn_id: &str,
         message_preview: &str,
-        started_at: DateTime<Utc>,
+        started_at: UtcTimestamp,
     ) -> TurnRecord {
         TurnRecord {
             thread_id: thread_id.to_string(),
@@ -3505,7 +3503,7 @@ mod tests {
         parent_thread_id: &str,
         parent_turn_id: &str,
         child_thread_id: &str,
-        occurred_at: DateTime<Utc>,
+        occurred_at: UtcTimestamp,
     ) -> AgentInteraction {
         AgentInteraction {
             kind: AgentInteractionKind::SpawnStarted,
@@ -3519,7 +3517,7 @@ mod tests {
         }
     }
 
-    fn bucket(as_of: DateTime<Utc>, provenance: Provenance, limit_id: &str) -> LimitBucket {
+    fn bucket(as_of: UtcTimestamp, provenance: Provenance, limit_id: &str) -> LimitBucket {
         LimitBucket {
             limit_id: limit_id.to_string(),
             limit_name: None,
@@ -6047,8 +6045,8 @@ mod tests {
     }
 
     fn quota_point(
-        observed_at: DateTime<Utc>,
-        resets_at: DateTime<Utc>,
+        observed_at: UtcTimestamp,
+        resets_at: UtcTimestamp,
         used_percent: f64,
     ) -> QuotaPoint {
         QuotaPoint {
@@ -6063,8 +6061,8 @@ mod tests {
     }
 
     fn local_bucket(
-        starts_at: DateTime<Utc>,
-        sampled_at: DateTime<Utc>,
+        starts_at: UtcTimestamp,
+        sampled_at: UtcTimestamp,
         total_tokens: u64,
         estimated_cost_units: u128,
     ) -> LocalHalfHourBucket {
@@ -6090,8 +6088,8 @@ mod tests {
     }
 
     fn weekly_point(
-        observed_at: DateTime<Utc>,
-        resets_at: DateTime<Utc>,
+        observed_at: UtcTimestamp,
+        resets_at: UtcTimestamp,
         total_tokens: u64,
         estimated_cost_units: u128,
     ) -> WeeklyLocalPoint {

@@ -22,14 +22,14 @@ enum Phase {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Progress {
-    cutoff: DateTime<Utc>,
-    trusted_at: DateTime<Utc>,
+    cutoff: UtcTimestamp,
+    trusted_at: UtcTimestamp,
     phase: Phase,
     cursor: Option<RowCursor>,
     state_cursor: String,
     job: Option<FactJob>,
-    expired_days: BTreeSet<NaiveDate>,
-    retained_days: BTreeSet<NaiveDate>,
+    expired_days: BTreeSet<UtcDay>,
+    retained_days: BTreeSet<UtcDay>,
     digest_namespace: Option<String>,
     digest_statistics_truncated: bool,
     statistics_partial: bool,
@@ -43,9 +43,9 @@ struct FactJob {
     replacement: FactBatchId,
     cursor: Option<RowCursor>,
     seen_count: usize,
-    seen_days: BTreeSet<NaiveDate>,
+    seen_days: BTreeSet<UtcDay>,
     retained_count: usize,
-    retained_days: BTreeSet<NaiveDate>,
+    retained_days: BTreeSet<UtcDay>,
     retained_bytes: u64,
     retire_namespace: Option<String>,
     cancelled: bool,
@@ -279,8 +279,8 @@ pub(crate) fn prepare_gc_evidence_unit(
     store: &SourceHistoryStore,
     source: &NodeId,
     redaction: RedactionProfile,
-    cutoff: DateTime<Utc>,
-    trusted_at: DateTime<Utc>,
+    cutoff: UtcTimestamp,
+    trusted_at: UtcTimestamp,
     budget: &mut Budget,
 ) -> io::Result<PreparedEvidenceGc> {
     let database = store.sqlite_database().expect("SQLite backend");
@@ -374,15 +374,15 @@ pub(crate) fn prepare_gc_evidence_unit(
                         "digest GC database key or timestamp is invalid",
                     ));
                 }
-                if record.range_start().date_naive() < cutoff.date_naive()
+                if record.range_start().utc_date() < cutoff.utc_date()
                     && record.retention_through() < cutoff
                 {
                     if !next.digest_statistics_truncated {
-                        next.expired_days.insert(record.range_start().date_naive());
+                        next.expired_days.insert(record.range_start().utc_date());
                     }
                     deletion.push(row);
                 } else if !next.digest_statistics_truncated {
-                    next.retained_days.insert(record.range_start().date_naive());
+                    next.retained_days.insert(record.range_start().utc_date());
                 }
                 if next.expired_days.len() + next.retained_days.len() > MAX_DAY_STATISTICS {
                     // Statistics must never pin retention behind a huge marker.
@@ -535,7 +535,7 @@ pub(crate) fn prepare_gc_evidence_unit(
                                 ));
                             }
                             job.seen_count += 1;
-                            job.seen_days.insert(record.occurred_at().date_naive());
+                            job.seen_days.insert(record.occurred_at().utc_date());
                             if job.seen_count > MAX_FACT_GENERATION_RECORDS
                                 || job.seen_count > job.expected.record_count
                             {
@@ -545,7 +545,7 @@ pub(crate) fn prepare_gc_evidence_unit(
                             }
                             if record.occurred_at() >= cutoff {
                                 job.retained_count += 1;
-                                job.retained_days.insert(record.occurred_at().date_naive());
+                                job.retained_days.insert(record.occurred_at().utc_date());
                                 job.retained_bytes = job
                                     .retained_bytes
                                     .checked_add(row.payload.len() as u64)
@@ -658,12 +658,12 @@ pub(crate) fn prepare_gc_evidence_unit(
                     .ok_or_else(|| {
                         invalid_data("staged fact batch has no central staging timestamp")
                     })?;
-                let timestamp: DateTime<Utc> = serde_json::from_slice(&timestamp_bytes)
+                let timestamp: UtcTimestamp = serde_json::from_slice(&timestamp_bytes)
                     .map_err(|e| invalid_data(e.to_string()))?;
                 if timestamp
                     < trusted_at
                         .checked_sub_signed(Duration::hours(FACT_STAGING_TTL_HOURS))
-                        .unwrap_or(DateTime::<Utc>::MIN_UTC)
+                        .unwrap_or(UtcTimestamp::MIN)
                 {
                     let publication_key = staged_key(
                         store,

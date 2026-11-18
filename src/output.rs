@@ -2,7 +2,6 @@ use std::collections::BTreeSet;
 use std::fmt::Write;
 
 use anyhow::Result;
-use chrono::Utc;
 use serde_json::Value;
 
 use crate::api_cost::{format_api_cost_amount, format_api_equivalent_cost};
@@ -10,6 +9,7 @@ use crate::domain::{
     ApiCostAmount, Confidence, LimitWindow, Provenance, Snapshot, TokenUsage, WindowAnalysis,
     terminal_safe_text,
 };
+use crate::time::UtcTimestamp;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OutputFormat {
@@ -853,7 +853,7 @@ fn reset_label(window: &LimitWindow) -> String {
     let Some(reset) = window.resets_at else {
         return "unknown".to_string();
     };
-    let remaining = reset - Utc::now();
+    let remaining = reset - UtcTimestamp::now();
     if remaining.num_seconds() <= 0 {
         return "due".to_string();
     }

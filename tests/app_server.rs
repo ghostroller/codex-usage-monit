@@ -9,7 +9,6 @@ use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::time::Instant;
 
-use chrono::{TimeZone, Utc};
 use codex_usage_monit::app_server::{
     fetch_account_snapshot, parse_account_usage_result, parse_rate_limit_reset_credits_result,
     parse_rate_limits_result,
@@ -20,6 +19,7 @@ use codex_usage_monit::domain::{Provenance, RateLimitResetCreditsSnapshot};
 use codex_usage_monit::rollout::RolloutCache;
 #[cfg(unix)]
 use codex_usage_monit::snapshot::collect_snapshot_cached;
+use codex_usage_monit::time::{Duration as SignedDuration, UtcTimestamp};
 use pretty_assertions::assert_eq;
 use serde_json::json;
 
@@ -65,7 +65,7 @@ fn with_mock_codex<T>(script: &str, run: impl FnOnce(&std::path::Path, OsString)
 
 #[test]
 fn parses_multi_bucket_rate_limits_and_prefers_the_keyed_view() {
-    let as_of = Utc.with_ymd_and_hms(2026, 7, 12, 4, 30, 0).unwrap();
+    let as_of = UtcTimestamp::from_utc(2026, 7, 12, 4, 30, 0).unwrap();
     let result = json!({
         "rateLimits": {
             "limitId": "legacy",
@@ -126,7 +126,7 @@ fn parses_multi_bucket_rate_limits_and_prefers_the_keyed_view() {
 
 #[test]
 fn parses_legacy_rate_limit_and_millisecond_reset_timestamp() {
-    let as_of = Utc.with_ymd_and_hms(2026, 7, 12, 4, 30, 0).unwrap();
+    let as_of = UtcTimestamp::from_utc(2026, 7, 12, 4, 30, 0).unwrap();
     let response = json!({
         "id": 2,
         "result": {
@@ -160,7 +160,7 @@ fn parses_legacy_rate_limit_and_millisecond_reset_timestamp() {
 
 #[test]
 fn parses_rate_limit_reset_credits_with_provenance_and_timestamp() {
-    let as_of = Utc.with_ymd_and_hms(2026, 7, 12, 4, 30, 0).unwrap();
+    let as_of = UtcTimestamp::from_utc(2026, 7, 12, 4, 30, 0).unwrap();
     let credits = parse_rate_limit_reset_credits_result(
         &json!({
             "id": 2,
@@ -228,7 +228,7 @@ fn parses_rate_limit_reset_credits_with_provenance_and_timestamp() {
 
 #[test]
 fn distinguishes_unavailable_empty_and_truncated_reset_credit_details() {
-    let as_of = Utc.with_ymd_and_hms(2026, 7, 12, 4, 30, 0).unwrap();
+    let as_of = UtcTimestamp::from_utc(2026, 7, 12, 4, 30, 0).unwrap();
     let unavailable = parse_rate_limit_reset_credits_result(
         &json!({
             "rateLimitResetCredits": { "availableCount": 2, "credits": null }
@@ -277,7 +277,7 @@ fn distinguishes_unavailable_empty_and_truncated_reset_credit_details() {
 
 #[test]
 fn rejects_malformed_rate_limit_reset_credit_details_with_field_context() {
-    let as_of = Utc.with_ymd_and_hms(2026, 7, 12, 4, 30, 0).unwrap();
+    let as_of = UtcTimestamp::from_utc(2026, 7, 12, 4, 30, 0).unwrap();
     let malformed = [
         (
             json!(true),
@@ -343,7 +343,7 @@ fn rejects_malformed_rate_limit_reset_credit_details_with_field_context() {
 
 #[test]
 fn parses_reset_credit_timestamps_as_strict_unix_seconds() {
-    let as_of = Utc.with_ymd_and_hms(2026, 7, 12, 4, 30, 0).unwrap();
+    let as_of = UtcTimestamp::from_utc(2026, 7, 12, 4, 30, 0).unwrap();
     let credits = parse_rate_limit_reset_credits_result(
         &json!({
             "rateLimitResetCredits": {
@@ -361,9 +361,11 @@ fn parses_reset_credit_timestamps_as_strict_unix_seconds() {
     )
     .unwrap()
     .unwrap();
+    let granted_at = credits.credits.as_ref().unwrap()[0].granted_at;
+    assert_eq!(granted_at.timestamp(), 1_783_834_200_123);
     assert_eq!(
-        credits.credits.as_ref().unwrap()[0].granted_at.timestamp(),
-        1_783_834_200_123
+        serde_json::to_value(granted_at).unwrap(),
+        json!("+58497-06-15T04:02:03Z")
     );
 
     for (timestamp, expected) in [
@@ -404,7 +406,7 @@ fn parses_reset_credit_timestamps_as_strict_unix_seconds() {
 
 #[test]
 fn rejects_invalid_rate_limit_reset_credit_counts_with_field_context() {
-    let as_of = Utc.with_ymd_and_hms(2026, 7, 12, 4, 30, 0).unwrap();
+    let as_of = UtcTimestamp::from_utc(2026, 7, 12, 4, 30, 0).unwrap();
     let invalid_counts = [
         None,
         Some(json!(null)),
@@ -468,7 +470,7 @@ fn parses_account_usage_numbers_and_nullable_buckets() {
 
 #[test]
 fn rejects_malformed_payloads_with_field_context() {
-    let as_of = Utc.with_ymd_and_hms(2026, 7, 12, 4, 30, 0).unwrap();
+    let as_of = UtcTimestamp::from_utc(2026, 7, 12, 4, 30, 0).unwrap();
     let error = parse_rate_limits_result(
         &json!({
             "rateLimits": {
@@ -722,7 +724,7 @@ printf '%s\n' '{"id":3,"error":{"code":-32601,"message":"usage disabled"}}'
         let mut cache = RolloutCache::new();
 
         let result = collect_snapshot_cached(&config, None, true, &mut cache);
-        let collection_completed_at = Utc::now();
+        let collection_completed_at = UtcTimestamp::now();
 
         assert_eq!(result.snapshot.limits.len(), 1);
         assert_eq!(result.snapshot.limits[0].limit_id, "codex");
@@ -914,8 +916,8 @@ while IFS= read -r ignored; do :; done
 #[cfg(unix)]
 #[test]
 fn optional_usage_eof_does_not_degrade_snapshot_health() {
-    let primary_reset = (Utc::now() + chrono::Duration::hours(2)).timestamp();
-    let weekly_reset = (Utc::now() + chrono::Duration::days(5)).timestamp();
+    let primary_reset = (UtcTimestamp::now() + SignedDuration::hours(2)).timestamp();
+    let weekly_reset = (UtcTimestamp::now() + SignedDuration::days(5)).timestamp();
     let script = r#"#!/bin/sh
 IFS= read -r initialize || exit 111
 printf '%s\n' '{"id":1,"result":{"userAgent":"mock"}}'

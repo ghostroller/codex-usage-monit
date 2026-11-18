@@ -1,8 +1,9 @@
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
-use chrono::{DateTime, FixedOffset, NaiveDateTime, Utc};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use jiff::civil::DateTime as CivilDateTime;
+use jiff::tz::Offset;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
@@ -11,6 +12,7 @@ use ratatui::style::{Color, Modifier};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::super::*;
+use crate::time::UtcTimestamp;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum ControlId {
@@ -136,7 +138,7 @@ pub(super) struct HarnessState {
     pub(super) summary_grain: SummaryGrain,
     pub(super) summary_metric: SummaryMetric,
     pub(super) summary_show_all_projects: bool,
-    pub(super) summary_inspected_date: Option<NaiveDateTime>,
+    pub(super) summary_inspected_date: Option<CivilDateTime>,
     pub(super) summary_selected_id: Option<String>,
     pub(super) summary_offset: usize,
     pub(super) quit_confirmation: bool,
@@ -360,9 +362,9 @@ impl TuiHarness {
         self.render_at(self.app.snapshot.as_of);
     }
 
-    pub(super) fn render_at(&mut self, now: DateTime<Utc>) {
+    pub(super) fn render_at(&mut self, now: UtcTimestamp) {
         let app = &mut self.app;
-        self.rendered_buffer = with_test_display_offset(FixedOffset::east_opt(0).unwrap(), || {
+        self.rendered_buffer = with_test_display_offset(Offset::UTC, || {
             self.terminal
                 .draw(|frame| super::super::render_at(frame, app, now))
                 .expect("test frame must render")

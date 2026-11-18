@@ -9,7 +9,6 @@ use std::sync::atomic::AtomicBool;
 use std::time::SystemTime;
 
 use anyhow::{Context, Result, bail, ensure};
-use chrono::{DateTime, Utc};
 
 use crate::app_server::session_management::{
     ManagedThread, SessionManagementClient, SharedEndpointIdentity, is_missing_thread,
@@ -19,6 +18,7 @@ use crate::config::CollectConfig;
 use crate::deleted_sessions::{self, DeletedSessionRecord, DeletionStatus};
 use crate::domain::{TaskStatus, TokenUsage, TurnStatus};
 use crate::rollout::{SessionCaptureRoots, SessionUsageCapture, capture_session_usage};
+use crate::time::UtcTimestamp;
 
 #[cfg(all(test, unix))]
 #[path = "session_delete/protocol_tests.rs"]
@@ -28,10 +28,10 @@ mod protocol_tests;
 pub(crate) struct PreparedSessionDeletion {
     pub(crate) root_thread_id: String,
     pub(crate) thread_ids: Vec<String>,
-    pub(crate) captured_at: DateTime<Utc>,
+    pub(crate) captured_at: UtcTimestamp,
     pub(crate) total_tokens: TokenUsage,
     selected_root: String,
-    capture_boundary: DateTime<Utc>,
+    capture_boundary: UtcTimestamp,
     binding: LocalBinding,
     threads: Vec<ManagedThread>,
     capture: SessionUsageCapture,
@@ -204,7 +204,7 @@ fn reconcile_with_client(
                 &receipt.operation_id,
                 &receipt.thread_id,
                 DeletionStatus::Deleted,
-                Utc::now(),
+                UtcTimestamp::now(),
             )?;
             confirmed.push(receipt.thread_id.clone());
         }
@@ -246,7 +246,7 @@ fn prepare_with_client(
         .map(|thread| thread.id.clone())
         .collect::<Vec<_>>();
     let targets = thread_ids.iter().cloned().collect::<HashSet<_>>();
-    let captured_at = Utc::now();
+    let captured_at = UtcTimestamp::now();
     let capture = capture_session_usage(config, &targets, captured_at, &AtomicBool::new(false))?;
     validate_capture(&threads, &capture)?;
     ensure!(
@@ -340,7 +340,7 @@ fn execute_with_client(
                 &prepared.operation_id,
                 id,
                 DeletionStatus::Failed,
-                Utc::now(),
+                UtcTimestamp::now(),
             )?;
         }
         return Err(error).context("logs changed before deletion; no delete request was sent");
@@ -379,7 +379,7 @@ fn execute_with_client(
             &prepared.operation_id,
             id,
             status,
-            Utc::now(),
+            UtcTimestamp::now(),
         )
         .context("deletion was attempted, but its journal outcome could not be committed")?;
     }
@@ -553,7 +553,7 @@ fn validate_uuid(value: &str) -> Result<()> {
 #[cfg(test)]
 pub(crate) fn prepared_session_deletion_for_test(
     thread_id: &str,
-    captured_at: DateTime<Utc>,
+    captured_at: UtcTimestamp,
 ) -> PreparedSessionDeletion {
     PreparedSessionDeletion {
         root_thread_id: thread_id.to_owned(),
@@ -583,7 +583,7 @@ pub(crate) fn prepared_session_deletion_for_test(
 mod tests {
     use std::io::Write;
 
-    use chrono::Duration;
+    use crate::time::Duration;
     use serde_json::json;
 
     use super::*;
@@ -720,7 +720,7 @@ mod tests {
             deleted_sessions_dir: Some(directory.path().join("ledger")),
             ..CollectConfig::default()
         };
-        let now = Utc::now() - Duration::minutes(10);
+        let now = UtcTimestamp::now() - Duration::minutes(10);
         let mut threads = BTreeMap::new();
         for (id, parent, directory) in [
             (ROOT, None, "sessions"),
@@ -1113,7 +1113,7 @@ mod tests {
             fs::OpenOptions::new().append(true).open(path).unwrap(),
             "{}",
             json!({
-                "timestamp":Utc::now()-Duration::seconds(1),"type":"event_msg",
+                "timestamp":UtcTimestamp::now()-Duration::seconds(1),"type":"event_msg",
                 "payload":{"type":"task_started","turn_id":"new-unfinished-turn","thread_id":ROOT}
             })
         )

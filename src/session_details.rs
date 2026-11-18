@@ -11,7 +11,6 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
@@ -21,6 +20,7 @@ use crate::bounded_io::{BoundedLine, read_bounded_line};
 use crate::domain::{
     AgentInteraction, AgentInteractionKind, RolloutDataset, TokenUsage, terminal_safe_text,
 };
+use crate::time::UtcTimestamp;
 
 const MAX_DISCOVERY_ENTRIES: usize = 50_000;
 const MAX_OWNER_PROBES: usize = 512;
@@ -487,7 +487,7 @@ pub(crate) struct DetailMessage {
     pub(crate) role: String,
     // Only the exact-turn Message preview can expose retained user content.
     pub(crate) text: String,
-    pub(crate) timestamp: Option<DateTime<Utc>>,
+    pub(crate) timestamp: Option<UtcTimestamp>,
     pub(crate) turn_id: Option<String>,
     pub(crate) phase: Option<String>,
 }
@@ -500,14 +500,14 @@ pub(crate) struct DetailTool {
     pub(crate) output: Option<String>,
     pub(crate) exit_code: Option<i64>,
     pub(crate) duration_ms: Option<u64>,
-    pub(crate) timestamp: Option<DateTime<Utc>>,
+    pub(crate) timestamp: Option<UtcTimestamp>,
     pub(crate) turn_id: Option<String>,
     pub(crate) test_command: bool,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct DetailUsage {
-    pub(crate) timestamp: Option<DateTime<Utc>>,
+    pub(crate) timestamp: Option<UtcTimestamp>,
     pub(crate) turn_id: Option<String>,
     pub(crate) model: Option<String>,
     pub(crate) service_tier: Option<String>,
@@ -518,7 +518,7 @@ pub(crate) struct DetailUsage {
 #[derive(Clone, Debug)]
 pub(crate) struct DetailEvidence {
     pub(crate) text: String,
-    pub(crate) timestamp: Option<DateTime<Utc>>,
+    pub(crate) timestamp: Option<UtcTimestamp>,
     pub(crate) turn_id: Option<String>,
 }
 
@@ -1376,7 +1376,7 @@ fn append_text(lines: &mut DetailLines, text: &str) {
     lines.extend(text.lines().map(str::to_owned));
 }
 
-fn time_label(time: Option<DateTime<Utc>>) -> String {
+fn time_label(time: Option<UtcTimestamp>) -> String {
     time.map(|time| time.to_rfc3339())
         .unwrap_or_else(|| "time unrecorded".into())
 }
@@ -1409,7 +1409,7 @@ pub(crate) fn load_session_details_at(
     thread_id: &str,
     turn_id: Option<&str>,
     redact_content: bool,
-    as_of: Option<DateTime<Utc>>,
+    as_of: Option<UtcTimestamp>,
     cancelled: &AtomicBool,
 ) -> SessionDetails {
     load_session_details_in_range(
@@ -1428,8 +1428,8 @@ pub(crate) fn load_session_details_in_range(
     thread_id: &str,
     turn_id: Option<&str>,
     redact_content: bool,
-    starts_at: Option<DateTime<Utc>>,
-    as_of: Option<DateTime<Utc>>,
+    starts_at: Option<UtcTimestamp>,
+    as_of: Option<UtcTimestamp>,
     cancelled: &AtomicBool,
 ) -> SessionDetails {
     load_session_details_inner(
@@ -1451,8 +1451,8 @@ pub(crate) fn load_session_details_with_preview_in_range(
     codex_home: &Path,
     target: &MessagePreviewReadTarget<'_>,
     redact_content: bool,
-    starts_at: Option<DateTime<Utc>>,
-    as_of: Option<DateTime<Utc>>,
+    starts_at: Option<UtcTimestamp>,
+    as_of: Option<UtcTimestamp>,
     cancelled: &AtomicBool,
 ) -> SessionDetails {
     load_session_details_inner(
@@ -1475,8 +1475,8 @@ fn load_session_details_inner(
     thread_id: &str,
     selection: DetailReadSelection<'_>,
     redact_content: bool,
-    starts_at: Option<DateTime<Utc>>,
-    as_of: Option<DateTime<Utc>>,
+    starts_at: Option<UtcTimestamp>,
+    as_of: Option<UtcTimestamp>,
     cancelled: &AtomicBool,
 ) -> SessionDetails {
     let mut result = SessionDetails {
@@ -1568,7 +1568,7 @@ fn load_session_details_inner(
         result.warn("No accessible local rollout was found; remote and expired history contain no message bodies.");
     }
     if !cancelled.load(Ordering::Relaxed) {
-        let cutoff = as_of.unwrap_or_else(Utc::now);
+        let cutoff = as_of.unwrap_or_else(UtcTimestamp::now);
         let dataset =
             crate::rollout::load_detail_usage(&files, codex_home, thread_id, cutoff, cancelled);
         add_usage_analysis(&mut result, dataset, thread_id, turn_id, starts_at, cutoff);
@@ -1674,11 +1674,11 @@ fn probe_owner(path: &Path) -> Option<String> {
 struct DetailParser<'a> {
     thread: &'a str,
     selected_turn: Option<&'a str>,
-    as_of: Option<DateTime<Utc>>,
-    starts_at: Option<DateTime<Utc>>,
+    as_of: Option<UtcTimestamp>,
+    starts_at: Option<UtcTimestamp>,
     result: SessionDetails,
     owner_seen: bool,
-    owner_created_at: Option<DateTime<Utc>>,
+    owner_created_at: Option<UtcTimestamp>,
     foreign: bool,
     content_bytes: usize,
     record_count: usize,
@@ -1696,7 +1696,7 @@ impl<'a> DetailParser<'a> {
     fn new(
         thread: &'a str,
         selected_turn: Option<&'a str>,
-        as_of: Option<DateTime<Utc>>,
+        as_of: Option<UtcTimestamp>,
         result: SessionDetails,
     ) -> Self {
         Self {
@@ -2010,7 +2010,7 @@ impl<'a> DetailParser<'a> {
         role: &str,
         text: String,
         turn: Option<String>,
-        time: Option<DateTime<Utc>>,
+        time: Option<UtcTimestamp>,
         phase: Option<String>,
         origin: DetailMessageOrigin<'_>,
     ) {
@@ -2191,7 +2191,7 @@ impl<'a> DetailParser<'a> {
         }
     }
 
-    fn message(&mut self, payload: &Value, turn: Option<String>, time: Option<DateTime<Utc>>) {
+    fn message(&mut self, payload: &Value, turn: Option<String>, time: Option<UtcTimestamp>) {
         let role = string(payload, &["role"]).unwrap_or("unknown");
         if !matches!(role, "user" | "assistant") {
             return;
@@ -2219,12 +2219,7 @@ impl<'a> DetailParser<'a> {
         }
     }
 
-    fn event_message(
-        &mut self,
-        payload: &Value,
-        turn: Option<String>,
-        time: Option<DateTime<Utc>>,
-    ) {
+    fn event_message(&mut self, payload: &Value, turn: Option<String>, time: Option<UtcTimestamp>) {
         let role = if string(payload, &["type"]) == Some("user_message") {
             "user"
         } else {
@@ -2243,7 +2238,7 @@ impl<'a> DetailParser<'a> {
         }
     }
 
-    fn completed_item(&mut self, item: &Value, turn: Option<String>, time: Option<DateTime<Utc>>) {
+    fn completed_item(&mut self, item: &Value, turn: Option<String>, time: Option<UtcTimestamp>) {
         let kind = string(item, &["type"]).unwrap_or("");
         match kind {
             "UserMessage" | "user_message" | "AgentMessage" | "agent_message" => {
@@ -2314,7 +2309,7 @@ impl<'a> DetailParser<'a> {
         }
     }
 
-    fn tool_call(&mut self, payload: &Value, turn: Option<String>, time: Option<DateTime<Utc>>) {
+    fn tool_call(&mut self, payload: &Value, turn: Option<String>, time: Option<UtcTimestamp>) {
         let Some(call_id) = string(payload, &["call_id", "callId", "id"]) else {
             return;
         };
@@ -2365,7 +2360,7 @@ impl<'a> DetailParser<'a> {
         });
     }
 
-    fn tool_output(&mut self, payload: &Value, turn: Option<String>, time: Option<DateTime<Utc>>) {
+    fn tool_output(&mut self, payload: &Value, turn: Option<String>, time: Option<UtcTimestamp>) {
         let Some(call_id) = string(payload, &["call_id", "callId", "id"]) else {
             return;
         };
@@ -2422,7 +2417,7 @@ impl<'a> DetailParser<'a> {
         }
     }
 
-    fn completed_tool(&mut self, item: &Value, turn: Option<String>, time: Option<DateTime<Utc>>) {
+    fn completed_tool(&mut self, item: &Value, turn: Option<String>, time: Option<UtcTimestamp>) {
         let Some(id) = string(item, &["call_id", "callId", "id"]) else {
             return;
         };
@@ -2449,7 +2444,7 @@ impl<'a> DetailParser<'a> {
         }
     }
 
-    fn native_usage(&mut self, payload: &Value, turn: Option<String>, time: Option<DateTime<Utc>>) {
+    fn native_usage(&mut self, payload: &Value, turn: Option<String>, time: Option<UtcTimestamp>) {
         if string(payload, &["thread_id", "threadId"]) != Some(self.thread)
             || !self.accept_turn(turn.as_deref())
         {
@@ -2522,7 +2517,7 @@ impl<'a> DetailParser<'a> {
         &mut self,
         payload: &Value,
         turn: Option<&str>,
-        time: Option<DateTime<Utc>>,
+        time: Option<UtcTimestamp>,
     ) {
         if self.result.redacted
             || !self
@@ -2577,7 +2572,7 @@ impl<'a> DetailParser<'a> {
         }
     }
 
-    fn usage_sample(&mut self, payload: &Value, turn: Option<String>, time: Option<DateTime<Utc>>) {
+    fn usage_sample(&mut self, payload: &Value, turn: Option<String>, time: Option<UtcTimestamp>) {
         let Some(info) = payload.get("info") else {
             return;
         };
@@ -2688,11 +2683,10 @@ fn value_text(value: &Value) -> String {
         .map(str::to_owned)
         .unwrap_or_else(|| value.to_string())
 }
-fn timestamp(value: &Value) -> Option<DateTime<Utc>> {
+fn timestamp(value: &Value) -> Option<UtcTimestamp> {
     value
         .as_str()
-        .and_then(|text| DateTime::parse_from_rfc3339(text).ok())
-        .map(|time| time.with_timezone(&Utc))
+        .and_then(|text| UtcTimestamp::parse_from_rfc3339(text).ok())
 }
 
 fn content_text(payload: &Value) -> Option<String> {
@@ -3147,8 +3141,8 @@ fn add_usage_analysis(
     dataset: RolloutDataset,
     thread_id: &str,
     turn_id: Option<&str>,
-    starts_at: Option<DateTime<Utc>>,
-    as_of: DateTime<Utc>,
+    starts_at: Option<UtcTimestamp>,
+    as_of: UtcTimestamp,
 ) {
     let source_partial = result.source_discovery_partial
         || !dataset.warnings.is_empty()
@@ -3159,7 +3153,7 @@ fn add_usage_analysis(
         result.warn(warning);
     }
     let in_range =
-        |time: DateTime<Utc>| time <= as_of && starts_at.is_none_or(|starts_at| time >= starts_at);
+        |time: UtcTimestamp| time <= as_of && starts_at.is_none_or(|starts_at| time >= starts_at);
     let mut calls: Vec<_> = dataset
         .calls
         .into_iter()
@@ -3400,7 +3394,7 @@ fn add_current_git(result: &mut SessionDetails, cancelled: &AtomicBool) {
             "Current Git checked at".into(),
             format!(
                 "{}; current workspace state, not a turn result",
-                Utc::now().to_rfc3339()
+                UtcTimestamp::now().to_rfc3339()
             ),
         );
     }
@@ -4239,9 +4233,7 @@ mod tests {
 
     #[test]
     fn session_details_frozen_snapshot_excludes_future_and_undated_records() {
-        let cutoff = DateTime::parse_from_rfc3339("2026-10-04T02:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
+        let cutoff = UtcTimestamp::parse_from_rfc3339("2026-10-04T02:00:00Z").unwrap();
         let mut parser = DetailParser::new("thread", None, Some(cutoff), SessionDetails::default());
         parser.record(&record("session_meta", json!({"id":"thread"})));
         parser.record(&json!({"type":"event_msg","timestamp":"2026-10-04T03:00:00Z","payload":{"type":"user_message","message":"future"}}));
@@ -4301,11 +4293,7 @@ mod tests {
     #[test]
     fn session_details_range_keeps_configuration_but_excludes_earlier_bodies() {
         let mut parser = parser(None);
-        parser.starts_at = Some(
-            DateTime::parse_from_rfc3339("2026-10-04T02:00:00Z")
-                .unwrap()
-                .with_timezone(&Utc),
-        );
+        parser.starts_at = Some(UtcTimestamp::parse_from_rfc3339("2026-10-04T02:00:00Z").unwrap());
         parser.record(&record(
             "turn_context",
             json!({"turn_id":"one","model":"gpt-5.6-sol","approval_policy":"on-request"}),
@@ -4355,9 +4343,7 @@ mod tests {
             &text,
         )
         .unwrap();
-        let cutoff = DateTime::parse_from_rfc3339("2026-10-04T02:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
+        let cutoff = UtcTimestamp::parse_from_rfc3339("2026-10-04T02:00:00Z").unwrap();
         let result = load_session_details_at(
             root.path(),
             "thread",
@@ -4406,7 +4392,7 @@ mod tests {
             "thread",
             None,
             None,
-            Utc::now(),
+            UtcTimestamp::now(),
         );
         assert!(
             result
@@ -4624,9 +4610,7 @@ mod tests {
         assert_eq!(redacted.files_read, 0);
         assert!(redacted.attachments.is_empty());
 
-        let cutoff = DateTime::parse_from_rfc3339("2026-10-04T02:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
+        let cutoff = UtcTimestamp::parse_from_rfc3339("2026-10-04T02:00:00Z").unwrap();
         let mut future = DetailParser::new("thread", None, Some(cutoff), SessionDetails::default());
         future.record(&record("session_meta", json!({"id":"thread"})));
         future.record(&json!({"type":"response_item","timestamp":"2026-10-04T03:00:00Z","payload":attachment}));

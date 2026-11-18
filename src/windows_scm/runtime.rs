@@ -112,7 +112,7 @@ fn log_failure(receipt: &MachineReceipt, message: &str) {
         &receipt.recorder.status_file.with_extension("scm.log"),
     ) {
         let _ = file.seek(SeekFrom::End(0));
-        let _ = writeln!(file, "{} {message}", Utc::now());
+        let _ = writeln!(file, "{} {message}", UtcTimestamp::now());
     }
 }
 
@@ -216,7 +216,7 @@ fn supervise(receipt: &MachineReceipt, handle: &ServiceStatusHandle) -> Result<u
     if let Some(path) = &receipt.recorder.environment_path {
         command.env("PATH", path);
     }
-    let prepared = Utc::now();
+    let prepared = UtcTimestamp::now();
     let child = process::spawn(&command, &log).context("machine_recorder_start_failed")?;
     let deadline = Instant::now() + Duration::from_secs(90);
     let mut ready = false;
@@ -272,7 +272,7 @@ fn heartbeat_matches(
     status: &crate::service::RecorderStatusFile,
     pid: u32,
     build: &str,
-    prepared: DateTime<Utc>,
+    prepared: UtcTimestamp,
 ) -> bool {
     status.pid == pid
         && status.build_id.as_deref() == Some(build)
@@ -289,7 +289,7 @@ mod tests {
     use super::*;
     #[test]
     fn scm_readiness_rejects_stale_wrong_pid_and_unpersisted_status() {
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         let mut status = crate::service::RecorderStatusFile::started(now, "history".into());
         status.pid = 42;
         status.bind_source_aware_v2(2).unwrap();
@@ -303,7 +303,7 @@ mod tests {
             &status,
             42,
             &build,
-            now + chrono::Duration::seconds(1)
+            now + crate::time::Duration::seconds(1)
         ));
     }
 }

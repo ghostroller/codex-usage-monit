@@ -12,7 +12,6 @@ use std::fmt;
 use std::io::{self, Write};
 use std::num::NonZeroU64;
 
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -26,6 +25,7 @@ use crate::remote_protocol::{
     RemoteUsageBucketChange, RemoteUsageBucketMutation, SourceGeneration,
 };
 use crate::source_history::RedactionProfile;
+use crate::time::UtcTimestamp;
 
 const MAX_JOURNAL_RECORD_BYTES: usize = 1024 * 1024;
 const MAX_JOURNAL_PAGE_ENTRIES: usize = 4096;
@@ -49,15 +49,15 @@ const BUCKET_MINUTES: i64 = 15;
 pub enum RemoteDeltaJournalRecord {
     QuotaDay(crate::remote_quota::RemoteQuotaDay),
     UsageBucket {
-        starts_at: DateTime<Utc>,
+        starts_at: UtcTimestamp,
         mutation: RemoteUsageBucketMutation,
     },
     SessionDigest {
         thread_id: crate::source_model::ThreadId,
-        range_start: DateTime<Utc>,
-        range_end: DateTime<Utc>,
-        changed_at: DateTime<Utc>,
-        retention_through: DateTime<Utc>,
+        range_start: UtcTimestamp,
+        range_end: UtcTimestamp,
+        changed_at: UtcTimestamp,
+        retention_through: UtcTimestamp,
         mutation: RemoteSessionDigestMutation,
     },
 }
@@ -92,7 +92,7 @@ pub struct RemoteDeltaJournalPageInputs {
     pub source: SourceGeneration,
     pub redaction_profile: RedactionProfile,
     pub revisions: ProtocolRevisions,
-    pub observed_at: DateTime<Utc>,
+    pub observed_at: UtcTimestamp,
     pub coverage: RemoteDeltaCoverage,
     pub live: Option<RemoteLiveState>,
     pub stats: RemoteDeltaStats,
@@ -940,7 +940,7 @@ fn invalid_data(message: impl Into<String>) -> io::Error {
 mod tests {
     use std::num::{NonZeroU32, NonZeroU64};
 
-    use chrono::{Duration, TimeZone};
+    use crate::time::Duration;
     use tempfile::tempdir;
 
     use super::*;
@@ -957,10 +957,8 @@ mod tests {
 
     const NODE: &str = "node-0123456789abcdef0123456789abcdef";
 
-    fn at(hour: u32, minute: u32) -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 8, 30, hour, minute, 0)
-            .single()
-            .unwrap()
+    fn at(hour: u32, minute: u32) -> UtcTimestamp {
+        UtcTimestamp::from_utc(2026, 8, 30, hour, minute, 0).unwrap()
     }
 
     fn nonzero32(value: u32) -> NonZeroU32 {
@@ -1020,10 +1018,7 @@ mod tests {
         }
     }
 
-    fn bucket_record(
-        starts_at: DateTime<Utc>,
-        key: ObservedProjectKey,
-    ) -> RemoteDeltaJournalRecord {
+    fn bucket_record(starts_at: UtcTimestamp, key: ObservedProjectKey) -> RemoteDeltaJournalRecord {
         RemoteDeltaJournalRecord::UsageBucket {
             starts_at,
             mutation: RemoteUsageBucketMutation::Upsert(Box::new(RemoteUsageBucket {
@@ -1102,14 +1097,14 @@ mod tests {
         }
     }
 
-    fn tombstone_bucket(starts_at: DateTime<Utc>) -> RemoteDeltaJournalRecord {
+    fn tombstone_bucket(starts_at: UtcTimestamp) -> RemoteDeltaJournalRecord {
         RemoteDeltaJournalRecord::UsageBucket {
             starts_at,
             mutation: RemoteUsageBucketMutation::Tombstone,
         }
     }
 
-    fn inputs(from: DateTime<Utc>, to: DateTime<Utc>) -> RemoteDeltaJournalPageInputs {
+    fn inputs(from: UtcTimestamp, to: UtcTimestamp) -> RemoteDeltaJournalPageInputs {
         let requested_range = ExportRange { from, to };
         RemoteDeltaJournalPageInputs {
             source: source(),
@@ -1668,8 +1663,8 @@ mod tests {
     fn assert_decode_error_contains_with_range(
         change: RemoteExportChange,
         expected: &str,
-        from: DateTime<Utc>,
-        to: DateTime<Utc>,
+        from: UtcTimestamp,
+        to: UtcTimestamp,
     ) {
         let directory = tempdir().unwrap();
         let store = RemoteExportStateStore::new(

@@ -20,7 +20,6 @@ use crate::source_history::{
     SourceHistoryRemoteGenerationId, SourceKind, SourceMetadata,
 };
 use crate::source_identity::NodeId;
-use chrono::TimeZone;
 use ratatui::backend::TestBackend;
 
 mod backfill_memory;
@@ -49,8 +48,8 @@ fn summary_estimate_formats_credit_rate_equivalents_instead_of_raw_units() {
 
 #[test]
 fn summary_api_chart_marks_a_non_aligned_range_start_as_a_lower_bound() {
-    let starts_at = Utc::now();
-    let window = SummaryWindow::new(starts_at, starts_at + ChronoDuration::days(1)).unwrap();
+    let starts_at = UtcTimestamp::now();
+    let window = SummaryWindow::new(starts_at, starts_at + SignedDuration::days(1)).unwrap();
     let prepared = PreparedSummary {
         usage: UsageSummary {
             window,
@@ -86,14 +85,10 @@ fn summary_daily_coverage_distinguishes_complete_partial_and_missing_days() {
         "known zero-value days need a visible state distinct from missing days"
     );
 
-    let date = NaiveDate::from_ymd_opt(2026, 8, 28).unwrap();
+    let date = Date::new(2026, 8, 28).unwrap();
     let window = SummaryWindow::new(
-        DateTime::parse_from_rfc3339("2026-08-28T00:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc),
-        DateTime::parse_from_rfc3339("2026-08-29T00:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc),
+        UtcTimestamp::parse_from_rfc3339("2026-08-28T00:00:00Z").unwrap(),
+        UtcTimestamp::parse_from_rfc3339("2026-08-29T00:00:00Z").unwrap(),
     )
     .unwrap();
     let mut prepared = PreparedSummary {
@@ -122,7 +117,7 @@ fn summary_daily_coverage_distinguishes_complete_partial_and_missing_days() {
         hourly_coverage: BTreeMap::new(),
         partial_reasons: Vec::new(),
     };
-    with_test_display_offset(FixedOffset::east_opt(0).unwrap(), || {
+    with_test_display_offset(Offset::UTC, || {
         assert_eq!(
             prepared.daily_state(
                 date,
@@ -139,7 +134,7 @@ fn summary_daily_coverage_distinguishes_complete_partial_and_missing_days() {
         .get_mut(&date)
         .unwrap()
         .covered_buckets = 48;
-    with_test_display_offset(FixedOffset::east_opt(0).unwrap(), || {
+    with_test_display_offset(Offset::UTC, || {
         assert_eq!(
             prepared.daily_state(
                 date,
@@ -156,7 +151,7 @@ fn summary_daily_coverage_distinguishes_complete_partial_and_missing_days() {
         .get_mut(&date)
         .unwrap()
         .covered_buckets = 0;
-    with_test_display_offset(FixedOffset::east_opt(0).unwrap(), || {
+    with_test_display_offset(Offset::UTC, || {
         assert_eq!(
             prepared.daily_state(
                 date,
@@ -171,14 +166,12 @@ fn summary_daily_coverage_distinguishes_complete_partial_and_missing_days() {
 
 #[test]
 fn rolling_summary_ranges_mark_first_and_last_local_days_partial() {
-    with_test_display_offset(FixedOffset::east_opt(8 * 60 * 60).unwrap(), || {
-        let query_now = DateTime::parse_from_rfc3339("2026-08-28T06:51:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
+    with_test_display_offset(Offset::from_seconds(8 * 60 * 60).unwrap(), || {
+        let query_now = UtcTimestamp::parse_from_rfc3339("2026-08-28T06:51:00Z").unwrap();
         for (days, expected_dates) in [(7, 8), (30, 31)] {
             let window = SummaryWindow::new(
-                query_now - ChronoDuration::days(days),
-                query_now + ChronoDuration::nanoseconds(1),
+                query_now - SignedDuration::days(days),
+                query_now + SignedDuration::nanoseconds(1),
             )
             .unwrap();
             let mut daily_coverage = expected_summary_daily_coverage(window);
@@ -245,10 +238,8 @@ fn rolling_summary_ranges_mark_first_and_last_local_days_partial() {
 
 #[test]
 fn summary_chart_grains_preserve_hourly_totals_and_project_composition() {
-    let starts_at = DateTime::parse_from_rfc3339("2026-08-28T00:00:00Z")
-        .unwrap()
-        .with_timezone(&Utc);
-    let ends_at = starts_at + ChronoDuration::days(1);
+    let starts_at = UtcTimestamp::parse_from_rfc3339("2026-08-28T00:00:00Z").unwrap();
+    let ends_at = starts_at + SignedDuration::days(1);
     let window = SummaryWindow::new(starts_at, ends_at).unwrap();
     let mut total = SummaryMetrics::default();
     let mut alpha_total = SummaryMetrics::default();
@@ -258,7 +249,7 @@ fn summary_chart_grains_preserve_hourly_totals_and_project_composition() {
     let mut beta_hours = Vec::new();
     let mut hourly_coverage = BTreeMap::new();
     for hour in 0_i64..24 {
-        let starts_at = (window.starts_at + ChronoDuration::hours(hour)).naive_utc();
+        let starts_at = (window.starts_at + SignedDuration::hours(hour)).naive_utc();
         let alpha = SummaryMetrics {
             token_usage: TokenUsage {
                 input_tokens: (hour + 1) as u64,
@@ -348,7 +339,7 @@ fn summary_chart_grains_preserve_hourly_totals_and_project_composition() {
         partial_reasons: Vec::new(),
     };
 
-    with_test_display_offset(FixedOffset::east_opt(0).unwrap(), || {
+    with_test_display_offset(Offset::UTC, || {
         for (grain, expected_buckets) in [
             (SummaryGrain::Day, 1),
             (SummaryGrain::Hours12, 2),
@@ -392,28 +383,16 @@ fn summary_chart_grains_preserve_hourly_totals_and_project_composition() {
 
 #[test]
 fn summary_hourly_coverage_handles_dst_fallback_and_spring_forward() {
-    let local_hour = |timestamp: DateTime<Utc>, offset_hours: i64| {
-        let local = (timestamp + ChronoDuration::hours(offset_hours)).naive_utc();
-        local
-            .date()
-            .and_hms_opt(local.hour(), 0, 0)
-            .expect("a shifted UTC timestamp remains a valid local hour")
+    let new_york = TimeZone::get("America/New_York").unwrap();
+    let local_hour = |timestamp: UtcTimestamp| {
+        let local = new_york.to_datetime(timestamp.as_jiff());
+        local.date().at(local.hour(), 0, 0, 0)
     };
 
-    let fallback_start = Utc.with_ymd_and_hms(2026, 11, 1, 4, 0, 0).unwrap();
-    let fallback_transition = Utc.with_ymd_and_hms(2026, 11, 1, 6, 0, 0).unwrap();
+    let fallback_start = UtcTimestamp::from_utc(2026, 11, 1, 4, 0, 0).unwrap();
     let fallback = expected_summary_coverage(
-        SummaryWindow::new(fallback_start, fallback_start + ChronoDuration::hours(4)).unwrap(),
-        |timestamp| {
-            local_hour(
-                timestamp,
-                if timestamp < fallback_transition {
-                    -4
-                } else {
-                    -5
-                },
-            )
-        },
+        SummaryWindow::new(fallback_start, fallback_start + SignedDuration::hours(4)).unwrap(),
+        local_hour,
     );
     assert_eq!(
         fallback
@@ -424,28 +403,14 @@ fn summary_hourly_coverage_handles_dst_fallback_and_spring_forward() {
     );
     assert_eq!(fallback.len(), 3);
     assert_eq!(
-        fallback[&NaiveDate::from_ymd_opt(2026, 11, 1)
-            .unwrap()
-            .and_hms_opt(1, 0, 0)
-            .unwrap()]
-            .expected_buckets,
+        fallback[&Date::constant(2026, 11, 1).at(1, 0, 0, 0)].expected_buckets,
         8
     );
 
-    let spring_start = Utc.with_ymd_and_hms(2026, 3, 8, 5, 0, 0).unwrap();
-    let spring_transition = Utc.with_ymd_and_hms(2026, 3, 8, 7, 0, 0).unwrap();
+    let spring_start = UtcTimestamp::from_utc(2026, 3, 8, 5, 0, 0).unwrap();
     let spring = expected_summary_coverage(
-        SummaryWindow::new(spring_start, spring_start + ChronoDuration::hours(4)).unwrap(),
-        |timestamp| {
-            local_hour(
-                timestamp,
-                if timestamp < spring_transition {
-                    -5
-                } else {
-                    -4
-                },
-            )
-        },
+        SummaryWindow::new(spring_start, spring_start + SignedDuration::hours(4)).unwrap(),
+        local_hour,
     );
     assert_eq!(
         spring
@@ -455,14 +420,7 @@ fn summary_hourly_coverage_handles_dst_fallback_and_spring_forward() {
         16
     );
     assert_eq!(spring.len(), 4);
-    assert!(
-        !spring.contains_key(
-            &NaiveDate::from_ymd_opt(2026, 3, 8)
-                .unwrap()
-                .and_hms_opt(2, 0, 0)
-                .unwrap()
-        )
-    );
+    assert!(!spring.contains_key(&Date::constant(2026, 3, 8).at(2, 0, 0, 0)));
 }
 
 #[test]
@@ -484,16 +442,14 @@ fn summary_backfill_is_local_one_time_work_and_detects_incomplete_30d_history() 
         SUMMARY_HISTORY_DAYS
     );
 
-    let now = DateTime::parse_from_rfc3339("2026-08-28T12:07:00Z")
-        .unwrap()
-        .with_timezone(&Utc);
-    let mut starts_at = now - ChronoDuration::days(30) + ChronoDuration::minutes(8);
+    let now = UtcTimestamp::parse_from_rfc3339("2026-08-28T12:07:00Z").unwrap();
+    let mut starts_at = now - SignedDuration::days(30) + SignedDuration::minutes(8);
     let mut buckets = Vec::new();
     while starts_at <= now {
         buckets.push(LocalHalfHourBucket {
             starts_at,
-            ends_at: starts_at + ChronoDuration::minutes(15),
-            sampled_at: starts_at + ChronoDuration::minutes(15),
+            ends_at: starts_at + SignedDuration::minutes(15),
+            sampled_at: starts_at + SignedDuration::minutes(15),
             token_usage: TokenUsage::default(),
             estimated_cost_units: 0,
             api_long_context_extra_cost_units: Some(0),
@@ -506,7 +462,7 @@ fn summary_backfill_is_local_one_time_work_and_detects_incomplete_30d_history() 
             project_groups: Vec::new(),
             partial_reasons: Vec::new(),
         });
-        starts_at += ChronoDuration::minutes(15);
+        starts_at += SignedDuration::minutes(15);
     }
     let complete = HistoryData {
         half_hour_buckets: (buckets).into(),
@@ -516,17 +472,17 @@ fn summary_backfill_is_local_one_time_work_and_detects_incomplete_30d_history() 
 
     let mut failed_but_covered = complete.clone();
     failed_but_covered.summary_backfill_attempt_complete = Some(false);
-    failed_but_covered.summary_backfill_attempted_at = Some(now - ChronoDuration::days(1));
+    failed_but_covered.summary_backfill_attempted_at = Some(now - SignedDuration::days(1));
     assert!(!summary_history_backfill_needed(&failed_but_covered, now));
     failed_but_covered.summary_backfill_attempted_at =
-        Some(now - ChronoDuration::days(SUMMARY_BACKFILL_RETRY_DAYS + 1));
+        Some(now - SignedDuration::days(SUMMARY_BACKFILL_RETRY_DAYS + 1));
     assert!(summary_history_backfill_needed(&failed_but_covered, now));
-    failed_but_covered.summary_backfill_attempted_at = Some(now + ChronoDuration::days(1));
+    failed_but_covered.summary_backfill_attempted_at = Some(now + SignedDuration::days(1));
     assert!(!summary_history_backfill_needed(&failed_but_covered, now));
 
     assert!(summary_history_backfill_needed(
         &complete,
-        now + ChronoDuration::days(31)
+        now + SignedDuration::days(31)
     ));
 
     let mut incomplete = complete;
@@ -536,12 +492,12 @@ fn summary_backfill_is_local_one_time_work_and_detects_incomplete_30d_history() 
     assert!(!summary_history_backfill_needed(&incomplete, now));
     assert!(summary_history_backfill_needed(
         &incomplete,
-        now + ChronoDuration::days(SUMMARY_BACKFILL_RETRY_DAYS + 1)
+        now + SignedDuration::days(SUMMARY_BACKFILL_RETRY_DAYS + 1)
     ));
     incomplete.read_only = true;
     assert!(!summary_history_backfill_needed(
         &incomplete,
-        now + ChronoDuration::days(SUMMARY_BACKFILL_RETRY_DAYS + 1)
+        now + SignedDuration::days(SUMMARY_BACKFILL_RETRY_DAYS + 1)
     ));
 }
 
@@ -743,7 +699,7 @@ fn remote_window_projection_keeps_the_larger_total_when_token_breakdowns_cross()
 
 #[test]
 fn remote_model_projection_reconciles_live_tail_api_total_without_fabricating_model_attribution() {
-    let as_of = Utc.with_ymd_and_hms(2026, 8, 31, 12, 0, 0).unwrap();
+    let as_of = UtcTimestamp::from_utc(2026, 8, 31, 12, 0, 0).unwrap();
     let history_cost = ApiCostAmount {
         minimum_pico_usd: PicoUsd::new(100),
         maximum_pico_usd: PicoUsd::new(100),
@@ -758,7 +714,7 @@ fn remote_model_projection_reconciles_live_tail_api_total_without_fabricating_mo
             window: Some(WindowDescriptor {
                 limit_id: "codex".to_owned(),
                 label: "5h".to_owned(),
-                starts_at: as_of - ChronoDuration::hours(5),
+                starts_at: as_of - SignedDuration::hours(5),
                 ends_at: as_of,
                 used_percent: 31.0,
             }),
@@ -944,12 +900,8 @@ fn summary_backfill_scan_completeness_rejects_ambiguous_or_partial_sources() {
 
 #[test]
 fn summary_backfill_persists_only_buckets_with_usage_evidence() {
-    let now = DateTime::parse_from_rfc3339("2026-08-28T12:07:00Z")
-        .unwrap()
-        .with_timezone(&Utc);
-    let first_usage = DateTime::parse_from_rfc3339("2026-08-26T10:15:00Z")
-        .unwrap()
-        .with_timezone(&Utc);
+    let now = UtcTimestamp::parse_from_rfc3339("2026-08-28T12:07:00Z").unwrap();
+    let first_usage = UtcTimestamp::parse_from_rfc3339("2026-08-26T10:15:00Z").unwrap();
     let call = UsageCall {
         timestamp: first_usage,
         thread_id: "thread-with-evidence".to_string(),
@@ -965,7 +917,7 @@ fn summary_backfill_persists_only_buckets_with_usage_evidence() {
         },
         request_usage_exact: true,
     };
-    let coverage_starts_at = now - ChronoDuration::days(SUMMARY_HISTORY_DAYS);
+    let coverage_starts_at = now - SignedDuration::days(SUMMARY_HISTORY_DAYS);
     let mut observation = HistoryObservation::from_sources_with_tasks_and_coverage(
         now,
         &[call],
@@ -1012,8 +964,8 @@ fn summary_backfill_persists_only_buckets_with_usage_evidence() {
     let mut spark_only = HistoryObservation {
         half_hour_buckets: vec![LocalHalfHourBucket {
             starts_at: first_usage,
-            ends_at: first_usage + ChronoDuration::minutes(15),
-            sampled_at: first_usage + ChronoDuration::minutes(15),
+            ends_at: first_usage + SignedDuration::minutes(15),
+            sampled_at: first_usage + SignedDuration::minutes(15),
             token_usage: TokenUsage::default(),
             estimated_cost_units: 0,
             api_long_context_extra_cost_units: Some(0),
@@ -1293,7 +1245,7 @@ fn history_source_query_worker_panic_clears_loading_and_can_be_retried() {
         &mut app,
         completion,
         now,
-        Utc::now()
+        UtcTimestamp::now()
     ));
 
     assert!(!app.worker_running);
@@ -1327,7 +1279,7 @@ fn summary_backfill_worker_panic_clears_both_running_flags_and_sets_cooldown() {
     app.summary_backfill_running = true;
     app.summary_backfill_pending = false;
     let now = Instant::now();
-    let observed_at = Utc::now();
+    let observed_at = UtcTimestamp::now();
 
     let completion = caught_refresh_worker_panic(RefreshWorkerFailure::SummaryBackfill);
     assert!(completion.summary_backfill);
@@ -1346,7 +1298,7 @@ fn summary_backfill_worker_panic_clears_both_running_flags_and_sets_cooldown() {
     assert!(!summary_history_backfill_needed(&app.history, observed_at));
     assert!(summary_history_backfill_needed(
         &app.history,
-        observed_at + ChronoDuration::days(SUMMARY_BACKFILL_RETRY_DAYS + 1)
+        observed_at + SignedDuration::days(SUMMARY_BACKFILL_RETRY_DAYS + 1)
     ));
 }
 
@@ -1361,7 +1313,7 @@ fn account_refresh_worker_panic_uses_account_and_worker_backoff() {
         &mut app,
         completion,
         now,
-        Utc::now()
+        UtcTimestamp::now()
     ));
 
     assert!(!app.worker_running);
@@ -1387,7 +1339,7 @@ fn local_refresh_worker_panic_is_bounded_by_the_shared_retry_deadline() {
         &mut app,
         completion,
         now,
-        Utc::now()
+        UtcTimestamp::now()
     ));
 
     assert!(!app.worker_running);
@@ -1643,7 +1595,7 @@ fn reset_credit_fetch_status_distinguishes_initial_load_and_retry() {
     app.snapshot.sources = vec![SourceStatus {
         source: "app_server".to_string(),
         status: "stale".to_string(),
-        as_of: Utc::now(),
+        as_of: UtcTimestamp::now(),
         message: Some("no cached account snapshot".to_string()),
     }];
 
@@ -1655,7 +1607,7 @@ fn reset_credit_fetch_status_distinguishes_initial_load_and_retry() {
         available_count: 2,
         credits: None,
         provenance: Provenance::ServerSnapshot,
-        as_of: Utc::now(),
+        as_of: UtcTimestamp::now(),
     });
     assert_eq!(app.reset_credit_fetch_status(now), None);
 
@@ -1663,7 +1615,7 @@ fn reset_credit_fetch_status_distinguishes_initial_load_and_retry() {
         available_count: 0,
         credits: None,
         provenance: Provenance::ServerSnapshot,
-        as_of: Utc::now(),
+        as_of: UtcTimestamp::now(),
     });
     assert_eq!(app.reset_credit_fetch_status(now), None);
 
@@ -1695,7 +1647,7 @@ fn incomplete_account_refreshes_back_off_before_returning_to_normal_period() {
             available_count: 2,
             credits: None,
             provenance: Provenance::ServerSnapshot,
-            as_of: Utc::now(),
+            as_of: UtcTimestamp::now(),
         }),
         false,
     );
@@ -1724,7 +1676,7 @@ fn complete_account_refresh_uses_normal_period_and_resets_backoff() {
             available_count: 0,
             credits: Some(Vec::new()),
             provenance: Provenance::ServerSnapshot,
-            as_of: Utc::now(),
+            as_of: UtcTimestamp::now(),
         }),
         false,
     );
@@ -1746,7 +1698,7 @@ fn complete_account_refresh_uses_normal_period_and_resets_backoff() {
             available_count: 2,
             credits: Some(Vec::new()),
             provenance: Provenance::ServerSnapshot,
-            as_of: Utc::now(),
+            as_of: UtcTimestamp::now(),
         }),
         false,
     );
@@ -1755,9 +1707,9 @@ fn complete_account_refresh_uses_normal_period_and_resets_backoff() {
 
 #[test]
 fn bootstrap_history_defers_server_points_online_and_preserves_them_offline() {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let bucket = LocalHalfHourBucket {
-        starts_at: now - ChronoDuration::minutes(15),
+        starts_at: now - SignedDuration::minutes(15),
         ends_at: now,
         sampled_at: now,
         token_usage: TokenUsage {
@@ -1781,7 +1733,7 @@ fn bootstrap_history_defers_server_points_online_and_preserves_them_offline() {
             observed_at: now,
             limit_id: "codex".to_string(),
             duration_mins: 10_080,
-            resets_at: now + ChronoDuration::days(1),
+            resets_at: now + SignedDuration::days(1),
             used_percent: 25.0,
             remaining_percent: 75.0,
             provenance: Provenance::Stale,
@@ -1789,7 +1741,7 @@ fn bootstrap_history_defers_server_points_online_and_preserves_them_offline() {
         half_hour_buckets: vec![bucket.clone()],
         weekly_local_points: vec![WeeklyLocalPoint {
             observed_at: now,
-            resets_at: now + ChronoDuration::days(1),
+            resets_at: now + SignedDuration::days(1),
             token_usage: TokenUsage {
                 total_tokens: 42,
                 ..TokenUsage::default()
@@ -1863,7 +1815,7 @@ fn account_refresh_result(
     reset_credits_partial: bool,
 ) -> CollectionResult {
     let app = mouse_test_app(0);
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let limits = (app_server_status != "error")
         .then(|| LimitBucket {
             limit_id: "codex".to_string(),
@@ -1902,7 +1854,7 @@ fn account_refresh_result(
 }
 
 fn interaction_test_app(task_count: usize, turns_per_task: usize) -> App {
-    let now = chrono::Utc::now();
+    let now = UtcTimestamp::now();
     let tasks = (0..task_count)
         .map(|index| TaskRecord {
             thread_id: format!("task-thread-{index}"),
@@ -1939,8 +1891,8 @@ fn interaction_test_app(task_count: usize, turns_per_task: usize) -> App {
                 reasoning_effort: Some("high".to_string()),
                 service_tier: None,
                 message_preview: Some(format!("message {task_index}/{turn_index}")),
-                started_at: Some(now - chrono::Duration::seconds(turn_index as i64 + 2)),
-                completed_at: Some(now - chrono::Duration::seconds(turn_index as i64)),
+                started_at: Some(now - SignedDuration::seconds(turn_index as i64 + 2)),
+                completed_at: Some(now - SignedDuration::seconds(turn_index as i64)),
                 duration_ms: Some(2_000),
                 status: TurnStatus::Completed,
                 token_usage: TokenUsage {
@@ -2000,10 +1952,10 @@ fn interaction_test_app(task_count: usize, turns_per_task: usize) -> App {
 }
 
 fn remote_live_fixture(
-    received_at: DateTime<Utc>,
+    received_at: UtcTimestamp,
     range_complete: bool,
 ) -> SourceRemoteLiveSnapshot {
-    let captured_at = received_at - ChronoDuration::minutes(1);
+    let captured_at = received_at - SignedDuration::minutes(1);
     let node_id: NodeId = "node-0123456789abcdef0123456789abcdef".parse().unwrap();
     SourceRemoteLiveSnapshot {
         source: SourceMetadata::new(node_id.clone(), SourceKind::Ssh, "dev-server").unwrap(),
@@ -2022,7 +1974,7 @@ fn remote_live_fixture(
                 parent_thread_id: None,
                 observed_project_key: None,
                 title_preview: None,
-                created_at: Some(captured_at - ChronoDuration::minutes(1)),
+                created_at: Some(captured_at - SignedDuration::minutes(1)),
                 updated_at: captured_at,
                 status: TaskStatus::Running,
                 token_usage: RemoteTokenUsage {
@@ -2068,17 +2020,17 @@ fn merged_overview_tasks_sort_globally_while_tree_rows_keep_recent_subtrees_toge
     let mut app = interaction_test_app(2, 0);
     let as_of = app.snapshot.as_of;
     app.snapshot.tasks[0].updated_at = Some(as_of);
-    app.snapshot.tasks[1].updated_at = Some(as_of - ChronoDuration::minutes(2));
+    app.snapshot.tasks[1].updated_at = Some(as_of - SignedDuration::minutes(2));
     app.local_snapshot = app.snapshot.clone();
 
-    let mut state = remote_live_fixture(as_of + ChronoDuration::minutes(5), true);
+    let mut state = remote_live_fixture(as_of + SignedDuration::minutes(5), true);
     let node = state.source.source_id().as_str().to_owned();
     let remote_parent = remote_live_thread_id(&node, "remote-thread");
-    state.snapshot.tasks[0].updated_at = as_of - ChronoDuration::minutes(2);
+    state.snapshot.tasks[0].updated_at = as_of - SignedDuration::minutes(2);
     let mut child = state.snapshot.tasks[0].clone();
     child.thread_id = "remote-child".parse().unwrap();
     child.parent_thread_id = Some("remote-thread".parse().unwrap());
-    child.updated_at = as_of - ChronoDuration::minutes(1);
+    child.updated_at = as_of - SignedDuration::minutes(1);
     state.snapshot.tasks.push(child);
     let remote_child = remote_live_thread_id(&node, "remote-child");
 
@@ -2087,7 +2039,7 @@ fn merged_overview_tasks_sort_globally_while_tree_rows_keep_recent_subtrees_toge
         &mut snapshot,
         &[state],
         &RemoteOverviewHistory::default(),
-        as_of + ChronoDuration::minutes(6),
+        as_of + SignedDuration::minutes(6),
     );
     assert_eq!(
         snapshot
@@ -2152,11 +2104,11 @@ fn remote_live_rebuild_preserves_selected_thread_and_scrolled_task_viewport() {
     let viewport_thread = app.snapshot.tasks[app.filtered_task_indices()[3]]
         .thread_id
         .clone();
-    let received_at = app.snapshot.as_of + ChronoDuration::minutes(2);
+    let received_at = app.snapshot.as_of + SignedDuration::minutes(2);
 
     assert!(app.replace_remote_live_states_at(
         vec![remote_live_fixture(received_at, true)],
-        received_at + ChronoDuration::minutes(1),
+        received_at + SignedDuration::minutes(1),
     ));
 
     assert_eq!(app.raw_selected_thread_id(), Some(selected_thread.as_str()));
@@ -2171,9 +2123,9 @@ fn remote_live_rebuild_preserves_selected_thread_and_scrolled_task_viewport() {
 fn unchanged_remote_live_state_crosses_stale_boundary_once_including_error_refreshes() {
     let mut app = interaction_test_app(0, 0);
     let local_as_of = app.snapshot.as_of;
-    let received_at = local_as_of + ChronoDuration::hours(1);
+    let received_at = local_as_of + SignedDuration::hours(1);
     let state = remote_live_fixture(received_at, true);
-    let fresh_at = received_at + ChronoDuration::minutes(1);
+    let fresh_at = received_at + SignedDuration::minutes(1);
 
     assert!(app.replace_remote_live_states_at(vec![state.clone()], fresh_at));
     assert_eq!(app.snapshot.as_of, local_as_of);
@@ -2186,10 +2138,10 @@ fn unchanged_remote_live_state_crosses_stale_boundary_once_including_error_refre
     assert_eq!(app.snapshot.turns[0].status, TurnStatus::InProgress);
     assert!(!app.replace_remote_live_states_at(
         vec![state.clone()],
-        received_at + ChronoDuration::minutes(15),
+        received_at + SignedDuration::minutes(15),
     ));
 
-    let stale_at = received_at + ChronoDuration::minutes(16);
+    let stale_at = received_at + SignedDuration::minutes(16);
     assert!(app.record_remote_live_load_error_at("disk busy".to_owned(), stale_at));
     assert_eq!(app.snapshot.sources[0].status, "stale");
     assert_eq!(app.snapshot.tasks[0].status, TaskStatus::Stale);
@@ -2202,51 +2154,51 @@ fn unchanged_remote_live_state_crosses_stale_boundary_once_including_error_refre
     );
     assert!(!app.record_remote_live_load_error_at(
         "disk busy".to_owned(),
-        stale_at + ChronoDuration::minutes(1),
+        stale_at + SignedDuration::minutes(1),
     ));
-    assert!(app.replace_remote_live_states_at(vec![state], stale_at + ChronoDuration::minutes(1),));
+    assert!(app.replace_remote_live_states_at(vec![state], stale_at + SignedDuration::minutes(1),));
     assert!(!has_remote_live_load_error(&app.snapshot));
     let unchanged = app.remote_live_states.clone();
-    assert!(!app.replace_remote_live_states_at(unchanged, stale_at + ChronoDuration::minutes(2),));
+    assert!(!app.replace_remote_live_states_at(unchanged, stale_at + SignedDuration::minutes(2),));
 }
 
 #[test]
 fn remote_live_partial_error_and_source_removal_restore_local_quality() {
     let mut app = interaction_test_app(0, 0);
     let local_as_of = app.snapshot.as_of;
-    let received_at = local_as_of + ChronoDuration::hours(1);
+    let received_at = local_as_of + SignedDuration::hours(1);
     let partial = remote_live_fixture(received_at, false);
 
     assert!(
-        app.replace_remote_live_states_at(vec![partial], received_at + ChronoDuration::minutes(1),)
+        app.replace_remote_live_states_at(vec![partial], received_at + SignedDuration::minutes(1),)
     );
     assert!(app.snapshot.partial);
     assert_eq!(app.snapshot.sources[0].status, "partial");
 
-    let complete = remote_live_fixture(received_at + ChronoDuration::minutes(2), true);
+    let complete = remote_live_fixture(received_at + SignedDuration::minutes(2), true);
     assert!(app.replace_remote_live_states_at(
         vec![complete.clone()],
-        received_at + ChronoDuration::minutes(3),
+        received_at + SignedDuration::minutes(3),
     ));
     assert!(!app.snapshot.partial);
     assert_eq!(app.snapshot.sources[0].status, "ok");
 
     assert!(app.record_remote_live_load_error_at(
         "temporarily unreadable".to_owned(),
-        received_at + ChronoDuration::minutes(4),
+        received_at + SignedDuration::minutes(4),
     ));
     assert!(app.snapshot.partial);
     // A successful read with identical state must clear the transient error
     // instead of taking the ordinary unchanged-state fast path.
     assert!(app.replace_remote_live_states_at(
         vec![complete],
-        received_at + ChronoDuration::minutes(5),
+        received_at + SignedDuration::minutes(5),
     ));
     assert!(!app.snapshot.partial);
     assert!(!has_remote_live_load_error(&app.snapshot));
 
     assert!(
-        app.replace_remote_live_states_at(Vec::new(), received_at + ChronoDuration::minutes(6),)
+        app.replace_remote_live_states_at(Vec::new(), received_at + SignedDuration::minutes(6),)
     );
     assert!(!app.snapshot.partial);
     assert!(app.snapshot.sources.is_empty());
@@ -2260,7 +2212,7 @@ fn collapsed_remote_subtree_uses_projected_window_tokens_not_live_cumulative_tok
     let mut app = interaction_test_app(1, 1);
     add_window_analysis(&mut app, WindowScope::Week, 100, 100.0);
     app.local_snapshot = app.snapshot.clone();
-    let received_at = app.snapshot.as_of + ChronoDuration::hours(1);
+    let received_at = app.snapshot.as_of + SignedDuration::hours(1);
     let mut state = remote_live_fixture(received_at, true);
     let node_id = state.source.source_id().as_str().to_owned();
     let parent_id = state.snapshot.tasks[0].thread_id.clone();
@@ -2281,7 +2233,7 @@ fn collapsed_remote_subtree_uses_projected_window_tokens_not_live_cumulative_tok
         .sort_by(|left, right| left.thread_id.as_str().cmp(right.thread_id.as_str()));
 
     assert!(
-        app.replace_remote_live_states_at(vec![state], received_at + ChronoDuration::minutes(1),)
+        app.replace_remote_live_states_at(vec![state], received_at + SignedDuration::minutes(1),)
     );
     let root_thread_id = remote_live_thread_id(&node_id, "remote-thread");
     let child_thread_id = remote_live_thread_id(&node_id, "remote-child");
@@ -2355,7 +2307,7 @@ fn collapsed_remote_subtree_uses_projected_window_tokens_not_live_cumulative_tok
     assert_eq!(usage.quota_confidence, Confidence::Unknown);
 }
 
-fn remote_overview_history_fixture(as_of: DateTime<Utc>) -> RemoteOverviewHistory {
+fn remote_overview_history_fixture(as_of: UtcTimestamp) -> RemoteOverviewHistory {
     let node: NodeId = "node-0123456789abcdef0123456789abcdef".parse().unwrap();
     let group = LocalProjectUsageGroup {
         thread_id: format!("remote-thread@{node}"),
@@ -2377,7 +2329,7 @@ fn remote_overview_history_fixture(as_of: DateTime<Utc>) -> RemoteOverviewHistor
     };
     let history = HistoryData {
         half_hour_buckets: (vec![LocalHalfHourBucket {
-            starts_at: as_of - ChronoDuration::minutes(15),
+            starts_at: as_of - SignedDuration::minutes(15),
             ends_at: as_of,
             sampled_at: as_of,
             token_usage: group.token_usage,
@@ -2401,7 +2353,7 @@ fn remote_overview_history_fixture(as_of: DateTime<Utc>) -> RemoteOverviewHistor
 #[test]
 fn remote_history_rebuild_preserves_selected_thread_and_scrolled_task_viewport() {
     let mut app = interaction_test_app(8, 1);
-    let old_updated_at = app.snapshot.as_of - ChronoDuration::hours(1);
+    let old_updated_at = app.snapshot.as_of - SignedDuration::hours(1);
     for task in &mut app.snapshot.tasks {
         task.updated_at = Some(old_updated_at);
     }
@@ -2434,9 +2386,9 @@ fn remote_history_and_live_overlay_are_idempotent_and_never_double_count() {
     add_window_analysis(&mut app, WindowScope::Week, 100, 100.0);
     app.local_snapshot = app.snapshot.clone();
     let history = remote_overview_history_fixture(app.snapshot.as_of);
-    let received_at = app.snapshot.as_of + ChronoDuration::minutes(1);
+    let received_at = app.snapshot.as_of + SignedDuration::minutes(1);
     let mut live = remote_live_fixture(received_at, true);
-    live.snapshot.tasks[0].updated_at = app.snapshot.as_of - ChronoDuration::minutes(5);
+    live.snapshot.tasks[0].updated_at = app.snapshot.as_of - SignedDuration::minutes(5);
 
     let mut snapshot = app.local_snapshot.clone();
     merge_remote_live_into_snapshot_at(
@@ -2524,7 +2476,7 @@ fn remote_history_synced_after_the_local_snapshot_is_visible_on_the_same_merge()
     let mut app = interaction_test_app(1, 1);
     add_window_analysis(&mut app, WindowScope::Week, 100, 100.0);
     app.local_snapshot = app.snapshot.clone();
-    let merge_at = app.snapshot.as_of + ChronoDuration::minutes(1);
+    let merge_at = app.snapshot.as_of + SignedDuration::minutes(1);
     let history = remote_overview_history_fixture(merge_at);
     let mut snapshot = app.local_snapshot.clone();
 
@@ -2584,7 +2536,7 @@ fn logical_remote_live_overlay_keeps_host_label_tree_and_single_parent() {
     ];
     let history_data = HistoryData {
         half_hour_buckets: (vec![LocalHalfHourBucket {
-            starts_at: as_of - ChronoDuration::minutes(15),
+            starts_at: as_of - SignedDuration::minutes(15),
             ends_at: as_of,
             sampled_at: as_of,
             token_usage: TokenUsage {
@@ -2611,7 +2563,7 @@ fn logical_remote_live_overlay_keeps_host_label_tree_and_single_parent() {
         [(node.clone(), "dev-server".to_owned())],
         as_of,
     );
-    let mut live = remote_live_fixture(as_of + ChronoDuration::minutes(1), true);
+    let mut live = remote_live_fixture(as_of + SignedDuration::minutes(1), true);
     live.snapshot.tasks[0].thread_id = "parent".parse().unwrap();
     let mut child = live.snapshot.tasks[0].clone();
     child.thread_id = "child".parse().unwrap();
@@ -2665,7 +2617,7 @@ fn logical_remote_live_overlay_keeps_host_label_tree_and_single_parent() {
 fn install_remote_sources_fixture(
     app: &mut App,
     directory: &Path,
-    now: DateTime<Utc>,
+    now: UtcTimestamp,
 ) -> (RemotesConfigStore, RemoteSyncHealthStore) {
     #[cfg(unix)]
     {
@@ -2711,16 +2663,16 @@ fn install_remote_sources_fixture(
                 response_bytes: 4_096,
                 completion: RemoteSyncCompletion::Complete,
             },
-            Some(now + ChronoDuration::minutes(1)),
+            Some(now + SignedDuration::minutes(1)),
         )
         .unwrap();
     health_store
         .record_failure(
             "lab",
             None,
-            now - ChronoDuration::minutes(2),
+            now - SignedDuration::minutes(2),
             RemoteSyncErrorCategory::Transport,
-            Some(now + ChronoDuration::minutes(3)),
+            Some(now + SignedDuration::minutes(3)),
         )
         .unwrap();
 
@@ -2747,7 +2699,7 @@ fn install_empty_remote_sources_fixture(app: &mut App, directory: &Path) -> Remo
     config_store
 }
 
-fn record_remote_bandwidth(app: &App, host_id: &str, recorded_at: DateTime<Utc>, bytes: usize) {
+fn record_remote_bandwidth(app: &App, host_id: &str, recorded_at: UtcTimestamp, bytes: usize) {
     let source = app
         .remote_sources
         .config
@@ -2778,19 +2730,19 @@ fn record_remote_bandwidth(app: &App, host_id: &str, recorded_at: DateTime<Utc>,
         .unwrap();
 }
 
-fn trend_history_fixture(now: DateTime<Utc>) -> HistoryData {
-    let five_hour_reset = now + ChronoDuration::hours(4);
-    let weekly_reset = now + ChronoDuration::days(3);
+fn trend_history_fixture(now: UtcTimestamp) -> HistoryData {
+    let five_hour_reset = now + SignedDuration::hours(4);
+    let weekly_reset = now + SignedDuration::days(3);
     let day_bounds = trend_day_bounds(now, 0);
     let bucket_starts = [
-        day_bounds[1] - ChronoDuration::hours(2),
-        day_bounds[1] - ChronoDuration::minutes(90),
-        day_bounds[1] - ChronoDuration::minutes(15),
+        day_bounds[1] - SignedDuration::hours(2),
+        day_bounds[1] - SignedDuration::minutes(90),
+        day_bounds[1] - SignedDuration::minutes(15),
     ];
     HistoryData {
         quota_points: (vec![
             QuotaPoint {
-                observed_at: now - ChronoDuration::hours(1),
+                observed_at: now - SignedDuration::hours(1),
                 limit_id: "codex".to_string(),
                 duration_mins: 300,
                 resets_at: five_hour_reset,
@@ -2808,7 +2760,7 @@ fn trend_history_fixture(now: DateTime<Utc>) -> HistoryData {
                 provenance: Provenance::ServerSnapshot,
             },
             QuotaPoint {
-                observed_at: now - ChronoDuration::days(1),
+                observed_at: now - SignedDuration::days(1),
                 limit_id: "codex".to_string(),
                 duration_mins: 10_080,
                 resets_at: weekly_reset,
@@ -2832,8 +2784,8 @@ fn trend_history_fixture(now: DateTime<Utc>) -> HistoryData {
             .enumerate()
             .map(|(index, starts_at)| LocalHalfHourBucket {
                 starts_at,
-                ends_at: starts_at + ChronoDuration::minutes(15),
-                sampled_at: now.min(starts_at + ChronoDuration::minutes(15)),
+                ends_at: starts_at + SignedDuration::minutes(15),
+                sampled_at: now.min(starts_at + SignedDuration::minutes(15)),
                 token_usage: TokenUsage {
                     total_tokens: u64::try_from(index + 1).unwrap() * 1_000,
                     ..TokenUsage::default()
@@ -3576,8 +3528,8 @@ fn add_window_analysis(
             window: Some(WindowDescriptor {
                 limit_id: "codex".to_string(),
                 label: scope.label().to_ascii_lowercase(),
-                starts_at: now - chrono::Duration::minutes(scope.duration_mins() - 60),
-                ends_at: now + chrono::Duration::hours(1),
+                starts_at: now - SignedDuration::minutes(scope.duration_mins() - 60),
+                ends_at: now + SignedDuration::hours(1),
                 used_percent: 23.0,
             }),
             local_token_usage: usage.token_usage,
@@ -3653,7 +3605,7 @@ fn set_window_entity_api_costs(
         .collect();
 }
 
-fn set_window_reset(app: &mut App, scope: WindowScope, reset_at: chrono::DateTime<chrono::Utc>) {
+fn set_window_reset(app: &mut App, scope: WindowScope, reset_at: UtcTimestamp) {
     add_window_analysis(app, scope, 100, 100.0);
     let window = app
         .snapshot
@@ -3663,15 +3615,12 @@ fn set_window_reset(app: &mut App, scope: WindowScope, reset_at: chrono::DateTim
         .and_then(|analysis| analysis.attribution.window.as_mut())
         .expect("window analysis");
     window.ends_at = reset_at;
-    window.starts_at = reset_at - chrono::Duration::minutes(scope.duration_mins());
+    window.starts_at = reset_at - SignedDuration::minutes(scope.duration_mins());
 }
 
-fn reset_credit(
-    now: chrono::DateTime<chrono::Utc>,
-    expires_at: Option<chrono::DateTime<chrono::Utc>>,
-) -> RateLimitResetCredit {
+fn reset_credit(now: UtcTimestamp, expires_at: Option<UtcTimestamp>) -> RateLimitResetCredit {
     RateLimitResetCredit {
-        granted_at: now - chrono::Duration::hours(1),
+        granted_at: now - SignedDuration::hours(1),
         expires_at,
         status: "available".to_string(),
         reset_type: "codexRateLimits".to_string(),
@@ -3712,8 +3661,8 @@ fn add_spark_window_analysis(app: &mut App, scope: WindowScope, total_tokens: u6
     let window = analysis.attribution.window.as_mut().unwrap();
     window.limit_id = "codex_bengalfox".to_string();
     window.used_percent = 7.0;
-    window.ends_at += chrono::Duration::minutes(30);
-    window.starts_at += chrono::Duration::minutes(30);
+    window.ends_at += SignedDuration::minutes(30);
+    window.starts_at += SignedDuration::minutes(30);
     analysis.attribution.local_token_usage = usage.token_usage;
     analysis.attribution.observed_delta_percent = 0.5;
     analysis.attribution.estimated_assigned_percent = 0.4;
@@ -3747,16 +3696,16 @@ fn quota_thresholds_are_distinct() {
 fn reset_expiry_reminder_uses_strict_weekly_boundary() {
     let mut app = interaction_test_app(1, 1);
     let now = app.snapshot.as_of;
-    let weekly_reset = now + chrono::Duration::days(4);
+    let weekly_reset = now + SignedDuration::days(4);
     set_window_reset(&mut app, WindowScope::Week, weekly_reset);
 
     for (expires_at, expected) in [
-        (Some(now - chrono::Duration::seconds(1)), false),
+        (Some(now - SignedDuration::seconds(1)), false),
         (Some(now), false),
-        (Some(now + chrono::Duration::seconds(1)), true),
-        (Some(weekly_reset - chrono::Duration::seconds(1)), true),
+        (Some(now + SignedDuration::seconds(1)), true),
+        (Some(weekly_reset - SignedDuration::seconds(1)), true),
         (Some(weekly_reset), false),
-        (Some(weekly_reset + chrono::Duration::seconds(1)), false),
+        (Some(weekly_reset + SignedDuration::seconds(1)), false),
         (None, false),
     ] {
         set_reset_credits(&mut app, 1, vec![reset_credit(now, expires_at)]);
@@ -3775,15 +3724,34 @@ fn reset_expiry_reminder_uses_strict_weekly_boundary() {
 }
 
 #[test]
-fn reset_expiry_gauge_alert_preserves_the_exact_expiry_at_narrow_widths() {
-    let now = chrono::Utc::now();
+fn reset_expiry_gauge_displays_exact_utc_outside_the_local_calendar() {
+    let expires_at = UtcTimestamp::from_timestamp(253_402_300_800, 0).unwrap();
+    let expected = "+10000-01-01T00:00:00+00:00";
+    assert_eq!(format_local_time(expires_at, "%H:%M"), expected);
+
     let reminder = ResetExpiryReminder {
-        expires_at: now + chrono::Duration::days(2) + chrono::Duration::seconds(47),
-        weekly_reset_at: now + chrono::Duration::days(4) + chrono::Duration::seconds(29),
+        expires_at,
+        weekly_reset_at: expires_at + SignedDuration::days(1),
     };
-    let local_expiry = reminder.expires_at.with_timezone(&Local);
-    let expected_date = local_expiry.format("%Y-%m-%d").to_string();
-    let expected_time = local_expiry.format("%H:%M:%S %:z").to_string();
+    assert_eq!(
+        reset_expiry_gauge_alert_lines(reminder, 18).concat(),
+        format!("! {expected}")
+    );
+}
+
+#[test]
+fn reset_expiry_gauge_alert_preserves_the_exact_expiry_at_narrow_widths() {
+    let now = UtcTimestamp::now();
+    let reminder = ResetExpiryReminder {
+        expires_at: now + SignedDuration::days(2) + SignedDuration::seconds(47),
+        weekly_reset_at: now + SignedDuration::days(4) + SignedDuration::seconds(29),
+    };
+    let local_expiry = reminder
+        .expires_at
+        .as_jiff()
+        .to_zoned_datetime(TimeZone::system());
+    let expected_date = local_expiry.strftime("%Y-%m-%d").to_string();
+    let expected_time = local_expiry.strftime("%H:%M:%S %:z").to_string();
 
     for width in [58, 38, 28, 18, 12, 1] {
         let lines = reset_expiry_gauge_alert_lines(reminder, width);
@@ -3808,19 +3776,19 @@ fn reset_expiry_gauge_alert_preserves_the_exact_expiry_at_narrow_widths() {
 fn reset_expiry_reminder_selects_the_earliest_reliable_available_credit() {
     let mut app = interaction_test_app(1, 1);
     let now = app.snapshot.as_of;
-    let weekly_reset = now + chrono::Duration::days(5);
-    let earliest = now + chrono::Duration::days(2);
+    let weekly_reset = now + SignedDuration::days(5);
+    let earliest = now + SignedDuration::days(2);
     set_window_reset(&mut app, WindowScope::Week, weekly_reset);
 
-    let mut wrong_status = reset_credit(now, Some(now + chrono::Duration::hours(1)));
+    let mut wrong_status = reset_credit(now, Some(now + SignedDuration::hours(1)));
     wrong_status.status = "redeeming".to_string();
-    let mut wrong_type = reset_credit(now, Some(now + chrono::Duration::hours(2)));
+    let mut wrong_type = reset_credit(now, Some(now + SignedDuration::hours(2)));
     wrong_type.reset_type = "futureResetType".to_string();
     let credits = vec![
-        reset_credit(now, Some(now - chrono::Duration::minutes(1))),
+        reset_credit(now, Some(now - SignedDuration::minutes(1))),
         reset_credit(now, None),
-        reset_credit(now, Some(weekly_reset + chrono::Duration::days(1))),
-        reset_credit(now, Some(now + chrono::Duration::days(3))),
+        reset_credit(now, Some(weekly_reset + SignedDuration::days(1))),
+        reset_credit(now, Some(now + SignedDuration::days(3))),
         reset_credit(now, Some(earliest)),
         wrong_status,
         wrong_type,
@@ -3863,7 +3831,7 @@ fn reset_expiry_reminder_selects_the_earliest_reliable_available_credit() {
 fn reset_expiry_reminder_requires_a_current_codex_week_window() {
     let mut app = interaction_test_app(1, 1);
     let now = app.snapshot.as_of;
-    let expires_at = now + chrono::Duration::days(1);
+    let expires_at = now + SignedDuration::days(1);
     set_reset_credits(&mut app, 1, vec![reset_credit(now, Some(expires_at))]);
 
     assert_eq!(reset_expiry_reminder(&app.snapshot), None);
@@ -3871,11 +3839,11 @@ fn reset_expiry_reminder_requires_a_current_codex_week_window() {
     set_window_reset(
         &mut app,
         WindowScope::FiveHours,
-        now + chrono::Duration::hours(2),
+        now + SignedDuration::hours(2),
     );
     assert_eq!(reset_expiry_reminder(&app.snapshot), None);
 
-    set_window_reset(&mut app, WindowScope::Week, now + chrono::Duration::days(4));
+    set_window_reset(&mut app, WindowScope::Week, now + SignedDuration::days(4));
     let weekly_index = app
         .snapshot
         .window_analyses
@@ -3909,7 +3877,7 @@ fn reset_expiry_reminder_requires_a_current_codex_week_window() {
         .window
         .as_mut()
         .unwrap()
-        .ends_at = now + chrono::Duration::days(4);
+        .ends_at = now + SignedDuration::days(4);
     app.snapshot.window_analyses[weekly_index]
         .partial_reasons
         .push("quota_window_stale".to_string());
@@ -3928,7 +3896,7 @@ fn overview_orders_codex_quota_windows_before_other_buckets() {
             primary: Some(LimitWindow::new(
                 0.0,
                 Some(10_080),
-                Some(now + chrono::Duration::days(7)),
+                Some(now + SignedDuration::days(7)),
             )),
             secondary: None,
             credits: None,
@@ -3943,12 +3911,12 @@ fn overview_orders_codex_quota_windows_before_other_buckets() {
             primary: Some(LimitWindow::new(
                 12.0,
                 Some(300),
-                Some(now + chrono::Duration::hours(5)),
+                Some(now + SignedDuration::hours(5)),
             )),
             secondary: Some(LimitWindow::new(
                 34.0,
                 Some(10_080),
-                Some(now + chrono::Duration::days(6)),
+                Some(now + SignedDuration::days(6)),
             )),
             credits: None,
             rate_limit_reached_type: None,
@@ -3962,7 +3930,7 @@ fn overview_orders_codex_quota_windows_before_other_buckets() {
             primary: Some(LimitWindow::new(
                 0.0,
                 Some(300),
-                Some(now + chrono::Duration::hours(4)),
+                Some(now + SignedDuration::hours(4)),
             )),
             secondary: None,
             credits: None,
@@ -4018,9 +3986,9 @@ fn weekly_gauge_renders_exact_reset_expiry_reminder() {
             let mut app = interaction_test_app(1, 1);
             app.theme = theme;
             let now = app.snapshot.as_of;
-            let five_hour_reset = now + chrono::Duration::hours(2) + chrono::Duration::seconds(13);
-            let weekly_reset = now + chrono::Duration::days(4) + chrono::Duration::seconds(29);
-            let expires_at = now + chrono::Duration::days(2) + chrono::Duration::seconds(47);
+            let five_hour_reset = now + SignedDuration::hours(2) + SignedDuration::seconds(13);
+            let weekly_reset = now + SignedDuration::days(4) + SignedDuration::seconds(29);
+            let expires_at = now + SignedDuration::days(2) + SignedDuration::seconds(47);
             set_window_reset(&mut app, WindowScope::FiveHours, five_hour_reset);
             set_window_reset(&mut app, WindowScope::Week, weekly_reset);
             set_reset_credits(&mut app, 1, vec![reset_credit(now, Some(expires_at))]);
@@ -4048,9 +4016,9 @@ fn weekly_gauge_renders_exact_reset_expiry_reminder() {
             let buffer = terminal.backend().buffer();
             let five_hour_text = buffer_rect_text(buffer, columns[0]);
             let weekly_text = buffer_rect_text(buffer, columns[1]);
-            let local_expiry = expires_at.with_timezone(&Local);
-            let expected_date = local_expiry.format("%Y-%m-%d").to_string();
-            let expected_time = local_expiry.format("%H:%M:%S %:z").to_string();
+            let local_expiry = expires_at.as_jiff().to_zoned_datetime(TimeZone::system());
+            let expected_date = local_expiry.strftime("%Y-%m-%d").to_string();
+            let expected_time = local_expiry.strftime("%H:%M:%S %:z").to_string();
 
             assert!(!five_hour_text.contains(&expected_date));
             assert!(!five_hour_text.contains(&expected_time));
@@ -4097,7 +4065,7 @@ fn weekly_gauge_renders_exact_reset_expiry_reminder() {
 
     let mut app = interaction_test_app(1, 1);
     let now = app.snapshot.as_of;
-    let weekly_reset = now + chrono::Duration::days(4);
+    let weekly_reset = now + SignedDuration::days(4);
     set_window_reset(&mut app, WindowScope::Week, weekly_reset);
     set_reset_credits(&mut app, 1, vec![reset_credit(now, Some(weekly_reset))]);
     app.snapshot.limits = vec![LimitBucket {
@@ -4131,9 +4099,9 @@ fn quota_labels_invert_inside_the_filled_gauge_including_reset_credit_warning() 
         let mut app = interaction_test_app(1, 1);
         app.theme = theme;
         let now = app.snapshot.as_of;
-        let five_hour_reset = now + chrono::Duration::hours(2);
-        let weekly_reset = now + chrono::Duration::days(4);
-        let expires_at = now + chrono::Duration::days(2);
+        let five_hour_reset = now + SignedDuration::hours(2);
+        let weekly_reset = now + SignedDuration::days(4);
+        let expires_at = now + SignedDuration::days(2);
         set_window_reset(&mut app, WindowScope::FiveHours, five_hour_reset);
         set_window_reset(&mut app, WindowScope::Week, weekly_reset);
         set_reset_credits(&mut app, 1, vec![reset_credit(now, Some(expires_at))]);
@@ -4228,9 +4196,9 @@ fn quota_labels_invert_inside_the_filled_gauge_including_reset_credit_warning() 
 fn reset_expiry_reminder_only_marks_the_matching_codex_weekly_gauge() {
     let mut app = interaction_test_app(1, 1);
     let now = app.snapshot.as_of;
-    let five_hour_reset = now + chrono::Duration::hours(2);
-    let weekly_reset = now + chrono::Duration::days(4);
-    let expires_at = now + chrono::Duration::days(2);
+    let five_hour_reset = now + SignedDuration::hours(2);
+    let weekly_reset = now + SignedDuration::days(4);
+    let expires_at = now + SignedDuration::days(2);
     set_window_reset(&mut app, WindowScope::FiveHours, five_hour_reset);
     set_window_reset(&mut app, WindowScope::Week, weekly_reset);
     set_reset_credits(&mut app, 1, vec![reset_credit(now, Some(expires_at))]);
@@ -4295,9 +4263,9 @@ fn reset_expiry_reminder_only_marks_the_matching_codex_weekly_gauge() {
 fn overview_keeps_reset_expiry_reminder_inside_the_quota_panel() {
     let mut app = interaction_test_app(1, 1);
     let now = app.snapshot.as_of;
-    let five_hour_reset = now + chrono::Duration::hours(2);
-    let weekly_reset = now + chrono::Duration::days(4);
-    let expires_at = now + chrono::Duration::days(2) + chrono::Duration::seconds(47);
+    let five_hour_reset = now + SignedDuration::hours(2);
+    let weekly_reset = now + SignedDuration::days(4);
+    let expires_at = now + SignedDuration::days(2) + SignedDuration::seconds(47);
     set_window_reset(&mut app, WindowScope::FiveHours, five_hour_reset);
     set_window_reset(&mut app, WindowScope::Week, weekly_reset);
     set_reset_credits(&mut app, 1, vec![reset_credit(now, Some(expires_at))]);
@@ -4416,7 +4384,7 @@ fn overview_keeps_app_server_failure_stable_across_local_only_refresh_state() {
         primary: Some(LimitWindow::new(
             25.0,
             Some(300),
-            Some(now + ChronoDuration::hours(2)),
+            Some(now + SignedDuration::hours(2)),
         )),
         secondary: None,
         credits: None,
@@ -4582,9 +4550,7 @@ fn saved_ui_state_restores_stable_menu_and_column_preferences_with_theme_overrid
         .insert("project:temporary".to_string());
     app.summary_selected_id = Some("project:temporary".to_string());
     app.summary_offset = 7;
-    app.summary_inspected_date = NaiveDate::from_ymd_opt(2026, 8, 29)
-        .unwrap()
-        .and_hms_opt(12, 0, 0);
+    app.summary_inspected_date = Some(Date::constant(2026, 8, 29).at(12, 0, 0, 0));
     assert_eq!(app.ui_state(), saved);
 
     app.apply_ui_state(&saved, Some(Theme::Dark));
@@ -4609,9 +4575,7 @@ fn summary_preferences_survive_store_round_trip_while_navigation_resets() {
         .insert("project:temporary".to_string());
     app.summary_selected_id = Some("project:temporary".to_string());
     app.summary_offset = 7;
-    app.summary_inspected_date = NaiveDate::from_ymd_opt(2026, 8, 29)
-        .unwrap()
-        .and_hms_opt(12, 0, 0);
+    app.summary_inspected_date = Some(Date::constant(2026, 8, 29).at(12, 0, 0, 0));
 
     assert!(store.save(&app.ui_state()).unwrap());
     let loaded = store.load();
@@ -4632,7 +4596,7 @@ fn summary_preferences_survive_store_round_trip_while_navigation_resets() {
 #[test]
 fn summary_and_trends_share_an_exact_persisted_source_selection() {
     let directory = tempfile::tempdir().unwrap();
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let mut app = interaction_test_app(1, 1);
     install_remote_sources_fixture(&mut app, directory.path(), now);
     let local_id: NodeId = "node-22222222222222222222222222222222".parse().unwrap();
@@ -4792,7 +4756,7 @@ fn source_controls_are_keyboard_styled_and_whole_label_clickable_in_compact_them
         app.history_local_source_id = Some(local_id.clone());
         let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
         terminal
-            .draw(|frame| render_at(frame, &mut app, Utc::now()))
+            .draw(|frame| render_at(frame, &mut app, UtcTimestamp::now()))
             .unwrap();
         let hitbox = app.history_source_control_hitbox;
         assert!(!hitbox.is_empty(), "{view:?} {theme:?} width={width}");
@@ -4833,9 +4797,7 @@ fn source_controls_are_keyboard_styled_and_whole_label_clickable_in_compact_them
 
 #[test]
 fn filtered_history_titles_name_the_scope_while_quota_is_explicitly_global() {
-    let now = DateTime::parse_from_rfc3339("2026-08-29T12:00:00Z")
-        .unwrap()
-        .with_timezone(&Utc);
+    let now = UtcTimestamp::parse_from_rfc3339("2026-08-29T12:00:00Z").unwrap();
     let local_id: NodeId = "node-22222222222222222222222222222222".parse().unwrap();
     let mut app = interaction_test_app(1, 1);
     app.history_local_source_id = Some(local_id.clone());
@@ -4876,7 +4838,7 @@ fn remote_summary_never_overlays_same_id_local_task_metadata() {
     app.snapshot.tasks[0].thread_id = "shared-thread".to_string();
     app.snapshot.tasks[0].title = "local title must not leak".to_string();
     app.snapshot.tasks[0].cwd = Some("/tmp/local-project".into());
-    let mut bucket = tui_runtime_test_bucket(now - ChronoDuration::minutes(15), 42);
+    let mut bucket = tui_runtime_test_bucket(now - SignedDuration::minutes(15), 42);
     bucket.project_groups[0] = LocalProjectUsageGroup {
         thread_id: "shared-thread".to_string(),
         project_id: Some("remote-project-id".to_string()),
@@ -4982,12 +4944,12 @@ fn every_available_estimate_is_marked_as_approximate() {
 
 #[test]
 fn attribution_summary_explains_the_credit_rate_weighted_codex_share_formula() {
-    let now = chrono::Utc::now();
+    let now = UtcTimestamp::now();
     let attribution = AttributionSummary {
         window: Some(WindowDescriptor {
             limit_id: "codex".to_string(),
             label: "week".to_string(),
-            starts_at: now - chrono::Duration::days(7),
+            starts_at: now - SignedDuration::days(7),
             ends_at: now,
             used_percent: 34.0,
         }),
@@ -5056,12 +5018,12 @@ fn models_panel_explains_missing_five_hour_with_weekly_data() {
         primary: Some(LimitWindow::new(
             23.0,
             Some(10_080),
-            Some(now + chrono::Duration::days(6)),
+            Some(now + SignedDuration::days(6)),
         )),
         secondary: Some(LimitWindow::new(
             5.0,
             Some(1_440),
-            Some(now + chrono::Duration::hours(20)),
+            Some(now + SignedDuration::hours(20)),
         )),
         credits: None,
         rate_limit_reached_type: None,
@@ -5082,8 +5044,8 @@ fn models_panel_distinguishes_an_empty_active_window() {
     app.snapshot.attribution.window = Some(WindowDescriptor {
         limit_id: "codex".to_string(),
         label: "5h".to_string(),
-        starts_at: now - chrono::Duration::hours(1),
-        ends_at: now + chrono::Duration::hours(4),
+        starts_at: now - SignedDuration::hours(1),
+        ends_at: now + SignedDuration::hours(4),
         used_percent: 0.0,
     });
 
@@ -5101,8 +5063,8 @@ fn models_panel_prioritizes_token_usage_and_reports_clipping() {
     app.snapshot.attribution.window = Some(WindowDescriptor {
         limit_id: "codex".to_string(),
         label: "5h".to_string(),
-        starts_at: now - chrono::Duration::hours(1),
-        ends_at: now + chrono::Duration::hours(4),
+        starts_at: now - SignedDuration::hours(1),
+        ends_at: now + SignedDuration::hours(4),
         used_percent: 10.0,
     });
     app.snapshot.attribution.local_token_usage = TokenUsage {
@@ -5484,8 +5446,8 @@ fn tui_ignores_legacy_five_hour_fields_without_a_codex_window() {
     app.snapshot.attribution.window = Some(WindowDescriptor {
         limit_id: "codex_bengalfox".to_string(),
         label: "5h".to_string(),
-        starts_at: now - chrono::Duration::hours(4),
-        ends_at: now + chrono::Duration::hours(1),
+        starts_at: now - SignedDuration::hours(4),
+        ends_at: now + SignedDuration::hours(1),
         used_percent: 50.0,
     });
     app.snapshot.tasks[0].window_token_usage.total_tokens = 100;
@@ -5926,8 +5888,8 @@ fn collapsed_tree_rows_aggregate_the_hidden_subtree_for_each_scope() {
     app.snapshot.attribution.window = Some(WindowDescriptor {
         limit_id: "codex".to_string(),
         label: "5h".to_string(),
-        starts_at: app.snapshot.as_of - chrono::Duration::hours(4),
-        ends_at: app.snapshot.as_of + chrono::Duration::hours(1),
+        starts_at: app.snapshot.as_of - SignedDuration::hours(4),
+        ends_at: app.snapshot.as_of + SignedDuration::hours(1),
         used_percent: 1.0,
     });
     set_task_parent(&mut app, 0, 2);
@@ -6018,8 +5980,8 @@ fn collapsed_tree_rows_aggregate_the_hidden_subtree_for_each_scope() {
             window: Some(WindowDescriptor {
                 limit_id: "codex".to_string(),
                 label: "week".to_string(),
-                starts_at: app.snapshot.as_of - chrono::Duration::days(5),
-                ends_at: app.snapshot.as_of + chrono::Duration::days(2),
+                starts_at: app.snapshot.as_of - SignedDuration::days(5),
+                ends_at: app.snapshot.as_of + SignedDuration::days(2),
                 used_percent: 10.0,
             }),
             ..AttributionSummary::default()
@@ -9628,9 +9590,7 @@ fn trends_view_uses_responsive_panels_and_btop_controls() {
 
 #[test]
 fn trend_inspect_control_is_whole_label_clickable_and_esc_exits_inspection() {
-    let now = DateTime::parse_from_rfc3339("2026-07-29T09:16:42Z")
-        .unwrap()
-        .with_timezone(&Utc);
+    let now = UtcTimestamp::parse_from_rfc3339("2026-07-29T09:16:42Z").unwrap();
 
     for theme in [Theme::Dark, Theme::Light] {
         let mut app = interaction_test_app(1, 1);
@@ -9727,9 +9687,7 @@ fn trend_inspect_control_is_whole_label_clickable_and_esc_exits_inspection() {
 
 #[test]
 fn trend_inspect_keyboard_steps_samples_and_visible_panels() {
-    let now = DateTime::parse_from_rfc3339("2026-07-29T09:16:42Z")
-        .unwrap()
-        .with_timezone(&Utc);
+    let now = UtcTimestamp::parse_from_rfc3339("2026-07-29T09:16:42Z").unwrap();
     let mut app = interaction_test_app(1, 1);
     app.replace_history(trend_history_fixture(now));
     app.set_view(View::Trends);
@@ -9751,7 +9709,7 @@ fn trend_inspect_keyboard_steps_samples_and_visible_panels() {
         app.trend_inspection,
         Some(TrendInspection {
             panel: TrendPanelId::Remaining,
-            at: now - ChronoDuration::hours(1),
+            at: now - SignedDuration::hours(1),
         })
     );
     handle_key_event(&mut app, key_event(KeyCode::Home));
@@ -9759,7 +9717,7 @@ fn trend_inspect_keyboard_steps_samples_and_visible_panels() {
         app.trend_inspection,
         Some(TrendInspection {
             panel: TrendPanelId::Remaining,
-            at: now - ChronoDuration::days(1),
+            at: now - SignedDuration::days(1),
         })
     );
     handle_key_event(&mut app, key_event(KeyCode::Right));
@@ -9767,7 +9725,7 @@ fn trend_inspect_keyboard_steps_samples_and_visible_panels() {
         app.trend_inspection,
         Some(TrendInspection {
             panel: TrendPanelId::Remaining,
-            at: now - ChronoDuration::hours(1),
+            at: now - SignedDuration::hours(1),
         })
     );
     handle_key_event(&mut app, key_event(KeyCode::End));
@@ -9844,9 +9802,7 @@ fn trend_inspect_keyboard_steps_samples_and_visible_panels() {
 
 #[test]
 fn trend_inspect_mouse_click_drag_and_release_retain_the_selected_sample() {
-    let now = DateTime::parse_from_rfc3339("2026-07-29T09:16:42Z")
-        .unwrap()
-        .with_timezone(&Utc);
+    let now = UtcTimestamp::parse_from_rfc3339("2026-07-29T09:16:42Z").unwrap();
     let mut app = interaction_test_app(1, 1);
     app.replace_history(trend_history_fixture(now));
     app.set_view(View::Trends);
@@ -9871,7 +9827,7 @@ fn trend_inspect_mouse_click_drag_and_release_retain_the_selected_sample() {
         app.trend_inspection,
         Some(TrendInspection {
             panel: TrendPanelId::Remaining,
-            at: now - ChronoDuration::days(1),
+            at: now - SignedDuration::days(1),
         })
     );
     assert_eq!(
@@ -9922,9 +9878,7 @@ fn trend_inspect_mouse_click_drag_and_release_retain_the_selected_sample() {
 
 #[test]
 fn inspected_quarter_hour_bar_shows_exact_tokens_and_bucket_interval() {
-    let now = DateTime::parse_from_rfc3339("2026-07-29T09:16:42Z")
-        .unwrap()
-        .with_timezone(&Utc);
+    let now = UtcTimestamp::parse_from_rfc3339("2026-07-29T09:16:42Z").unwrap();
     let exact_tokens = 9_007_199_254_740_993;
     let mut history = trend_history_fixture(now);
     history
@@ -9941,7 +9895,7 @@ fn inspected_quarter_hour_bar_shows_exact_tokens_and_bucket_interval() {
         app.set_view(View::Trends);
         app.trend_section = TrendSection::HalfHour;
         let mut terminal = Terminal::new(TestBackend::new(119, 40)).unwrap();
-        let content = with_test_display_offset(FixedOffset::east_opt(0).unwrap(), || {
+        let content = with_test_display_offset(Offset::UTC, || {
             terminal
                 .draw(|frame| render_at(frame, &mut app, now))
                 .unwrap();
@@ -10033,11 +9987,9 @@ fn trends_render_recorded_samples_gaps_partial_state_and_day_windows() {
 
 #[test]
 fn line_trend_readouts_show_exact_values_at_their_real_sample_times() {
-    let now = DateTime::parse_from_rfc3339("2026-07-29T09:16:42Z")
-        .unwrap()
-        .with_timezone(&Utc);
+    let now = UtcTimestamp::parse_from_rfc3339("2026-07-29T09:16:42Z").unwrap();
     let mut history = trend_history_fixture(now);
-    let weekly_observed_at = now - ChronoDuration::seconds(7);
+    let weekly_observed_at = now - SignedDuration::seconds(7);
     history
         .quota_points
         .iter_mut()
@@ -10077,7 +10029,7 @@ fn line_trend_readouts_show_exact_values_at_their_real_sample_times() {
         Some(TrendReadoutValue::Percent(25.0))
     );
 
-    let offset = FixedOffset::east_opt(0).unwrap();
+    let offset = Offset::UTC;
     for theme in [Theme::Dark, Theme::Light] {
         app.theme = theme;
         let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
@@ -10120,16 +10072,14 @@ fn line_trend_readouts_show_exact_values_at_their_real_sample_times() {
 
 #[test]
 fn half_hour_bar_charts_omit_the_current_value_row() {
-    let now = DateTime::parse_from_rfc3339("2026-07-29T09:16:42Z")
-        .unwrap()
-        .with_timezone(&Utc);
+    let now = UtcTimestamp::parse_from_rfc3339("2026-07-29T09:16:42Z").unwrap();
     let mut app = interaction_test_app(1, 1);
     app.replace_history(trend_history_fixture(now));
     app.set_view(View::Trends);
     app.trend_section = TrendSection::HalfHour;
 
     let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
-    let content = with_test_display_offset(FixedOffset::east_opt(0).unwrap(), || {
+    let content = with_test_display_offset(Offset::UTC, || {
         terminal
             .draw(|frame| render_at(frame, &mut app, now))
             .unwrap();
@@ -10145,18 +10095,16 @@ fn half_hour_bar_charts_omit_the_current_value_row() {
 
 #[test]
 fn fifteen_minute_bars_render_a_full_day_of_96_samples() {
-    let now = DateTime::parse_from_rfc3339("2026-07-29T12:00:00Z")
-        .unwrap()
-        .with_timezone(&Utc);
+    let now = UtcTimestamp::parse_from_rfc3339("2026-07-29T12:00:00Z").unwrap();
     let bounds = trend_day_bounds(now, 0);
-    let weekly_reset = now + ChronoDuration::days(3);
+    let weekly_reset = now + SignedDuration::days(3);
     let buckets = (0..96)
         .map(|index| {
-            let starts_at = bounds[0] + ChronoDuration::minutes(i64::from(index) * 15);
+            let starts_at = bounds[0] + SignedDuration::minutes(i64::from(index) * 15);
             LocalHalfHourBucket {
                 starts_at,
-                ends_at: starts_at + ChronoDuration::minutes(15),
-                sampled_at: starts_at + ChronoDuration::minutes(15),
+                ends_at: starts_at + SignedDuration::minutes(15),
+                sampled_at: starts_at + SignedDuration::minutes(15),
                 token_usage: TokenUsage {
                     total_tokens: u64::try_from(index + 1).unwrap() * 100,
                     ..TokenUsage::default()
@@ -10197,7 +10145,7 @@ fn fifteen_minute_bars_render_a_full_day_of_96_samples() {
     assert_eq!(data.half_hour_estimated.len(), 96);
     assert_eq!(
         data.half_hour_tokens[0].at,
-        bounds[0] + ChronoDuration::minutes(7) + ChronoDuration::seconds(30)
+        bounds[0] + SignedDuration::minutes(7) + SignedDuration::seconds(30)
     );
 
     for (width, height) in [(60, 24), (120, 40)] {
@@ -10234,10 +10182,8 @@ fn fifteen_minute_bars_render_a_full_day_of_96_samples() {
 
 #[test]
 fn api_long_context_toggle_reweights_weekly_and_fifteen_minute_estimates_without_changing_tokens() {
-    let now = DateTime::parse_from_rfc3339("2026-07-29T11:10:00Z")
-        .unwrap()
-        .with_timezone(&Utc);
-    let weekly_reset = now + ChronoDuration::days(3);
+    let now = UtcTimestamp::parse_from_rfc3339("2026-07-29T11:10:00Z").unwrap();
+    let weekly_reset = now + SignedDuration::days(3);
     let call = |timestamp, thread_id: &str, input_tokens| UsageCall {
         timestamp,
         thread_id: thread_id.to_string(),
@@ -10254,8 +10200,8 @@ fn api_long_context_toggle_reweights_weekly_and_fifteen_minute_estimates_without
         request_usage_exact: true,
     };
     let calls = vec![
-        call(now - ChronoDuration::minutes(70), "short", 200_000),
-        call(now - ChronoDuration::minutes(40), "long", 300_000),
+        call(now - SignedDuration::minutes(70), "short", 200_000),
+        call(now - SignedDuration::minutes(40), "long", 300_000),
     ];
     let limits = vec![LimitBucket {
         limit_id: "codex".to_string(),
@@ -10372,15 +10318,13 @@ fn trend_readout_formatting_keeps_exact_integer_tokens_and_compact_decimals() {
 
 #[test]
 fn trend_readouts_reject_expired_quota_and_the_synthetic_weekly_anchor() {
-    let now = DateTime::parse_from_rfc3339("2026-07-29T09:16:42Z")
-        .unwrap()
-        .with_timezone(&Utc);
-    let weekly_reset = now + ChronoDuration::days(3);
+    let now = UtcTimestamp::parse_from_rfc3339("2026-07-29T09:16:42Z").unwrap();
+    let weekly_reset = now + SignedDuration::days(3);
     let mut app = interaction_test_app(1, 1);
     app.history = HistoryData {
         quota_points: (vec![
             QuotaPoint {
-                observed_at: now - ChronoDuration::minutes(1),
+                observed_at: now - SignedDuration::minutes(1),
                 limit_id: "codex".to_string(),
                 duration_mins: 300,
                 resets_at: now,
@@ -10417,11 +10361,9 @@ fn trend_readouts_reject_expired_quota_and_the_synthetic_weekly_anchor() {
 
 #[test]
 fn weekly_readout_keeps_a_real_sample_at_the_exact_cycle_start() {
-    let weekly_reset = DateTime::parse_from_rfc3339("2026-08-05T09:00:00Z")
-        .unwrap()
-        .with_timezone(&Utc);
-    let cycle_start = weekly_reset - ChronoDuration::days(7);
-    let now = cycle_start + ChronoDuration::minutes(1);
+    let weekly_reset = UtcTimestamp::parse_from_rfc3339("2026-08-05T09:00:00Z").unwrap();
+    let cycle_start = weekly_reset - SignedDuration::days(7);
+    let now = cycle_start + SignedDuration::minutes(1);
     let mut app = interaction_test_app(1, 1);
     app.history = HistoryData {
         quota_points: (vec![QuotaPoint {
@@ -10483,15 +10425,13 @@ fn weekly_readout_keeps_a_real_sample_at_the_exact_cycle_start() {
 
 #[test]
 fn latest_local_bucket_window_uses_now_and_15_minute_alignment() {
-    let now = DateTime::parse_from_rfc3339("2026-07-29T12:07:00Z")
-        .unwrap()
-        .with_timezone(&Utc);
+    let now = UtcTimestamp::parse_from_rfc3339("2026-07-29T12:07:00Z").unwrap();
     let mut app = interaction_test_app(1, 1);
-    app.snapshot.as_of = now - ChronoDuration::hours(6);
+    app.snapshot.as_of = now - SignedDuration::hours(6);
     let bucket = |starts_at, total_tokens| LocalHalfHourBucket {
         starts_at,
-        ends_at: starts_at + ChronoDuration::minutes(15),
-        sampled_at: starts_at + ChronoDuration::minutes(15),
+        ends_at: starts_at + SignedDuration::minutes(15),
+        sampled_at: starts_at + SignedDuration::minutes(15),
         token_usage: TokenUsage {
             total_tokens,
             ..TokenUsage::default()
@@ -10509,15 +10449,11 @@ fn latest_local_bucket_window_uses_now_and_15_minute_alignment() {
     };
     app.history.half_hour_buckets = (vec![
         bucket(
-            DateTime::parse_from_rfc3339("2026-07-28T08:00:00Z")
-                .unwrap()
-                .with_timezone(&Utc),
+            UtcTimestamp::parse_from_rfc3339("2026-07-28T08:00:00Z").unwrap(),
             100,
         ),
         bucket(
-            DateTime::parse_from_rfc3339("2026-07-29T11:45:00Z")
-                .unwrap()
-                .with_timezone(&Utc),
+            UtcTimestamp::parse_from_rfc3339("2026-07-29T11:45:00Z").unwrap(),
             200,
         ),
     ])
@@ -10528,9 +10464,7 @@ fn latest_local_bucket_window_uses_now_and_15_minute_alignment() {
     assert_eq!(data.half_hour_bounds, trend_day_bounds(now, 0));
     assert_eq!(
         data.half_hour_bounds[1],
-        DateTime::parse_from_rfc3339("2026-07-29T12:15:00Z")
-            .unwrap()
-            .with_timezone(&Utc)
+        UtcTimestamp::parse_from_rfc3339("2026-07-29T12:15:00Z").unwrap()
     );
     assert_ne!(
         data.half_hour_bounds,
@@ -10545,27 +10479,21 @@ fn latest_local_bucket_window_uses_now_and_15_minute_alignment() {
     );
     assert_eq!(
         data.half_hour_tokens[0].at,
-        DateTime::parse_from_rfc3339("2026-07-29T11:52:30Z")
-            .unwrap()
-            .with_timezone(&Utc)
+        UtcTimestamp::parse_from_rfc3339("2026-07-29T11:52:30Z").unwrap()
     );
 }
 
 #[test]
 fn history_view_cutoff_uses_15_minute_alignment() {
-    let now = DateTime::parse_from_rfc3339("2026-07-29T12:20:00Z")
-        .unwrap()
-        .with_timezone(&Utc);
+    let now = UtcTimestamp::parse_from_rfc3339("2026-07-29T12:20:00Z").unwrap();
     assert_eq!(
         history_view_since(now),
-        DateTime::parse_from_rfc3339("2026-06-28T12:15:00Z")
-            .unwrap()
-            .with_timezone(&Utc)
+        UtcTimestamp::parse_from_rfc3339("2026-06-28T12:15:00Z").unwrap()
     );
 }
 
-fn tui_runtime_test_bucket(starts_at: DateTime<Utc>, tokens: u64) -> LocalHalfHourBucket {
-    let ends_at = starts_at + ChronoDuration::minutes(15);
+fn tui_runtime_test_bucket(starts_at: UtcTimestamp, tokens: u64) -> LocalHalfHourBucket {
+    let ends_at = starts_at + SignedDuration::minutes(15);
     LocalHalfHourBucket {
         starts_at,
         ends_at,
@@ -10601,9 +10529,9 @@ fn tui_runtime_test_bucket(starts_at: DateTime<Utc>, tokens: u64) -> LocalHalfHo
     }
 }
 
-fn tui_runtime_test_observation(starts_at: DateTime<Utc>, tokens: u64) -> HistoryObservation {
+fn tui_runtime_test_observation(starts_at: UtcTimestamp, tokens: u64) -> HistoryObservation {
     HistoryObservation {
-        observed_at: starts_at + ChronoDuration::minutes(20),
+        observed_at: starts_at + SignedDuration::minutes(20),
         half_hour_buckets: vec![tui_runtime_test_bucket(starts_at, tokens)],
         ..HistoryObservation::default()
     }
@@ -10616,12 +10544,12 @@ fn canonical_tui_history_runtime_activates_v2_and_aggregates_remote_history() {
     std::fs::create_dir(&codex_home).unwrap();
     let history_root = directory.path().join("state/history-v1");
     let mut runtime = HistoryRuntime::new(history_root, &codex_home, false).unwrap();
-    let starts_at = Utc.with_ymd_and_hms(2026, 8, 30, 9, 0, 0).unwrap();
+    let starts_at = UtcTimestamp::from_utc(2026, 8, 30, 9, 0, 0).unwrap();
     let profile_lease = acquire_runtime_profile_lease(&runtime).unwrap();
     let TuiHistoryRuntimePreparation::Ready(warnings) = prepare_tui_history_runtime(
         &mut runtime,
         &profile_lease,
-        starts_at + ChronoDuration::minutes(20),
+        starts_at + SignedDuration::minutes(20),
     );
     assert!(
         warnings.is_empty(),
@@ -10708,14 +10636,14 @@ fn canonical_tui_history_runtime_activates_v2_and_aggregates_remote_history() {
                 None,
                 &generation,
                 &binding,
-                starts_at + ChronoDuration::minutes(20),
+                starts_at + SignedDuration::minutes(20),
             )
             .unwrap();
         writer.validate().unwrap();
     }
 
     let mut store = TuiHistoryStore::runtime(runtime, Some(profile_lease), Vec::new());
-    let history = store.load_since_with_staged(starts_at - ChronoDuration::hours(1));
+    let history = store.load_since_with_staged(starts_at - SignedDuration::hours(1));
     assert_eq!(history.half_hour_buckets.len(), 1);
     assert_eq!(
         history.half_hour_buckets[0].token_usage.total_tokens, 30,
@@ -10737,9 +10665,7 @@ fn prepare_synthetic_history_measurement_fixture() {
         "codex-usage-monit synthetic measurement v1\n"
     );
     assert!(!root.join("state").exists(), "fixture must start empty");
-    let now = DateTime::parse_from_rfc3339(&std::env::var("N2_OBSERVED_AT").unwrap())
-        .unwrap()
-        .with_timezone(&Utc);
+    let now = UtcTimestamp::parse_from_rfc3339(&std::env::var("N2_OBSERVED_AT").unwrap()).unwrap();
     let remote_count: usize = std::env::var("N2_REMOTE_COUNT").unwrap().parse().unwrap();
     assert!(remote_count <= 3);
     let mut runtime = HistoryRuntime::new_with_project_mapping_store(
@@ -10755,12 +10681,12 @@ fn prepare_synthetic_history_measurement_fixture() {
         observed_at: now,
         limit_id: "codex".to_owned(),
         duration_mins: 10_080,
-        resets_at: now + ChronoDuration::days(6),
+        resets_at: now + SignedDuration::days(6),
         used_percent: 20.0,
         remaining_percent: 80.0,
         provenance: Provenance::ServerSnapshot,
     };
-    let mut observation = tui_runtime_test_observation(now - ChronoDuration::minutes(20), 10);
+    let mut observation = tui_runtime_test_observation(now - SignedDuration::minutes(20), 10);
     observation.quota_points.push(quota.clone());
     runtime
         .record_local_observation(&observation, LocalObservationMode::Incremental)
@@ -10810,7 +10736,7 @@ fn prepare_synthetic_history_measurement_fixture() {
                 )
                 .unwrap();
             let mut bucket =
-                tui_runtime_test_bucket(now - ChronoDuration::minutes(20), 20 * index as u64);
+                tui_runtime_test_bucket(now - SignedDuration::minutes(20), 20 * index as u64);
             bucket.project_groups[0].thread_id = format!("synthetic-remote-{index}");
             writer
                 .apply_remote_history_generation_page(
@@ -10823,7 +10749,7 @@ fn prepare_synthetic_history_measurement_fixture() {
                     &[RemoteQuotaChange {
                         sequence: NonZeroU64::new(2).unwrap(),
                         quota: RemoteQuotaDay {
-                            day: now.date_naive(),
+                            day: now.utc_date(),
                             points: vec![RemoteQuotaPoint::from_local(&quota).unwrap()],
                         },
                     }],
@@ -10870,7 +10796,7 @@ fn remote_overview_seed_without_remote_sources_preserves_data_and_invalidates_ol
     )
     .unwrap();
     let lease = acquire_runtime_profile_lease(&runtime).unwrap();
-    let now = Utc.with_ymd_and_hms(2026, 8, 30, 9, 20, 0).unwrap();
+    let now = UtcTimestamp::from_utc(2026, 8, 30, 9, 20, 0).unwrap();
     assert!(matches!(
         prepare_tui_history_runtime(&mut runtime, &lease, now),
         TuiHistoryRuntimePreparation::Ready(_)
@@ -10888,7 +10814,7 @@ fn remote_overview_seed_without_remote_sources_preserves_data_and_invalidates_ol
     let mut store = TuiHistoryStore::runtime(runtime, Some(lease), Vec::new());
     let seed = HistoryData {
         half_hour_buckets: (vec![tui_runtime_test_bucket(
-            now - ChronoDuration::minutes(20),
+            now - SignedDuration::minutes(20),
             42,
         )])
         .into(),
@@ -10983,7 +10909,7 @@ fn remote_overview_seed_with_remote_sources_preserves_projection_errors_and_cach
     )
     .unwrap();
     let lease = acquire_runtime_profile_lease(&runtime).unwrap();
-    let now = Utc.with_ymd_and_hms(2026, 8, 30, 9, 20, 0).unwrap();
+    let now = UtcTimestamp::from_utc(2026, 8, 30, 9, 20, 0).unwrap();
     assert!(matches!(
         prepare_tui_history_runtime(&mut runtime, &lease, now),
         TuiHistoryRuntimePreparation::Ready(_)
@@ -11008,7 +10934,7 @@ fn remote_overview_seed_with_remote_sources_preserves_projection_errors_and_cach
                 .unwrap(),
             )
             .unwrap();
-        let mut bucket = tui_runtime_test_bucket(now - ChronoDuration::minutes(20), index * 10);
+        let mut bucket = tui_runtime_test_bucket(now - SignedDuration::minutes(20), index * 10);
         bucket.project_groups[0].thread_id = format!("remote-thread-{index}@{node}");
         seed.half_hour_buckets.push(bucket);
         sources.push((node, label));
@@ -11115,7 +11041,7 @@ fn application_refresh_shares_quota_with_background_overview_and_invalidates_quo
     )
     .unwrap();
     let lease = acquire_runtime_profile_lease(&runtime).unwrap();
-    let now = Utc.with_ymd_and_hms(2026, 8, 30, 9, 20, 0).unwrap();
+    let now = UtcTimestamp::from_utc(2026, 8, 30, 9, 20, 0).unwrap();
     assert!(matches!(
         prepare_tui_history_runtime(&mut runtime, &lease, now),
         TuiHistoryRuntimePreparation::Ready(_)
@@ -11136,7 +11062,7 @@ fn application_refresh_shares_quota_with_background_overview_and_invalidates_quo
     let source_store = runtime.source_history().clone();
     let mut store = TuiHistoryStore::runtime(runtime, Some(lease), Vec::new());
     let since = history_view_since(now);
-    let observation = tui_runtime_test_observation(now - ChronoDuration::minutes(20), 10);
+    let observation = tui_runtime_test_observation(now - SignedDuration::minutes(20), 10);
     let stages_before = crate::history_application::stage_calls();
     store.with_query_request(now, |store| {
         let (projection, _) = stage_and_load_history_selected(
@@ -11182,7 +11108,7 @@ fn application_refresh_shares_quota_with_background_overview_and_invalidates_quo
     if let TuiHistoryBackend::Runtime(runtime) = &mut store.backend {
         runtime
             .record_local_observation(
-                &tui_runtime_test_observation(now - ChronoDuration::minutes(20), 20),
+                &tui_runtime_test_observation(now - SignedDuration::minutes(20), 20),
                 LocalObservationMode::Incremental,
             )
             .unwrap();
@@ -11213,12 +11139,12 @@ fn v2_projection_cache_matches_a_fresh_query_while_new_data_is_only_staged() {
     let history_root = directory.path().join("state/history-v1");
     let mut runtime = HistoryRuntime::new(history_root, &codex_home, false).unwrap();
     let profile_lease = acquire_runtime_profile_lease(&runtime).unwrap();
-    let starts_at = Utc.with_ymd_and_hms(2026, 8, 30, 9, 0, 0).unwrap();
+    let starts_at = UtcTimestamp::from_utc(2026, 8, 30, 9, 0, 0).unwrap();
     assert!(matches!(
         prepare_tui_history_runtime(
             &mut runtime,
             &profile_lease,
-            starts_at + ChronoDuration::minutes(20)
+            starts_at + SignedDuration::minutes(20)
         ),
         TuiHistoryRuntimePreparation::Ready(_)
     ));
@@ -11230,7 +11156,7 @@ fn v2_projection_cache_matches_a_fresh_query_while_new_data_is_only_staged() {
         .unwrap();
     let mut store = TuiHistoryStore::runtime(runtime, Some(profile_lease), Vec::new());
     let selection = HistorySourceSelection::AllIncluded;
-    let now = starts_at + ChronoDuration::minutes(20);
+    let now = starts_at + SignedDuration::minutes(20);
     let since = history_view_since(now);
     let durable = store.load_since_with_staged_selected(&selection, since);
     assert_eq!(
@@ -11288,12 +11214,12 @@ fn v2_projection_cache_rebases_only_a_proven_noop_local_revision() {
     let history_root = directory.path().join("state/history-v1");
     let mut runtime = HistoryRuntime::new(history_root, &codex_home, false).unwrap();
     let profile_lease = acquire_runtime_profile_lease(&runtime).unwrap();
-    let starts_at = Utc.with_ymd_and_hms(2026, 8, 30, 9, 0, 0).unwrap();
+    let starts_at = UtcTimestamp::from_utc(2026, 8, 30, 9, 0, 0).unwrap();
     assert!(matches!(
         prepare_tui_history_runtime(
             &mut runtime,
             &profile_lease,
-            starts_at + ChronoDuration::minutes(20)
+            starts_at + SignedDuration::minutes(20)
         ),
         TuiHistoryRuntimePreparation::Ready(_)
     ));
@@ -11303,7 +11229,7 @@ fn v2_projection_cache_rebases_only_a_proven_noop_local_revision() {
         .unwrap();
     let mut store = TuiHistoryStore::runtime(runtime, Some(profile_lease), Vec::new());
     let selection = HistorySourceSelection::AllIncluded;
-    let since = starts_at - ChronoDuration::hours(1);
+    let since = starts_at - SignedDuration::hours(1);
     store.load_since_with_staged_selected(&selection, since);
     let original_revision = store.projection_cache.as_ref().unwrap().revision.clone();
 
@@ -11367,7 +11293,7 @@ fn v2_projection_cache_rebases_only_a_proven_noop_local_revision() {
     );
     assert!(
         store
-            .cached_projection(&selection, since + ChronoDuration::minutes(15), false)
+            .cached_projection(&selection, since + SignedDuration::minutes(15), false)
             .is_none()
     );
 
@@ -11402,8 +11328,8 @@ fn v2_projection_cache_reloads_after_sqlite_batch_rollback_and_retry() {
         )
         .unwrap();
         let profile_lease = acquire_runtime_profile_lease(&runtime).unwrap();
-        let starts_at = Utc.with_ymd_and_hms(2026, 8, 30, 9, 0, 0).unwrap();
-        let now = starts_at + ChronoDuration::minutes(20);
+        let starts_at = UtcTimestamp::from_utc(2026, 8, 30, 9, 0, 0).unwrap();
+        let now = starts_at + SignedDuration::minutes(20);
         assert!(matches!(
             prepare_tui_history_runtime(&mut runtime, &profile_lease, now),
             TuiHistoryRuntimePreparation::Ready(_)
@@ -11472,7 +11398,7 @@ fn tui_history_with_damaged_or_missing_ownership_keeps_only_read_only_memory() {
         let codex_home = directory.path().join("codex-home");
         std::fs::create_dir(&codex_home).unwrap();
         let history_root = directory.path().join("state/history-v1");
-        let starts_at = Utc.with_ymd_and_hms(2026, 8, 30, 9, 0, 0).unwrap();
+        let starts_at = UtcTimestamp::from_utc(2026, 8, 30, 9, 0, 0).unwrap();
         let mut runtime = HistoryRuntime::new(history_root.clone(), &codex_home, false).unwrap();
         runtime.ensure_v2_active().unwrap();
         let namespace = HistoryStore::memory_only(&codex_home, false)
@@ -11497,10 +11423,10 @@ fn tui_history_with_damaged_or_missing_ownership_keeps_only_read_only_memory() {
         assert!(binding.is_err());
         let mut store = tui_history_store_from_binding(&config, binding);
         store.stage(&tui_runtime_test_observation(
-            starts_at + ChronoDuration::minutes(30),
+            starts_at + SignedDuration::minutes(30),
             42,
         ));
-        let history = store.load_since_with_staged(starts_at - ChronoDuration::hours(1));
+        let history = store.load_since_with_staged(starts_at - SignedDuration::hours(1));
         assert!(history.read_only);
         assert_eq!(history.half_hour_buckets.len(), 1);
         assert_eq!(history.half_hour_buckets[0].token_usage.total_tokens, 42);
@@ -11522,7 +11448,7 @@ fn recent_legacy_recorder_defers_tui_v2_cutover() {
     std::fs::create_dir(&codex_home).unwrap();
     let history_root = directory.path().join("state/history-v1");
     let mut runtime = HistoryRuntime::new(history_root, &codex_home, false).unwrap();
-    let now = Utc.with_ymd_and_hms(2026, 8, 30, 12, 0, 0).unwrap();
+    let now = UtcTimestamp::from_utc(2026, 8, 30, 12, 0, 0).unwrap();
     let mut status =
         RecorderStatusFile::started_with_interval(now, runtime.namespace().to_string(), 60);
     status.record_success(now);
@@ -11559,7 +11485,7 @@ fn busy_recorder_keeps_tui_bound_to_sqlite_without_reading_old_history() {
 
     let mut store = TuiHistoryStore::deferred_runtime(runtime, profile_lease);
     assert_eq!(
-        store.prepare_deferred_runtime(&codex_home, false, Utc::now()),
+        store.prepare_deferred_runtime(&codex_home, false, UtcTimestamp::now()),
         DeferredTuiHistoryPreparation::Ready
     );
     assert!(store.setup_warnings.iter().any(|warning| {
@@ -11591,7 +11517,7 @@ fn same_profile_recorder_on_v2_allows_tui_persistence() {
     let mut runtime = HistoryRuntime::new(history_root.clone(), &codex_home, false).unwrap();
     let profile_lease = acquire_runtime_profile_lease(&runtime).unwrap();
     let TuiHistoryRuntimePreparation::Ready(warnings) =
-        prepare_tui_history_runtime(&mut runtime, &profile_lease, Utc::now());
+        prepare_tui_history_runtime(&mut runtime, &profile_lease, UtcTimestamp::now());
     assert!(warnings.is_empty());
     let _recorder_profile_lease = acquire_runtime_profile_lease(&runtime).unwrap();
     let _recorder_guard =
@@ -11600,14 +11526,14 @@ fn same_profile_recorder_on_v2_allows_tui_persistence() {
             TryRecorderInstanceLock::Busy => panic!("test recorder lock was unexpectedly busy"),
         };
 
-    let starts_at = Utc.with_ymd_and_hms(2026, 8, 30, 10, 0, 0).unwrap();
+    let starts_at = UtcTimestamp::from_utc(2026, 8, 30, 10, 0, 0).unwrap();
     let mut store = TuiHistoryStore::runtime(runtime, Some(profile_lease), warnings);
     store.stage(&tui_runtime_test_observation(starts_at, 51));
     assert!(matches!(
         store.flush_staged_if_due(Duration::ZERO).unwrap(),
         Some(HistoryRuntimeWriteReport::V2(_))
     ));
-    let history = store.load_since_with_staged(starts_at - ChronoDuration::hours(1));
+    let history = store.load_since_with_staged(starts_at - SignedDuration::hours(1));
     assert_eq!(history.half_hour_buckets.len(), 1);
     assert_eq!(history.half_hour_buckets[0].token_usage.total_tokens, 51);
 }
@@ -11621,10 +11547,10 @@ fn same_profile_recorder_does_not_block_tui_reconcile_or_backfill_marker() {
     let mut runtime = HistoryRuntime::new(history_root.clone(), &codex_home, false).unwrap();
     let profile_lease = acquire_runtime_profile_lease(&runtime).unwrap();
     let TuiHistoryRuntimePreparation::Ready(warnings) =
-        prepare_tui_history_runtime(&mut runtime, &profile_lease, Utc::now());
+        prepare_tui_history_runtime(&mut runtime, &profile_lease, UtcTimestamp::now());
     let mut store = TuiHistoryStore::runtime(runtime, Some(profile_lease), warnings);
-    let starts_at = Utc.with_ymd_and_hms(2026, 8, 30, 11, 0, 0).unwrap();
-    let observed_at = starts_at + ChronoDuration::minutes(20);
+    let starts_at = UtcTimestamp::from_utc(2026, 8, 30, 11, 0, 0).unwrap();
+    let observed_at = starts_at + SignedDuration::minutes(20);
     store.stage_full_observation(&tui_runtime_test_observation(starts_at, 73));
 
     let _recorder_profile_lease = acquire_runtime_profile_lease(match &store.backend {
@@ -11639,7 +11565,7 @@ fn same_profile_recorder_does_not_block_tui_reconcile_or_backfill_marker() {
         };
     assert!(matches!(
         store
-            .flush_staged_reconcile(starts_at - ChronoDuration::hours(1), observed_at)
+            .flush_staged_reconcile(starts_at - SignedDuration::hours(1), observed_at)
             .unwrap(),
         Some(HistoryRuntimeWriteReport::V2(_))
     ));
@@ -11658,7 +11584,7 @@ fn tui_revalidates_profile_lease_before_each_runtime_write() {
     let history_root = directory.path().join("state/history-v1");
     let mut runtime = HistoryRuntime::new(history_root, &codex_home, false).unwrap();
     let profile_lease = acquire_runtime_profile_lease(&runtime).unwrap();
-    match prepare_tui_history_runtime(&mut runtime, &profile_lease, Utc::now()) {
+    match prepare_tui_history_runtime(&mut runtime, &profile_lease, UtcTimestamp::now()) {
         TuiHistoryRuntimePreparation::Ready(_) => {}
     }
     let marker = profile_lease
@@ -11666,7 +11592,7 @@ fn tui_revalidates_profile_lease_before_each_runtime_write() {
         .parent()
         .unwrap()
         .join("active-profile.json");
-    let starts_at = Utc.with_ymd_and_hms(2026, 8, 30, 11, 30, 0).unwrap();
+    let starts_at = UtcTimestamp::from_utc(2026, 8, 30, 11, 30, 0).unwrap();
     let mut store = TuiHistoryStore::runtime(runtime, Some(profile_lease), Vec::new());
     store.stage(&tui_runtime_test_observation(starts_at, 19));
     std::fs::remove_file(marker).unwrap();
@@ -11674,7 +11600,7 @@ fn tui_revalidates_profile_lease_before_each_runtime_write() {
     let error = store.flush_staged().unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     assert!(store.profile_lease.is_none());
-    let history = store.load_since_with_staged(starts_at - ChronoDuration::hours(1));
+    let history = store.load_since_with_staged(starts_at - SignedDuration::hours(1));
     assert!(history.read_only);
     assert!(
         history
@@ -11693,8 +11619,8 @@ fn opposite_profile_keeps_tui_runtime_read_only_without_losing_v2_history() {
     let mut preview_runtime =
         HistoryRuntime::new(history_root.clone(), &codex_home, false).unwrap();
     let preview_lease = acquire_runtime_profile_lease(&preview_runtime).unwrap();
-    let starts_at = Utc.with_ymd_and_hms(2026, 8, 30, 12, 0, 0).unwrap();
-    match prepare_tui_history_runtime(&mut preview_runtime, &preview_lease, Utc::now()) {
+    let starts_at = UtcTimestamp::from_utc(2026, 8, 30, 12, 0, 0).unwrap();
+    match prepare_tui_history_runtime(&mut preview_runtime, &preview_lease, UtcTimestamp::now()) {
         TuiHistoryRuntimePreparation::Ready(_) => {}
     }
     preview_runtime
@@ -11725,7 +11651,7 @@ fn opposite_profile_keeps_tui_runtime_read_only_without_losing_v2_history() {
     assert_eq!(marker_error.kind(), io::ErrorKind::WouldBlock);
     assert_eq!(marker_error.to_string(), TUI_HISTORY_PROFILE_BUSY_WARNING);
 
-    let history = store.load_since_with_staged(starts_at - ChronoDuration::hours(1));
+    let history = store.load_since_with_staged(starts_at - SignedDuration::hours(1));
     assert!(history.read_only);
     assert_eq!(history.half_hour_buckets.len(), 1);
     assert_eq!(history.half_hour_buckets[0].token_usage.total_tokens, 11);
@@ -11747,14 +11673,14 @@ fn memory_tui_fallback_keeps_live_history_without_persisting() {
     let memory = HistoryStore::memory_only(&codex_home, false);
     let mut store =
         TuiHistoryStore::memory_fallback(memory, vec!["source-aware test fallback".to_string()]);
-    let starts_at = Utc.with_ymd_and_hms(2026, 8, 30, 9, 0, 0).unwrap();
+    let starts_at = UtcTimestamp::from_utc(2026, 8, 30, 9, 0, 0).unwrap();
 
     let mut observation = tui_runtime_test_observation(starts_at, 42);
     observation.quota_points.push(QuotaPoint {
         observed_at: starts_at,
         limit_id: "codex".to_string(),
         duration_mins: 300,
-        resets_at: starts_at + ChronoDuration::hours(5),
+        resets_at: starts_at + SignedDuration::hours(5),
         used_percent: 20.0,
         remaining_percent: 80.0,
         provenance: Provenance::ServerSnapshot,
@@ -11764,7 +11690,7 @@ fn memory_tui_fallback_keeps_live_history_without_persisting() {
         &observation,
         &[],
         &LocalSessionDigestEvidence::default(),
-        starts_at + ChronoDuration::minutes(20),
+        starts_at + SignedDuration::minutes(20),
         &PerfLog::default(),
         true,
     );
@@ -11783,7 +11709,7 @@ fn memory_tui_fallback_keeps_live_history_without_persisting() {
     let source_id: NodeId = "node-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".parse().unwrap();
     let exact = store.load_since_with_staged_selected(
         &HistorySourceSelection::Remote(source_id),
-        starts_at - ChronoDuration::hours(1),
+        starts_at - SignedDuration::hours(1),
     );
     assert!(exact.history.half_hour_buckets.is_empty());
     assert!(exact.history.weekly_local_points.is_empty());
@@ -11834,17 +11760,15 @@ fn summary_does_not_mix_api_amounts_from_an_outdated_catalog() {
 
 #[test]
 fn recorder_health_treats_future_heartbeat_as_recent_during_clock_rollback() {
-    let now = DateTime::parse_from_rfc3339("2026-07-29T12:00:00Z")
-        .unwrap()
-        .with_timezone(&Utc);
+    let now = UtcTimestamp::parse_from_rfc3339("2026-07-29T12:00:00Z").unwrap();
     let mut app = interaction_test_app(1, 1);
-    app.snapshot.as_of = now - ChronoDuration::hours(2);
+    app.snapshot.as_of = now - SignedDuration::hours(2);
     let mut status = RecorderStatusFile::started_with_interval(
-        now - ChronoDuration::hours(1),
+        now - SignedDuration::hours(1),
         "test-history".to_string(),
         60,
     );
-    status.record_success(now - ChronoDuration::minutes(1));
+    status.record_success(now - SignedDuration::minutes(1));
     assert!(
         status.heartbeat_is_recent(app.snapshot.as_of),
         "an apparent future heartbeat is ambiguous clock rollback and must fail closed"
@@ -11853,22 +11777,20 @@ fn recorder_health_treats_future_heartbeat_as_recent_during_clock_rollback() {
 
     assert!(recorder_panel_status_at(&app, now).starts_with("running "));
     assert!(
-        recorder_panel_status_at(&app, now + ChronoDuration::minutes(13)).starts_with("stale ")
+        recorder_panel_status_at(&app, now + SignedDuration::minutes(13)).starts_with("stale ")
     );
 }
 
 #[test]
 fn half_hour_estimates_merge_cross_reset_cycles_and_restore_older_days() {
-    let boundary = DateTime::parse_from_rfc3339("2026-07-23T12:00:00Z")
-        .unwrap()
-        .with_timezone(&Utc);
+    let boundary = UtcTimestamp::parse_from_rfc3339("2026-07-23T12:00:00Z").unwrap();
     let previous_reset = boundary;
-    let current_reset = boundary + ChronoDuration::days(7);
-    let cross_reset_now = boundary + ChronoDuration::hours(12);
+    let current_reset = boundary + SignedDuration::days(7);
+    let cross_reset_now = boundary + SignedDuration::hours(12);
     let bucket = |starts_at, cost_units| LocalHalfHourBucket {
         starts_at,
-        ends_at: starts_at + ChronoDuration::minutes(15),
-        sampled_at: starts_at + ChronoDuration::minutes(15),
+        ends_at: starts_at + SignedDuration::minutes(15),
+        sampled_at: starts_at + SignedDuration::minutes(15),
         token_usage: TokenUsage {
             total_tokens: u64::try_from(cost_units).unwrap(),
             ..TokenUsage::default()
@@ -11888,7 +11810,7 @@ fn half_hour_estimates_merge_cross_reset_cycles_and_restore_older_days() {
     app.history = HistoryData {
         quota_points: (vec![
             QuotaPoint {
-                observed_at: boundary - ChronoDuration::hours(2),
+                observed_at: boundary - SignedDuration::hours(2),
                 limit_id: "codex".to_string(),
                 duration_mins: 10_080,
                 resets_at: previous_reset,
@@ -11897,7 +11819,7 @@ fn half_hour_estimates_merge_cross_reset_cycles_and_restore_older_days() {
                 provenance: Provenance::ServerSnapshot,
             },
             QuotaPoint {
-                observed_at: boundary - ChronoDuration::minutes(30),
+                observed_at: boundary - SignedDuration::minutes(30),
                 limit_id: "codex".to_string(),
                 duration_mins: 10_080,
                 resets_at: previous_reset,
@@ -11906,7 +11828,7 @@ fn half_hour_estimates_merge_cross_reset_cycles_and_restore_older_days() {
                 provenance: Provenance::ServerSnapshot,
             },
             QuotaPoint {
-                observed_at: boundary + ChronoDuration::hours(1),
+                observed_at: boundary + SignedDuration::hours(1),
                 limit_id: "codex".to_string(),
                 duration_mins: 10_080,
                 resets_at: current_reset,
@@ -11926,8 +11848,8 @@ fn half_hour_estimates_merge_cross_reset_cycles_and_restore_older_days() {
         ])
         .into(),
         half_hour_buckets: (vec![
-            bucket(boundary - ChronoDuration::hours(1), 100),
-            bucket(boundary + ChronoDuration::hours(1), 200),
+            bucket(boundary - SignedDuration::hours(1), 100),
+            bucket(boundary + SignedDuration::hours(1), 200),
         ])
         .into(),
         ..HistoryData::default()
@@ -11950,7 +11872,7 @@ fn half_hour_estimates_merge_cross_reset_cycles_and_restore_older_days() {
     );
 
     app.trend_day_offset = 1;
-    let older_day = prepare_trend_data_at(&app, boundary + ChronoDuration::hours(24));
+    let older_day = prepare_trend_data_at(&app, boundary + SignedDuration::hours(24));
     assert_eq!(
         older_day
             .half_hour_estimated
@@ -11964,15 +11886,13 @@ fn half_hour_estimates_merge_cross_reset_cycles_and_restore_older_days() {
 
 #[test]
 fn overlapping_early_reset_uses_the_new_weekly_cycle_for_15m_estimates() {
-    let transition = DateTime::parse_from_rfc3339("2026-07-29T12:00:00Z")
-        .unwrap()
-        .with_timezone(&Utc);
-    let now = transition + ChronoDuration::minutes(20);
-    let old_reset = transition + ChronoDuration::days(3);
-    let new_reset = transition + ChronoDuration::days(7);
+    let transition = UtcTimestamp::parse_from_rfc3339("2026-07-29T12:00:00Z").unwrap();
+    let now = transition + SignedDuration::minutes(20);
+    let old_reset = transition + SignedDuration::days(3);
+    let new_reset = transition + SignedDuration::days(7);
     let bucket = |starts_at, sampled_at| LocalHalfHourBucket {
         starts_at,
-        ends_at: starts_at + ChronoDuration::minutes(15),
+        ends_at: starts_at + SignedDuration::minutes(15),
         sampled_at,
         token_usage: TokenUsage {
             total_tokens: 1_000,
@@ -11993,7 +11913,7 @@ fn overlapping_early_reset_uses_the_new_weekly_cycle_for_15m_estimates() {
     app.history = HistoryData {
         quota_points: (vec![
             QuotaPoint {
-                observed_at: transition - ChronoDuration::minutes(5),
+                observed_at: transition - SignedDuration::minutes(5),
                 limit_id: "codex".to_string(),
                 duration_mins: 10_080,
                 resets_at: old_reset,
@@ -12013,8 +11933,8 @@ fn overlapping_early_reset_uses_the_new_weekly_cycle_for_15m_estimates() {
         ])
         .into(),
         half_hour_buckets: (vec![
-            bucket(transition - ChronoDuration::minutes(15), transition),
-            bucket(transition, transition + ChronoDuration::minutes(15)),
+            bucket(transition - SignedDuration::minutes(15), transition),
+            bucket(transition, transition + SignedDuration::minutes(15)),
         ])
         .into(),
         ..HistoryData::default()
@@ -12047,7 +11967,7 @@ fn overlapping_early_reset_uses_the_new_weekly_cycle_for_15m_estimates() {
     }])
     .into();
     app.trend_day_offset = 1;
-    let viewed_at = now + ChronoDuration::days(1);
+    let viewed_at = now + SignedDuration::days(1);
     let uncalibrated = prepare_trend_data_at(&app, viewed_at);
     assert_eq!(
         uncalibrated
@@ -12061,14 +11981,12 @@ fn overlapping_early_reset_uses_the_new_weekly_cycle_for_15m_estimates() {
 
 #[test]
 fn weekly_reset_dedup_is_order_independent_for_bridging_candidates() {
-    let base_reset = DateTime::parse_from_rfc3339("2026-07-30T12:00:00Z")
-        .unwrap()
-        .with_timezone(&Utc);
-    let observed_at = base_reset - ChronoDuration::days(1);
+    let base_reset = UtcTimestamp::parse_from_rfc3339("2026-07-30T12:00:00Z").unwrap();
+    let observed_at = base_reset - SignedDuration::days(1);
     let resets = [
         base_reset,
-        base_reset + ChronoDuration::seconds(120),
-        base_reset + ChronoDuration::seconds(240),
+        base_reset + SignedDuration::seconds(120),
+        base_reset + SignedDuration::seconds(240),
     ];
     let candidates = resets
         .into_iter()
@@ -12076,9 +11994,9 @@ fn weekly_reset_dedup_is_order_independent_for_bridging_candidates() {
         .map(|(index, resets_at)| QuotaPoint {
             observed_at: observed_at
                 + if index == 1 {
-                    ChronoDuration::minutes(3)
+                    SignedDuration::minutes(3)
                 } else {
-                    ChronoDuration::minutes(i64::try_from(index).unwrap())
+                    SignedDuration::minutes(i64::try_from(index).unwrap())
                 },
             limit_id: "codex".to_string(),
             duration_mins: 10_080,
@@ -12089,8 +12007,8 @@ fn weekly_reset_dedup_is_order_independent_for_bridging_candidates() {
         })
         .collect::<Vec<_>>();
     let bounds = [
-        base_reset - ChronoDuration::hours(1),
-        base_reset + ChronoDuration::hours(1),
+        base_reset - SignedDuration::hours(1),
+        base_reset + SignedDuration::hours(1),
     ];
 
     for order in [[0, 2, 1], [2, 0, 1], [1, 0, 2], [2, 1, 0]] {
@@ -12115,19 +12033,19 @@ fn weekly_reset_dedup_is_order_independent_for_bridging_candidates() {
 fn weekly_trends_connect_confirmed_zero_plateaus_and_keep_true_gaps() {
     let mut app = interaction_test_app(1, 1);
     let bucket_seconds = LOCAL_BUCKET_MINUTES * 60;
-    let aligned_now = DateTime::from_timestamp(
+    let aligned_now = UtcTimestamp::from_timestamp(
         app.snapshot.as_of.timestamp().div_euclid(bucket_seconds) * bucket_seconds,
         0,
     )
     .unwrap();
-    let reset = aligned_now + ChronoDuration::days(3);
-    let start = reset - ChronoDuration::days(7);
-    let first_at = start + ChronoDuration::minutes(30);
-    let second_at = start + ChronoDuration::minutes(120);
+    let reset = aligned_now + SignedDuration::days(3);
+    let start = reset - SignedDuration::days(7);
+    let first_at = start + SignedDuration::minutes(30);
+    let second_at = start + SignedDuration::minutes(120);
     let zero_bucket = |starts_at| LocalHalfHourBucket {
         starts_at,
-        ends_at: starts_at + ChronoDuration::minutes(15),
-        sampled_at: starts_at + ChronoDuration::minutes(15),
+        ends_at: starts_at + SignedDuration::minutes(15),
+        sampled_at: starts_at + SignedDuration::minutes(15),
         token_usage: TokenUsage::default(),
         estimated_cost_units: 0,
         api_long_context_extra_cost_units: Some(0),
@@ -12152,9 +12070,9 @@ fn weekly_trends_connect_confirmed_zero_plateaus_and_keep_true_gaps() {
         }])
         .into(),
         half_hour_buckets: (vec![
-            zero_bucket(start + ChronoDuration::minutes(30)),
-            zero_bucket(start + ChronoDuration::minutes(45)),
-            zero_bucket(start + ChronoDuration::minutes(60)),
+            zero_bucket(start + SignedDuration::minutes(30)),
+            zero_bucket(start + SignedDuration::minutes(45)),
+            zero_bucket(start + SignedDuration::minutes(60)),
         ])
         .into(),
         weekly_local_points: (vec![
@@ -12259,9 +12177,7 @@ fn trend_chart_canvas_uses_the_active_theme_background() {
 
 #[test]
 fn trend_segments_keep_single_points_and_split_missing_intervals() {
-    let start = DateTime::parse_from_rfc3339("2026-07-28T00:00:00Z")
-        .unwrap()
-        .with_timezone(&Utc);
+    let start = UtcTimestamp::parse_from_rfc3339("2026-07-28T00:00:00Z").unwrap();
     let points = vec![
         TrendPoint {
             at: start,
@@ -12272,18 +12188,18 @@ fn trend_segments_keep_single_points_and_split_missing_intervals() {
             partial: false,
         },
         TrendPoint {
-            at: start + ChronoDuration::minutes(5),
+            at: start + SignedDuration::minutes(5),
             value: 2.0,
             readout_value: TrendReadoutValue::Percent(2.0),
-            sampled_at: Some(start + ChronoDuration::minutes(5)),
+            sampled_at: Some(start + SignedDuration::minutes(5)),
             interval: None,
             partial: false,
         },
         TrendPoint {
-            at: start + ChronoDuration::minutes(25),
+            at: start + SignedDuration::minutes(25),
             value: 3.0,
             readout_value: TrendReadoutValue::Percent(3.0),
-            sampled_at: Some(start + ChronoDuration::minutes(25)),
+            sampled_at: Some(start + SignedDuration::minutes(25)),
             interval: None,
             partial: true,
         },
@@ -12291,7 +12207,7 @@ fn trend_segments_keep_single_points_and_split_missing_intervals() {
     let (segments, gaps) = prepare_trend_segments(
         &points,
         TrendGraphKind::Line {
-            maximum_gap: ChronoDuration::minutes(10),
+            maximum_gap: SignedDuration::minutes(10),
         },
     );
     assert_eq!(gaps, 1);
@@ -12300,7 +12216,7 @@ fn trend_segments_keep_single_points_and_split_missing_intervals() {
     let (single, gaps) = prepare_trend_segments(
         &points[..1],
         TrendGraphKind::Line {
-            maximum_gap: ChronoDuration::minutes(10),
+            maximum_gap: SignedDuration::minutes(10),
         },
     );
     assert_eq!(gaps, 0);
@@ -12309,7 +12225,7 @@ fn trend_segments_keep_single_points_and_split_missing_intervals() {
     let (bars, gaps) = prepare_trend_segments(
         &points,
         TrendGraphKind::Bar {
-            expected_step: ChronoDuration::minutes(5),
+            expected_step: SignedDuration::minutes(5),
         },
     );
     assert_eq!(gaps, 3);
@@ -12318,9 +12234,7 @@ fn trend_segments_keep_single_points_and_split_missing_intervals() {
 
 #[test]
 fn quota_remaining_trends_retain_previous_reset_cycles_and_show_observed_jumps() {
-    let boundary = DateTime::parse_from_rfc3339("2026-07-29T04:10:00Z")
-        .unwrap()
-        .with_timezone(&Utc);
+    let boundary = UtcTimestamp::parse_from_rfc3339("2026-07-29T04:10:00Z").unwrap();
     let quota_point = |duration_mins, observed_at, resets_at, remaining_percent| QuotaPoint {
         observed_at,
         limit_id: "codex".to_string(),
@@ -12337,21 +12251,21 @@ fn quota_remaining_trends_retain_previous_reset_cycles_and_show_observed_jumps()
         quota_points: (vec![
             quota_point(
                 300,
-                boundary + ChronoDuration::minutes(5),
-                boundary + ChronoDuration::minutes(300),
+                boundary + SignedDuration::minutes(5),
+                boundary + SignedDuration::minutes(300),
                 99.0,
             ),
             quota_point(
                 10_080,
-                boundary - ChronoDuration::minutes(5),
+                boundary - SignedDuration::minutes(5),
                 boundary,
                 12.0,
             ),
-            quota_point(300, boundary - ChronoDuration::minutes(5), boundary, 8.0),
+            quota_point(300, boundary - SignedDuration::minutes(5), boundary, 8.0),
             quota_point(
                 10_080,
-                boundary + ChronoDuration::minutes(5),
-                boundary + ChronoDuration::minutes(10_080),
+                boundary + SignedDuration::minutes(5),
+                boundary + SignedDuration::minutes(10_080),
                 100.0,
             ),
         ])
@@ -12359,7 +12273,7 @@ fn quota_remaining_trends_retain_previous_reset_cycles_and_show_observed_jumps()
         ..HistoryData::default()
     };
 
-    let data = prepare_trend_data_at(&app, boundary + ChronoDuration::minutes(5));
+    let data = prepare_trend_data_at(&app, boundary + SignedDuration::minutes(5));
     assert_eq!(
         data.five_hour_remaining
             .iter()
@@ -12378,7 +12292,7 @@ fn quota_remaining_trends_retain_previous_reset_cycles_and_show_observed_jumps()
     let (segments, gaps) = prepare_trend_segments(
         &data.five_hour_remaining,
         TrendGraphKind::Line {
-            maximum_gap: ChronoDuration::minutes(15),
+            maximum_gap: SignedDuration::minutes(15),
         },
     );
     assert_eq!(gaps, 0);
@@ -12394,13 +12308,11 @@ fn quota_remaining_trends_retain_previous_reset_cycles_and_show_observed_jumps()
 
 #[test]
 fn quota_remaining_reset_does_not_bridge_a_recorder_outage() {
-    let boundary = DateTime::parse_from_rfc3339("2026-07-29T04:10:00Z")
-        .unwrap()
-        .with_timezone(&Utc);
+    let boundary = UtcTimestamp::parse_from_rfc3339("2026-07-29T04:10:00Z").unwrap();
     let history = HistoryData {
         quota_points: (vec![
             QuotaPoint {
-                observed_at: boundary - ChronoDuration::minutes(10),
+                observed_at: boundary - SignedDuration::minutes(10),
                 limit_id: "codex".to_string(),
                 duration_mins: 300,
                 resets_at: boundary,
@@ -12409,10 +12321,10 @@ fn quota_remaining_reset_does_not_bridge_a_recorder_outage() {
                 provenance: Provenance::ServerSnapshot,
             },
             QuotaPoint {
-                observed_at: boundary + ChronoDuration::minutes(20),
+                observed_at: boundary + SignedDuration::minutes(20),
                 limit_id: "codex".to_string(),
                 duration_mins: 300,
-                resets_at: boundary + ChronoDuration::minutes(300),
+                resets_at: boundary + SignedDuration::minutes(300),
                 used_percent: 3.0,
                 remaining_percent: 97.0,
                 provenance: Provenance::ServerSnapshot,
@@ -12426,7 +12338,7 @@ fn quota_remaining_reset_does_not_bridge_a_recorder_outage() {
     let (segments, gaps) = prepare_trend_segments(
         &points,
         TrendGraphKind::Line {
-            maximum_gap: ChronoDuration::minutes(15),
+            maximum_gap: SignedDuration::minutes(15),
         },
     );
     assert_eq!(points.len(), 2);
@@ -13046,9 +12958,7 @@ fn settings_project_mapping_load_errors_are_sanitized() {
 #[test]
 fn settings_remote_sources_render_across_compact_light_and_dark_layouts() {
     let directory = tempfile::tempdir().unwrap();
-    let now = DateTime::parse_from_rfc3339("2026-08-31T08:15:30Z")
-        .unwrap()
-        .with_timezone(&Utc);
+    let now = UtcTimestamp::parse_from_rfc3339("2026-08-31T08:15:30Z").unwrap();
     let mut app = interaction_test_app(0, 0);
     install_remote_sources_fixture(&mut app, directory.path(), now);
     app.view = View::Settings;
@@ -13097,7 +13007,7 @@ fn settings_remote_sources_render_across_compact_light_and_dark_layouts() {
 fn settings_remote_viewport_shows_both_hosts_and_preserves_selection_and_hitboxes() {
     let directory = tempfile::tempdir().unwrap();
     let mut app = interaction_test_app(0, 0);
-    install_remote_sources_fixture(&mut app, directory.path(), Utc::now());
+    install_remote_sources_fixture(&mut app, directory.path(), UtcTimestamp::now());
     app.view = View::Settings;
 
     for theme in [Theme::Dark, Theme::Light] {
@@ -13158,7 +13068,7 @@ fn settings_remote_viewport_shows_both_hosts_and_preserves_selection_and_hitboxe
 fn settings_remote_viewport_reports_hidden_hosts_and_maps_scrolled_mouse_rows() {
     let directory = tempfile::tempdir().unwrap();
     let mut app = interaction_test_app(0, 0);
-    install_remote_sources_fixture(&mut app, directory.path(), Utc::now());
+    install_remote_sources_fixture(&mut app, directory.path(), UtcTimestamp::now());
     app.view = View::Settings;
     let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
     for theme in [Theme::Dark, Theme::Light] {
@@ -13548,7 +13458,8 @@ fn remote_ui_parent_traces_user_cancellation_distinctly() {
 fn settings_shortcuts_are_isolated_to_the_selected_panel_in_wide_and_compact_layouts() {
     let directory = tempfile::tempdir().unwrap();
     let mut app = interaction_test_app(0, 0);
-    let (config_store, _) = install_remote_sources_fixture(&mut app, directory.path(), Utc::now());
+    let (config_store, _) =
+        install_remote_sources_fixture(&mut app, directory.path(), UtcTimestamp::now());
     install_project_mapping_fixture(&mut app, directory.path());
     app.view = View::Settings;
     app.selected_setting = SettingItem::ALL.len();
@@ -13724,7 +13635,8 @@ fn settings_shortcuts_are_isolated_to_the_selected_panel_in_wide_and_compact_lay
 fn settings_remote_source_policy_is_distinct_clickable_and_uses_offline_cli() {
     let directory = tempfile::tempdir().unwrap();
     let mut app = interaction_test_app(0, 0);
-    let (config_store, _) = install_remote_sources_fixture(&mut app, directory.path(), Utc::now());
+    let (config_store, _) =
+        install_remote_sources_fixture(&mut app, directory.path(), UtcTimestamp::now());
     let attached_id: NodeId = "node-11111111111111111111111111111111".parse().unwrap();
     let attached = SourceMetadata::new_with_redaction_profile(
         attached_id,
@@ -13919,7 +13831,7 @@ fn settings_remote_source_policy_is_distinct_clickable_and_uses_offline_cli() {
 fn settings_remote_purge_rechecks_that_the_source_is_still_detached() {
     let directory = tempfile::tempdir().unwrap();
     let mut app = interaction_test_app(0, 0);
-    install_remote_sources_fixture(&mut app, directory.path(), Utc::now());
+    install_remote_sources_fixture(&mut app, directory.path(), UtcTimestamp::now());
     let source_id: NodeId = "node-22222222222222222222222222222222".parse().unwrap();
     let mut source = SourceMetadata::new_with_redaction_profile(
         source_id.clone(),
@@ -13968,7 +13880,7 @@ fn settings_remote_purge_rechecks_that_the_source_is_still_detached() {
 #[test]
 fn settings_remote_keyboard_mutations_persist_and_actions_are_single_host() {
     let directory = tempfile::tempdir().unwrap();
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let mut app = interaction_test_app(0, 0);
     let (config_store, _) = install_remote_sources_fixture(&mut app, directory.path(), now);
     app.view = View::Settings;
@@ -14007,7 +13919,7 @@ fn settings_remote_keyboard_mutations_persist_and_actions_are_single_host() {
 fn settings_remote_control_geometry_is_stable_while_an_action_is_running() {
     let directory = tempfile::tempdir().unwrap();
     let mut app = interaction_test_app(0, 0);
-    install_remote_sources_fixture(&mut app, directory.path(), Utc::now());
+    install_remote_sources_fixture(&mut app, directory.path(), UtcTimestamp::now());
     app.view = View::Settings;
     app.selected_setting = SettingItem::ALL.len();
     let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
@@ -14069,7 +13981,8 @@ fn settings_remote_control_geometry_is_stable_while_an_action_is_running() {
 fn settings_remote_config_controls_respect_running_and_pending_action_gates() {
     let directory = tempfile::tempdir().unwrap();
     let mut app = interaction_test_app(0, 0);
-    let (config_store, _) = install_remote_sources_fixture(&mut app, directory.path(), Utc::now());
+    let (config_store, _) =
+        install_remote_sources_fixture(&mut app, directory.path(), UtcTimestamp::now());
     app.view = View::Settings;
     app.selected_setting = SettingItem::ALL.len();
     let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
@@ -14182,7 +14095,8 @@ fn settings_remote_config_controls_respect_running_and_pending_action_gates() {
 fn settings_remote_mouse_uses_whole_control_and_host_hitboxes() {
     let directory = tempfile::tempdir().unwrap();
     let mut app = interaction_test_app(0, 0);
-    let (config_store, _) = install_remote_sources_fixture(&mut app, directory.path(), Utc::now());
+    let (config_store, _) =
+        install_remote_sources_fixture(&mut app, directory.path(), UtcTimestamp::now());
     app.view = View::Settings;
     app.selected_setting = SettingItem::ALL.len();
     let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
@@ -14230,7 +14144,8 @@ fn settings_remote_mouse_uses_whole_control_and_host_hitboxes() {
 fn settings_remote_editor_consumes_printable_shortcuts_before_global_bindings() {
     let directory = tempfile::tempdir().unwrap();
     let mut app = interaction_test_app(0, 0);
-    let (config_store, _) = install_remote_sources_fixture(&mut app, directory.path(), Utc::now());
+    let (config_store, _) =
+        install_remote_sources_fixture(&mut app, directory.path(), UtcTimestamp::now());
     app.view = View::Settings;
     app.selected_setting = SettingItem::ALL.len();
     let before = config_store.load().unwrap();
@@ -14298,7 +14213,8 @@ fn settings_remote_editor_consumes_printable_shortcuts_before_global_bindings() 
 fn settings_remote_add_and_edit_stage_exact_single_host_cli_arguments() {
     let directory = tempfile::tempdir().unwrap();
     let mut app = interaction_test_app(0, 0);
-    let (config_store, _) = install_remote_sources_fixture(&mut app, directory.path(), Utc::now());
+    let (config_store, _) =
+        install_remote_sources_fixture(&mut app, directory.path(), UtcTimestamp::now());
     app.view = View::Settings;
     app.selected_setting = SettingItem::ALL.len();
     let revision = config_store.load().unwrap().config_revision();
@@ -14378,7 +14294,7 @@ fn settings_remote_add_and_edit_stage_exact_single_host_cli_arguments() {
 fn settings_remote_editor_uses_the_shared_field_validation() {
     let directory = tempfile::tempdir().unwrap();
     let mut app = interaction_test_app(0, 0);
-    install_remote_sources_fixture(&mut app, directory.path(), Utc::now());
+    install_remote_sources_fixture(&mut app, directory.path(), UtcTimestamp::now());
     app.view = View::Settings;
     app.selected_setting = SettingItem::ALL.len();
     app.begin_remote_add();
@@ -14405,7 +14321,7 @@ fn settings_remote_editor_uses_the_shared_field_validation() {
 fn settings_remote_crud_mouse_controls_and_remove_confirmation_work_in_compact_layout() {
     let directory = tempfile::tempdir().unwrap();
     let mut app = interaction_test_app(0, 0);
-    install_remote_sources_fixture(&mut app, directory.path(), Utc::now());
+    install_remote_sources_fixture(&mut app, directory.path(), UtcTimestamp::now());
     app.view = View::Settings;
     app.selected_setting = SettingItem::ALL.len() + 1;
     let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
@@ -14558,7 +14474,8 @@ fn settings_remote_crud_mouse_controls_and_remove_confirmation_work_in_compact_l
 fn settings_remote_completion_is_applied_only_to_the_matching_request() {
     let directory = tempfile::tempdir().unwrap();
     let mut app = interaction_test_app(0, 0);
-    let (config_store, _) = install_remote_sources_fixture(&mut app, directory.path(), Utc::now());
+    let (config_store, _) =
+        install_remote_sources_fixture(&mut app, directory.path(), UtcTimestamp::now());
     app.view = View::Settings;
     app.selected_setting = SettingItem::ALL.len();
     let revision = config_store.load().unwrap().config_revision();
@@ -14762,7 +14679,7 @@ fn settings_remote_error_details_render_without_moving_controls_and_reach_diagno
         for (width, height) in [(64, 20), (120, 32)] {
             let directory = tempfile::tempdir().unwrap();
             let mut app = interaction_test_app(0, 0);
-            install_remote_sources_fixture(&mut app, directory.path(), Utc::now());
+            install_remote_sources_fixture(&mut app, directory.path(), UtcTimestamp::now());
             app.view = View::Settings;
             app.theme = theme;
             app.selected_setting = SettingItem::ALL.len();
@@ -14940,7 +14857,7 @@ fn event_log_tui_distinguishes_remote_state_from_stale_data_and_records_recovery
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("events.jsonl");
     let mut app = interaction_test_app(0, 0);
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let (store, _) = install_remote_sources_fixture(&mut app, temp.path(), now);
     let config = app.remote_sources.config.as_ref().unwrap();
     app.remote_sources.config = Some(
@@ -14952,7 +14869,7 @@ fn event_log_tui_distinguishes_remote_state_from_stale_data_and_records_recovery
             .unwrap(),
     );
     app.event_log = EventLog::open(Some(path.clone()), LogLevel::Debug, false);
-    let stale = remote_live_fixture(now - ChronoDuration::hours(10), true);
+    let stale = remote_live_fixture(now - SignedDuration::hours(10), true);
     app.replace_remote_live_states_at(vec![stale], now);
     app.observe_diagnostics();
     app.observe_diagnostics();
@@ -15022,7 +14939,7 @@ fn event_log_tui_remote_toggle_success_is_state_and_rejections_do_not_depend_on_
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("events.jsonl");
     let mut app = interaction_test_app(0, 0);
-    let (store, _) = install_remote_sources_fixture(&mut app, temp.path(), Utc::now());
+    let (store, _) = install_remote_sources_fixture(&mut app, temp.path(), UtcTimestamp::now());
     let revision = store.load().unwrap().config_revision();
     app.remote_sources.config = Some(
         store
@@ -15158,7 +15075,7 @@ fn event_log_tui_captures_diagnostics_and_failed_settings_save() {
 fn settings_remote_editor_next_control_is_clickable_in_terse_layout() {
     let directory = tempfile::tempdir().unwrap();
     let mut app = interaction_test_app(0, 0);
-    install_remote_sources_fixture(&mut app, directory.path(), Utc::now());
+    install_remote_sources_fixture(&mut app, directory.path(), UtcTimestamp::now());
     app.view = View::Settings;
     app.selected_setting = SettingItem::ALL.len();
     app.begin_selected_remote_edit();
@@ -15189,7 +15106,8 @@ fn settings_remote_editor_next_control_is_clickable_in_terse_layout() {
 fn settings_remote_editor_refuses_a_stale_config_revision() {
     let directory = tempfile::tempdir().unwrap();
     let mut app = interaction_test_app(0, 0);
-    let (config_store, _) = install_remote_sources_fixture(&mut app, directory.path(), Utc::now());
+    let (config_store, _) =
+        install_remote_sources_fixture(&mut app, directory.path(), UtcTimestamp::now());
     app.view = View::Settings;
     app.selected_setting = SettingItem::ALL.len();
     app.begin_selected_remote_edit();
@@ -15215,9 +15133,7 @@ fn settings_remote_editor_refuses_a_stale_config_revision() {
 #[test]
 fn other_view_shows_sanitized_per_host_remote_sync_health_fields() {
     let directory = tempfile::tempdir().unwrap();
-    let now = DateTime::parse_from_rfc3339("2026-08-31T08:15:30Z")
-        .unwrap()
-        .with_timezone(&Utc);
+    let now = UtcTimestamp::parse_from_rfc3339("2026-08-31T08:15:30Z").unwrap();
     let mut app = interaction_test_app(0, 0);
     install_remote_sources_fixture(&mut app, directory.path(), now);
     app.view = View::Health;
@@ -15249,7 +15165,7 @@ fn other_view_shows_sanitized_per_host_remote_sync_health_fields() {
     assert!(content.contains("hard=ok/250.0 MiB"));
     assert!(content.contains(&local_full_time_label(Some(now), "never")));
     assert!(content.contains(&local_full_time_label(
-        Some(now + ChronoDuration::minutes(1)),
+        Some(now + SignedDuration::minutes(1)),
         "-"
     )));
     assert!(!content.contains("dev-box"));
@@ -15259,7 +15175,7 @@ fn other_view_shows_sanitized_per_host_remote_sync_health_fields() {
 #[test]
 fn remote_health_exposes_fact_containment_after_aggregate_success() {
     let directory = tempfile::tempdir().unwrap();
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let mut app = interaction_test_app(0, 0);
     let (config_store, health_store) =
         install_remote_sources_fixture(&mut app, directory.path(), now);
@@ -15334,7 +15250,7 @@ fn remote_health_exposes_fact_containment_after_aggregate_success() {
 #[test]
 fn remote_health_exposes_independent_fact_failure_and_clears_it_after_recovery() {
     let directory = tempfile::tempdir().unwrap();
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let mut app = interaction_test_app(0, 0);
     let (config_store, health_store) =
         install_remote_sources_fixture(&mut app, directory.path(), now);
@@ -15366,7 +15282,7 @@ fn remote_health_exposes_independent_fact_failure_and_clears_it_after_recovery()
 #[test]
 fn remote_health_does_not_reuse_an_old_pairing_before_durable_reconciliation() {
     let directory = tempfile::tempdir().unwrap();
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let mut app = interaction_test_app(0, 0);
     let (config_store, health_store) =
         install_remote_sources_fixture(&mut app, directory.path(), now);
@@ -15417,7 +15333,7 @@ fn remote_health_does_not_reuse_an_old_pairing_before_durable_reconciliation() {
 #[test]
 fn remote_health_reload_detects_service_updates_without_snapshot_changes() {
     let directory = tempfile::tempdir().unwrap();
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let mut app = interaction_test_app(0, 0);
     let (config_store, health_store) =
         install_remote_sources_fixture(&mut app, directory.path(), now);
@@ -15429,9 +15345,9 @@ fn remote_health_reload_detects_service_updates_without_snapshot_changes() {
         .record_failure(
             "dev",
             Some(source),
-            now + ChronoDuration::minutes(1),
+            now + SignedDuration::minutes(1),
             RemoteSyncErrorCategory::Transport,
-            Some(now + ChronoDuration::minutes(5)),
+            Some(now + SignedDuration::minutes(5)),
         )
         .unwrap();
     assert!(app.reload_remote_sources());
@@ -15441,7 +15357,7 @@ fn remote_health_reload_detects_service_updates_without_snapshot_changes() {
 #[test]
 fn remote_config_busy_reload_keeps_snapshot_and_retries_without_blocking_actions() {
     let directory = tempfile::tempdir().unwrap();
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let mut app = interaction_test_app(0, 0);
     let (config_store, _) = install_remote_sources_fixture(&mut app, directory.path(), now);
     let previous = app.remote_sources.config.clone().unwrap();
@@ -15475,16 +15391,14 @@ fn remote_config_busy_reload_keeps_snapshot_and_retries_without_blocking_actions
 #[test]
 fn other_view_renders_budget_pause_as_distinct_health_state_with_exact_resume() {
     let directory = tempfile::tempdir().unwrap();
-    let now = DateTime::parse_from_rfc3339("2026-08-31T08:15:30Z")
-        .unwrap()
-        .with_timezone(&Utc);
+    let now = UtcTimestamp::parse_from_rfc3339("2026-08-31T08:15:30Z").unwrap();
     let mut app = interaction_test_app(0, 0);
     let (config_store, health_store) =
         install_remote_sources_fixture(&mut app, directory.path(), now);
     let config = config_store.load().unwrap();
     let source = config.host("dev").unwrap().expected_source().unwrap();
-    let paused_at = now + ChronoDuration::minutes(2);
-    let resume_at = now + ChronoDuration::hours(24);
+    let paused_at = now + SignedDuration::minutes(2);
+    let resume_at = now + SignedDuration::hours(24);
     health_store
         .record_pause(
             "dev",
@@ -15517,12 +15431,12 @@ fn other_view_renders_budget_pause_as_distinct_health_state_with_exact_resume() 
 #[test]
 fn remote_bandwidth_reload_detects_changes_and_renders_soft_hard_resume_times() {
     let directory = tempfile::tempdir().unwrap();
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let mut app = interaction_test_app(0, 0);
     install_remote_sources_fixture(&mut app, directory.path(), now);
 
     assert!(!app.reload_remote_sources());
-    record_remote_bandwidth(&app, "dev", Utc::now(), 160 * 1024 * 1024);
+    record_remote_bandwidth(&app, "dev", UtcTimestamp::now(), 160 * 1024 * 1024);
     assert!(app.reload_remote_sources());
     assert!(!app.reload_remote_sources());
     let soft = remote_bandwidth_status(&app, "dev").unwrap();
@@ -15554,7 +15468,7 @@ fn remote_bandwidth_reload_detects_changes_and_renders_soft_hard_resume_times() 
         }
     }
 
-    record_remote_bandwidth(&app, "dev", Utc::now(), 100 * 1024 * 1024);
+    record_remote_bandwidth(&app, "dev", UtcTimestamp::now(), 100 * 1024 * 1024);
     assert!(app.reload_remote_sources());
     let hard = remote_bandwidth_status(&app, "dev").unwrap();
     assert_eq!(hard.rolling_bytes, Some(260 * 1024 * 1024));
@@ -15580,7 +15494,7 @@ fn remote_bandwidth_reload_detects_changes_and_renders_soft_hard_resume_times() 
 fn remote_bandwidth_refresh_is_a_read_only_batch_snapshot() {
     let directory = tempfile::tempdir().unwrap();
     let mut app = interaction_test_app(0, 0);
-    install_remote_sources_fixture(&mut app, directory.path(), Utc::now());
+    install_remote_sources_fixture(&mut app, directory.path(), UtcTimestamp::now());
     let budget_directory = directory.path().join("remote-bandwidth-v1");
 
     // Observing a fresh store must not create even the budget directory or
@@ -15589,7 +15503,7 @@ fn remote_bandwidth_refresh_is_a_read_only_batch_snapshot() {
     assert!(!app.reload_remote_sources());
     assert!(!budget_directory.exists());
 
-    record_remote_bandwidth(&app, "dev", Utc::now(), 8 * 1024);
+    record_remote_bandwidth(&app, "dev", UtcTimestamp::now(), 8 * 1024);
     let ledger_path = budget_directory.join("ledger.json");
     let before = std::fs::read(&ledger_path).unwrap();
     let before_json: serde_json::Value = serde_json::from_slice(&before).unwrap();
@@ -15639,9 +15553,9 @@ fn remote_bandwidth_refresh_is_a_read_only_batch_snapshot() {
 fn unpaired_remote_bandwidth_uses_only_the_local_host_key() {
     let directory = tempfile::tempdir().unwrap();
     let mut app = interaction_test_app(0, 0);
-    install_remote_sources_fixture(&mut app, directory.path(), Utc::now());
+    install_remote_sources_fixture(&mut app, directory.path(), UtcTimestamp::now());
 
-    record_remote_bandwidth(&app, "lab", Utc::now(), 4 * 1024);
+    record_remote_bandwidth(&app, "lab", UtcTimestamp::now(), 4 * 1024);
     assert!(app.reload_remote_sources());
     let status = remote_bandwidth_status(&app, "lab").expect("unpaired host budget");
     assert_eq!(status.rolling_bytes, Some(4 * 1024));
@@ -15685,14 +15599,14 @@ fn other_view_lists_every_reset_time_and_available_reset_credits() {
             message: None,
         })
         .collect();
-    let primary_reset = now + chrono::Duration::hours(2);
-    let secondary_reset = now + chrono::Duration::days(4);
-    let expired_reset = now - chrono::Duration::hours(1);
-    let first_credit_granted = now - chrono::Duration::hours(3);
-    let first_credit_expires = now + chrono::Duration::days(7);
-    let second_credit_granted = now - chrono::Duration::minutes(45);
-    let second_credit_expires = now + chrono::Duration::days(14);
-    let third_credit_granted = now - chrono::Duration::minutes(5);
+    let primary_reset = now + SignedDuration::hours(2);
+    let secondary_reset = now + SignedDuration::days(4);
+    let expired_reset = now - SignedDuration::hours(1);
+    let first_credit_granted = now - SignedDuration::hours(3);
+    let first_credit_expires = now + SignedDuration::days(7);
+    let second_credit_granted = now - SignedDuration::minutes(45);
+    let second_credit_expires = now + SignedDuration::days(14);
+    let third_credit_granted = now - SignedDuration::minutes(5);
     app.snapshot.limits = vec![
         LimitBucket {
             limit_id: "codex".to_string(),
@@ -15752,13 +15666,15 @@ fn other_view_lists_every_reset_time_and_available_reset_credits() {
 
     let expected_resets = [primary_reset, secondary_reset, expired_reset].map(|reset| {
         reset
-            .with_timezone(&Local)
-            .format("%Y-%m-%d %H:%M:%S %:z")
+            .as_jiff()
+            .to_zoned_datetime(TimeZone::system())
+            .strftime("%Y-%m-%d %H:%M:%S %:z")
             .to_string()
     });
     let expected_credit_resets = [first_credit_expires, second_credit_expires].map(|time| {
-        time.with_timezone(&Local)
-            .format("%Y-%m-%d %H:%M:%S %:z")
+        time.as_jiff()
+            .to_zoned_datetime(TimeZone::system())
+            .strftime("%Y-%m-%d %H:%M:%S %:z")
             .to_string()
     });
     let credit_granted_times = [
@@ -15807,8 +15723,9 @@ fn other_view_lists_every_reset_time_and_available_reset_credits() {
                 );
             }
             let expected_grants = credit_granted_times.map(|time| {
-                time.with_timezone(&Local)
-                    .format(if width < 80 {
+                time.as_jiff()
+                    .to_zoned_datetime(TimeZone::system())
+                    .strftime(if width < 80 {
                         "%m-%d %H:%M"
                     } else {
                         "%Y-%m-%d %H:%M:%S %:z"
@@ -16035,10 +15952,10 @@ fn other_view_caps_many_credit_rows_and_keeps_diagnostics_intact() {
             message: None,
         })
         .collect();
-    let primary_reset = now + chrono::Duration::hours(2);
-    let secondary_reset = now + chrono::Duration::hours(3);
-    let review_primary_reset = now + chrono::Duration::hours(4);
-    let review_secondary_reset = now + chrono::Duration::hours(5);
+    let primary_reset = now + SignedDuration::hours(2);
+    let secondary_reset = now + SignedDuration::hours(3);
+    let review_primary_reset = now + SignedDuration::hours(4);
+    let review_secondary_reset = now + SignedDuration::hours(5);
     app.snapshot.limits = vec![
         LimitBucket {
             limit_id: "codex".to_string(),
@@ -16074,8 +15991,8 @@ fn other_view_caps_many_credit_rows_and_keeps_diagnostics_intact() {
     let credit_times = (0..8)
         .map(|index| {
             (
-                now - chrono::Duration::minutes(index),
-                now + chrono::Duration::days(index + 1),
+                now - SignedDuration::minutes(index),
+                now + SignedDuration::days(index + 1),
             )
         })
         .collect::<Vec<_>>();
@@ -16117,16 +16034,18 @@ fn other_view_caps_many_credit_rows_and_keeps_diagnostics_intact() {
         assert!(
             content.contains(
                 &granted_at
-                    .with_timezone(&Local)
-                    .format("%m-%d %H:%M")
+                    .as_jiff()
+                    .to_zoned_datetime(TimeZone::system())
+                    .strftime("%m-%d %H:%M")
                     .to_string()
             )
         );
         assert!(
             content.contains(
                 &expires_at
-                    .with_timezone(&Local)
-                    .format("%Y-%m-%d %H:%M:%S %:z")
+                    .as_jiff()
+                    .to_zoned_datetime(TimeZone::system())
+                    .strftime("%Y-%m-%d %H:%M:%S %:z")
                     .to_string()
             )
         );
@@ -16138,8 +16057,9 @@ fn other_view_caps_many_credit_rows_and_keeps_diagnostics_intact() {
         assert!(
             content.contains(
                 &reset
-                    .with_timezone(&Local)
-                    .format("%Y-%m-%d %H:%M:%S %:z")
+                    .as_jiff()
+                    .to_zoned_datetime(TimeZone::system())
+                    .strftime("%Y-%m-%d %H:%M:%S %:z")
                     .to_string()
             )
         );
@@ -16147,8 +16067,9 @@ fn other_view_caps_many_credit_rows_and_keeps_diagnostics_intact() {
     assert!(
         !content.contains(
             &review_secondary_reset
-                .with_timezone(&Local)
-                .format("%Y-%m-%d %H:%M:%S %:z")
+                .as_jiff()
+                .to_zoned_datetime(TimeZone::system())
+                .strftime("%Y-%m-%d %H:%M:%S %:z")
                 .to_string()
         )
     );
@@ -16850,7 +16771,7 @@ fn task_click_ignores_non_rows_non_left_clicks_and_stale_views() {
 #[test]
 fn renders_all_views_at_common_terminal_sizes() {
     for (width, height) in [(80, 24), (120, 40)] {
-        let now = chrono::Utc::now();
+        let now = UtcTimestamp::now();
         let snapshot = Snapshot {
             schema_version: 1,
             api_pricing: Default::default(),
@@ -16866,12 +16787,12 @@ fn renders_all_views_at_common_terminal_sizes() {
                 primary: Some(LimitWindow::new(
                     25.0,
                     Some(300),
-                    Some(now + chrono::Duration::hours(2)),
+                    Some(now + SignedDuration::hours(2)),
                 )),
                 secondary: Some(LimitWindow::new(
                     40.0,
                     Some(10_080),
-                    Some(now + chrono::Duration::days(4)),
+                    Some(now + SignedDuration::days(4)),
                 )),
                 credits: None,
                 rate_limit_reached_type: None,
@@ -16936,8 +16857,8 @@ fn renders_all_views_at_common_terminal_sizes() {
                 window: Some(WindowDescriptor {
                     limit_id: "codex".to_string(),
                     label: "5h".to_string(),
-                    starts_at: now - chrono::Duration::hours(3),
-                    ends_at: now + chrono::Duration::hours(2),
+                    starts_at: now - SignedDuration::hours(3),
+                    ends_at: now + SignedDuration::hours(2),
                     used_percent: 25.0,
                 }),
                 ..AttributionSummary::default()
@@ -17093,7 +17014,7 @@ fn renders_all_views_at_common_terminal_sizes() {
 fn settings_quota_merge_control_is_opt_in_clickable_and_keyboard_accessible() {
     let directory = tempfile::tempdir().unwrap();
     let mut app = interaction_test_app(0, 0);
-    install_remote_sources_fixture(&mut app, directory.path(), Utc::now());
+    install_remote_sources_fixture(&mut app, directory.path(), UtcTimestamp::now());
     let source_id: NodeId = "node-11111111111111111111111111111111".parse().unwrap();
     let source = SourceMetadata::new(source_id.clone(), SourceKind::Ssh, "dev").unwrap();
     assert!(!source.quota_matches_local_account());
@@ -17176,7 +17097,7 @@ fn settings_quota_merge_control_is_opt_in_clickable_and_keyboard_accessible() {
 fn settings_agent_deployment_supports_keyboard_whole_label_click_and_compact_layout() {
     let directory = tempfile::tempdir().unwrap();
     let mut app = interaction_test_app(0, 0);
-    install_remote_sources_fixture(&mut app, directory.path(), Utc::now());
+    install_remote_sources_fixture(&mut app, directory.path(), UtcTimestamp::now());
     app.view = View::Settings;
     app.selected_setting = SettingItem::ALL.len();
     for theme in [Theme::Dark, Theme::Light] {
@@ -17375,7 +17296,7 @@ fn settings_remote_update_scope_and_adoption_are_explicit_and_whole_label_clicka
         for (width, height) in [(40, 14), (80, 24), (110, 24)] {
             let directory = tempfile::tempdir().unwrap();
             let mut app = interaction_test_app(0, 0);
-            install_remote_sources_fixture(&mut app, directory.path(), Utc::now());
+            install_remote_sources_fixture(&mut app, directory.path(), UtcTimestamp::now());
             app.view = View::Settings;
             app.theme = theme;
             app.selected_setting = SettingItem::ALL.len();
@@ -17493,7 +17414,8 @@ fn settings_remote_update_scope_and_adoption_are_explicit_and_whole_label_clicka
 fn settings_remote_update_rejects_stale_config_and_hides_actions_in_tiny_terminals() {
     let directory = tempfile::tempdir().unwrap();
     let mut app = interaction_test_app(0, 0);
-    let (store, _) = install_remote_sources_fixture(&mut app, directory.path(), Utc::now());
+    let (store, _) =
+        install_remote_sources_fixture(&mut app, directory.path(), UtcTimestamp::now());
     app.view = View::Settings;
     app.selected_setting = SettingItem::ALL.len();
     app.begin_remote_update();

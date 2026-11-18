@@ -14,8 +14,6 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration as StdDuration, Instant};
 
-use chrono::{DateTime, Utc};
-
 use crate::domain::TaskRecord;
 use crate::git_repository::GitProjectEvidenceResolver;
 use crate::history::{
@@ -48,6 +46,7 @@ use crate::source_history::{
 };
 use crate::source_identity::{SourceIdentity, SourceIdentityStore};
 use crate::source_model::ObservedProjectKey;
+use crate::time::UtcTimestamp;
 use crate::trace::{TraceFields, TraceOutcome, process_trace_log};
 
 const LEGACY_HISTORY_DIRECTORY: &str = "history-v1";
@@ -98,7 +97,7 @@ pub enum HistoryRuntimeWriteReport {
 
 #[derive(Clone, Debug)]
 struct StagedLocalSessionDigests {
-    observed_at: DateTime<Utc>,
+    observed_at: UtcTimestamp,
     scan_complete: bool,
     digests: Vec<SourceSessionDigest>,
 }
@@ -509,7 +508,7 @@ impl HistoryRuntime {
     /// error; durable projections never read old JSON or overlay pending data.
     pub fn load_unified_history_since(
         &mut self,
-        since: DateTime<Utc>,
+        since: UtcTimestamp,
     ) -> io::Result<UnifiedHistorySnapshot> {
         self.load_unified_history_since_selected(&HistorySourceSelection::AllIncluded, since)
     }
@@ -519,7 +518,7 @@ impl HistoryRuntime {
     pub fn load_unified_history_since_selected(
         &mut self,
         selection: &HistorySourceSelection,
-        since: DateTime<Utc>,
+        since: UtcTimestamp,
     ) -> io::Result<UnifiedHistorySnapshot> {
         self.query_history_selected(
             selection,
@@ -646,7 +645,7 @@ impl HistoryRuntime {
     /// Loads durable history while local observations may still be pending.
     pub fn load_unified_history_since_with_staged(
         &mut self,
-        since: DateTime<Utc>,
+        since: UtcTimestamp,
     ) -> io::Result<UnifiedHistorySnapshot> {
         self.load_unified_history_since_with_staged_selected(
             &HistorySourceSelection::AllIncluded,
@@ -659,7 +658,7 @@ impl HistoryRuntime {
     pub fn load_unified_history_since_with_staged_selected(
         &mut self,
         selection: &HistorySourceSelection,
-        since: DateTime<Utc>,
+        since: UtcTimestamp,
     ) -> io::Result<UnifiedHistorySnapshot> {
         self.query_history_with_staged_selected(
             selection,
@@ -695,8 +694,8 @@ impl HistoryRuntime {
     /// from `[from, to)`.
     pub fn flush_staged_reconcile(
         &mut self,
-        from: DateTime<Utc>,
-        to: DateTime<Utc>,
+        from: UtcTimestamp,
+        to: UtcTimestamp,
     ) -> io::Result<Option<HistoryRuntimeWriteReport>> {
         if from >= to {
             return Err(io::Error::new(
@@ -711,7 +710,7 @@ impl HistoryRuntime {
     /// requested complete marker to partial.
     pub fn mark_summary_backfill_attempt(
         &mut self,
-        completed_at: DateTime<Utc>,
+        completed_at: UtcTimestamp,
         complete: bool,
     ) -> io::Result<SummaryBackfillAttempt> {
         let lease = self.ownership.acquire_writer_lease()?;
@@ -734,7 +733,7 @@ impl HistoryRuntime {
     fn flush_staged_internal(
         &mut self,
         due_interval: Option<StdDuration>,
-        reconcile: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        reconcile: Option<(UtcTimestamp, UtcTimestamp)>,
     ) -> io::Result<Option<HistoryRuntimeWriteReport>> {
         let lease = self.ownership.acquire_writer_lease()?;
         let manifest = self.load_runtime_write_manifest()?;
@@ -922,7 +921,7 @@ impl HistoryRuntime {
     fn maybe_garbage_collect_after_local_write(
         &self,
         writer: &SourceHistoryWriter<'_, '_, '_>,
-        observed_at: DateTime<Utc>,
+        observed_at: UtcTimestamp,
         report: &mut LocalObservationWriteReport,
     ) {
         let now = Instant::now();
@@ -978,7 +977,7 @@ impl HistoryRuntime {
     /// explicit v2 cutover completes.
     pub fn mark_v2_summary_backfill_attempt(
         &self,
-        completed_at: DateTime<Utc>,
+        completed_at: UtcTimestamp,
         complete: bool,
     ) -> io::Result<V2SummaryBackfillAttempt> {
         let lease = self.ownership.acquire_writer_lease()?;
@@ -1325,7 +1324,7 @@ mod tests {
     use std::sync::{Arc, Barrier};
     use std::thread;
 
-    use chrono::{Duration, TimeZone};
+    use crate::time::Duration;
     use tempfile::tempdir;
 
     use crate::api_cost::API_PRICING_CATALOG_REVISION;
@@ -1346,10 +1345,8 @@ mod tests {
     };
     use crate::source_identity::NodeId;
 
-    fn at(day: u32, hour: u32, minute: u32) -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 8, day, hour, minute, 0)
-            .single()
-            .unwrap()
+    fn at(day: u32, hour: u32, minute: u32) -> UtcTimestamp {
+        UtcTimestamp::from_utc(2026, 8, day, hour, minute, 0).unwrap()
     }
 
     fn runtime_paths(directory: &Path) -> (PathBuf, PathBuf) {
@@ -1395,7 +1392,7 @@ mod tests {
         );
     }
 
-    fn sample_bucket(starts_at: DateTime<Utc>, tokens: u64) -> LocalHalfHourBucket {
+    fn sample_bucket(starts_at: UtcTimestamp, tokens: u64) -> LocalHalfHourBucket {
         let ends_at = starts_at + Duration::minutes(15);
         LocalHalfHourBucket {
             starts_at,
@@ -1432,7 +1429,7 @@ mod tests {
         }
     }
 
-    fn sample_observation(starts_at: DateTime<Utc>, tokens: u64) -> HistoryObservation {
+    fn sample_observation(starts_at: UtcTimestamp, tokens: u64) -> HistoryObservation {
         HistoryObservation {
             observed_at: starts_at + Duration::minutes(20),
             quota_points: vec![QuotaPoint {

@@ -3,9 +3,8 @@
 
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, Utc};
-
 use crate::history::QuotaPoint;
+use crate::time::UtcTimestamp;
 
 const SAMPLE_SECONDS: i64 = 300;
 const RESET_DRIFT_SECONDS: i64 = 120;
@@ -27,8 +26,8 @@ pub(crate) fn merge_quota_points(mut points: Vec<QuotaPoint>) -> Vec<QuotaPoint>
             .then(a.limit_id.cmp(&b.limit_id))
             .then_with(|| provenance_rank(a.provenance).cmp(&provenance_rank(b.provenance)))
     });
-    let mut merged = BTreeMap::<(String, i64, DateTime<Utc>, i64), QuotaPoint>::new();
-    let mut cycle: Option<(String, i64, DateTime<Utc>)> = None;
+    let mut merged = BTreeMap::<(String, i64, UtcTimestamp, i64), QuotaPoint>::new();
+    let mut cycle: Option<(String, i64, UtcTimestamp)> = None;
     for mut point in points {
         let limit = point.limit_id.to_ascii_lowercase();
         let anchor = match &cycle {
@@ -99,10 +98,10 @@ fn provenance_rank(provenance: crate::domain::Provenance) -> u8 {
 mod tests {
     use super::*;
     use crate::domain::Provenance;
-    use chrono::Duration;
+    use crate::time::Duration;
 
     fn point(minutes: i64, remaining: f64, reset_offset: i64) -> QuotaPoint {
-        let base = DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+        let base = UtcTimestamp::from_timestamp(1_800_000_000, 0).unwrap();
         QuotaPoint {
             observed_at: base + Duration::minutes(minutes),
             resets_at: base + Duration::hours(5) + Duration::seconds(reset_offset),

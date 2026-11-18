@@ -5,7 +5,6 @@ use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use chrono::{DateTime, Utc};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::Line;
@@ -24,6 +23,7 @@ use crate::domain::{TaskRecord, terminal_safe_text};
 use crate::event_log::LogLevel;
 use crate::rollout::RolloutCache;
 use crate::session_delete::{DeletionOutcome, PreparedSessionDeletion};
+use crate::time::UtcTimestamp;
 
 pub(super) const DELETE_ACTION_SECTION: &str = "action.delete-session";
 const REFRESH_STOPPED_DELETE_WARNING: &str =
@@ -38,8 +38,8 @@ pub(super) struct SessionDeleteTarget {
 
 #[derive(Clone)]
 pub(super) struct DeletedSessionInfo {
-    pub(super) deleted_at: Option<DateTime<Utc>>,
-    pub(super) captured_at: DateTime<Utc>,
+    pub(super) deleted_at: Option<UtcTimestamp>,
+    pub(super) captured_at: UtcTimestamp,
 }
 
 pub(super) enum DeletePhase {

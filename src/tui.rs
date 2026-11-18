@@ -37,13 +37,14 @@ use anyhow::{Result, ensure};
 use base64::Engine;
 #[cfg(test)]
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use chrono::{DateTime, Duration as ChronoDuration, Local, NaiveDate, NaiveDateTime, Utc};
-#[cfg(test)]
-use chrono::{FixedOffset, Timelike};
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
     MouseEventKind,
 };
+use jiff::civil::{Date, DateTime as CivilDateTime};
+#[cfg(test)]
+use jiff::tz::Offset;
+use jiff::tz::TimeZone;
 use ratatui::Frame;
 use ratatui::Terminal;
 use ratatui::backend::{CrosstermBackend, TestBackend};
@@ -173,6 +174,7 @@ use crate::summary_report::{
     SummaryDailyCoverage, expected_summary_coverage, retain_summary_backfill_evidence_buckets,
     summary_api_cost_for_catalog, summary_backfill_scan_complete,
 };
+use crate::time::{Duration as SignedDuration, UtcTimestamp};
 use crate::trace::{TraceFields, TraceLog, TraceOutcome, process_trace_log};
 use crate::trends::{
     TrendPoint, TrendReadout, TrendReadoutValue, TrendsReport, build_trends_report,
@@ -186,7 +188,7 @@ use crate::ui_state::{
 };
 
 const LOCAL_REFRESH: Duration = Duration::from_secs(2);
-const REMOTE_LIVE_STALE_AFTER: ChronoDuration = ChronoDuration::minutes(15);
+const REMOTE_LIVE_STALE_AFTER: SignedDuration = SignedDuration::minutes(15);
 const ACCOUNT_REFRESH: Duration = Duration::from_secs(45);
 const ACCOUNT_REFRESH_RETRY_DELAYS: [Duration; 2] =
     [Duration::from_secs(5), Duration::from_secs(10)];
@@ -237,7 +239,7 @@ struct TuiRemoteOverviewCache {
 #[derive(Clone, Debug)]
 struct TuiHistoryProjectionCache {
     selection: HistorySourceSelection,
-    since: DateTime<Utc>,
+    since: UtcTimestamp,
     revision: HistoryProjectionRevision,
     projection: TuiHistoryProjection,
     loaded_at: Instant,
@@ -277,7 +279,7 @@ struct TuiHistoryProjection {
 impl TuiHistoryStore {
     fn with_query_request<R>(
         &mut self,
-        now: DateTime<Utc>,
+        now: UtcTimestamp,
         query: impl FnOnce(&mut Self) -> R,
     ) -> R {
         self.query_context = Some(HistoryQueryContext::new(history_view_since(now)));
@@ -341,7 +343,7 @@ impl TuiHistoryStore {
         &mut self,
         _codex_home: &Path,
         _redact_content: bool,
-        now: DateTime<Utc>,
+        now: UtcTimestamp,
     ) -> DeferredTuiHistoryPreparation {
         if !self.runtime_preparation_pending {
             return DeferredTuiHistoryPreparation::AlreadyPrepared;
@@ -418,7 +420,7 @@ impl TuiHistoryStore {
     fn load_remote_overview_history(
         &mut self,
         unified_seed: Option<&HistoryData>,
-        now: DateTime<Utc>,
+        now: UtcTimestamp,
     ) -> Result<RemoteOverviewHistory, String> {
         let TuiHistoryBackend::Runtime(runtime) = &mut self.backend else {
             return Ok(RemoteOverviewHistory::default());
@@ -657,8 +659,8 @@ impl TuiHistoryStore {
 
     fn flush_staged_reconcile(
         &mut self,
-        from: DateTime<Utc>,
-        to: DateTime<Utc>,
+        from: UtcTimestamp,
+        to: UtcTimestamp,
     ) -> io::Result<Option<HistoryRuntimeWriteReport>> {
         if !self.validate_runtime_write_authority()? {
             return Ok(None);
@@ -670,7 +672,7 @@ impl TuiHistoryStore {
     }
 
     #[cfg(test)]
-    fn load_since_with_staged(&mut self, since: DateTime<Utc>) -> HistoryData {
+    fn load_since_with_staged(&mut self, since: UtcTimestamp) -> HistoryData {
         self.load_since_with_staged_selected(&HistorySourceSelection::AllIncluded, since)
             .history
     }
@@ -691,7 +693,7 @@ impl TuiHistoryStore {
     fn projection_cache_valid(
         &mut self,
         selection: &HistorySourceSelection,
-        since: DateTime<Utc>,
+        since: UtcTimestamp,
         rebase_revision: bool,
     ) -> bool {
         let Some(revision) = self.projection_revision(selection).ok().flatten() else {
@@ -738,7 +740,7 @@ impl TuiHistoryStore {
     fn cached_projection(
         &mut self,
         selection: &HistorySourceSelection,
-        since: DateTime<Utc>,
+        since: UtcTimestamp,
         rebase_revision: bool,
     ) -> Option<TuiHistoryProjection> {
         self.projection_cache_valid(selection, since, rebase_revision)
@@ -749,7 +751,7 @@ impl TuiHistoryStore {
     fn cache_projection_if_revision_consistent(
         &mut self,
         selection: &HistorySourceSelection,
-        since: DateTime<Utc>,
+        since: UtcTimestamp,
         projection: &TuiHistoryProjection,
         revision_before: Option<HistoryProjectionRevision>,
         revision_after: Option<HistoryProjectionRevision>,
@@ -781,7 +783,7 @@ impl TuiHistoryStore {
     fn load_since_with_staged_selected(
         &mut self,
         selection: &HistorySourceSelection,
-        since: DateTime<Utc>,
+        since: UtcTimestamp,
     ) -> TuiHistoryProjection {
         let runtime_backend = matches!(&self.backend, TuiHistoryBackend::Runtime(_));
         let revision_before = runtime_backend
@@ -880,7 +882,7 @@ impl TuiHistoryStore {
     fn reload_since_if_stale_with_staged_selected(
         &mut self,
         selection: &HistorySourceSelection,
-        since: DateTime<Utc>,
+        since: UtcTimestamp,
     ) -> Option<TuiHistoryProjection> {
         if matches!(&self.backend, TuiHistoryBackend::Runtime(_)) {
             // Source-aware history can change when another process completes
@@ -912,7 +914,7 @@ impl TuiHistoryStore {
 
     fn mark_summary_backfill_attempt(
         &mut self,
-        completed_at: DateTime<Utc>,
+        completed_at: UtcTimestamp,
         complete: bool,
     ) -> io::Result<crate::history::SummaryBackfillAttempt> {
         if !self.validate_runtime_write_authority()? {
@@ -973,48 +975,45 @@ const MAX_DEBUG_STARTUP_CELLS: u32 = 500_000;
 
 #[cfg(test)]
 thread_local! {
-    static TEST_DISPLAY_OFFSET: std::cell::Cell<Option<FixedOffset>> =
+    static TEST_DISPLAY_OFFSET: std::cell::Cell<Option<Offset>> =
         const { std::cell::Cell::new(None) };
 }
 
-fn format_local_time(value: DateTime<Utc>, format: &str) -> String {
+fn display_time_zone() -> TimeZone {
     #[cfg(test)]
     if let Some(offset) = TEST_DISPLAY_OFFSET.with(std::cell::Cell::get) {
-        return value.with_timezone(&offset).format(format).to_string();
+        return offset.to_time_zone();
     }
 
-    value.with_timezone(&Local).format(format).to_string()
+    TimeZone::system()
 }
 
-fn display_local_date(value: DateTime<Utc>) -> chrono::NaiveDate {
-    #[cfg(test)]
-    if let Some(offset) = TEST_DISPLAY_OFFSET.with(std::cell::Cell::get) {
-        return value.with_timezone(&offset).date_naive();
-    }
-
-    value.with_timezone(&Local).date_naive()
+fn format_local_time(value: UtcTimestamp, format: &str) -> String {
+    let Some(instant) = value.as_jiff_checked() else {
+        return value.to_rfc3339();
+    };
+    instant
+        .to_zoned_datetime(display_time_zone())
+        .strftime(format)
+        .to_string()
 }
 
-fn display_local_datetime(value: DateTime<Utc>) -> NaiveDateTime {
-    #[cfg(test)]
-    if let Some(offset) = TEST_DISPLAY_OFFSET.with(std::cell::Cell::get) {
-        return value.with_timezone(&offset).naive_local();
-    }
+fn display_local_date(value: UtcTimestamp) -> Date {
+    display_local_datetime(value).date()
+}
 
-    value.with_timezone(&Local).naive_local()
+fn display_local_datetime(value: UtcTimestamp) -> CivilDateTime {
+    display_time_zone().to_datetime(value.as_jiff())
 }
 
 #[cfg(test)]
-fn display_local_hour(value: DateTime<Utc>) -> NaiveDateTime {
+fn display_local_hour(value: UtcTimestamp) -> CivilDateTime {
     let value = display_local_datetime(value);
-    value
-        .date()
-        .and_hms_opt(value.hour(), 0, 0)
-        .unwrap_or(value)
+    value.date().at(value.hour(), 0, 0, 0)
 }
 
 #[cfg(test)]
-struct TestDisplayOffsetGuard(Option<FixedOffset>);
+struct TestDisplayOffsetGuard(Option<Offset>);
 
 #[cfg(test)]
 impl Drop for TestDisplayOffsetGuard {
@@ -1024,7 +1023,7 @@ impl Drop for TestDisplayOffsetGuard {
 }
 
 #[cfg(test)]
-fn with_test_display_offset<T>(offset: FixedOffset, render: impl FnOnce() -> T) -> T {
+fn with_test_display_offset<T>(offset: Offset, render: impl FnOnce() -> T) -> T {
     let _guard =
         TestDisplayOffsetGuard(TEST_DISPLAY_OFFSET.with(|current| current.replace(Some(offset))));
     let _summary_guard = crate::summary_report::set_test_local_offset(offset);
@@ -1295,12 +1294,12 @@ enum TrendValueKind {
 
 #[derive(Clone, Copy, Debug)]
 enum TrendGraphKind {
-    Line { maximum_gap: chrono::Duration },
-    Bar { expected_step: chrono::Duration },
+    Line { maximum_gap: SignedDuration },
+    Bar { expected_step: SignedDuration },
 }
 
 impl TrendGraphKind {
-    fn selection_tolerance(self) -> chrono::Duration {
+    fn selection_tolerance(self) -> SignedDuration {
         match self {
             Self::Line { maximum_gap } => maximum_gap,
             Self::Bar { expected_step } => expected_step,
@@ -1320,7 +1319,7 @@ enum TrendPanelId {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct TrendInspection {
     panel: TrendPanelId,
-    at: DateTime<Utc>,
+    at: UtcTimestamp,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1335,7 +1334,7 @@ struct TrendChartHitbox {
     legend: Option<Rect>,
     x_bounds: [f64; 2],
     graph_kind: TrendGraphKind,
-    inspectable_times: Vec<DateTime<Utc>>,
+    inspectable_times: Vec<UtcTimestamp>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1376,7 +1375,7 @@ impl TrendChartHitbox {
             })
     }
 
-    fn nearest_inspection(&self, at: DateTime<Utc>) -> Option<TrendInspection> {
+    fn nearest_inspection(&self, at: UtcTimestamp) -> Option<TrendInspection> {
         let tolerance_ms = self
             .graph_kind
             .selection_tolerance()
@@ -1397,7 +1396,7 @@ impl TrendChartHitbox {
             })
     }
 
-    fn step_inspection(&self, current: DateTime<Utc>, forward: bool) -> Option<TrendInspection> {
+    fn step_inspection(&self, current: UtcTimestamp, forward: bool) -> Option<TrendInspection> {
         let at = if forward {
             self.inspectable_times
                 .iter()
@@ -1429,7 +1428,7 @@ impl TrendChartHitbox {
             f64::from(column.saturating_sub(self.plot.x)) / f64::from(self.plot.width - 1)
         };
         let target = self.x_bounds[0] + fraction * (self.x_bounds[1] - self.x_bounds[0]);
-        let target = DateTime::from_timestamp(target.round() as i64, 0)?;
+        let target = UtcTimestamp::from_timestamp(target.round() as i64, 0)?;
         self.nearest_inspection(target)
     }
 }
@@ -1768,8 +1767,8 @@ fn window_analysis_with_api_long_context(
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ResetExpiryReminder {
-    expires_at: chrono::DateTime<chrono::Utc>,
-    weekly_reset_at: chrono::DateTime<chrono::Utc>,
+    expires_at: UtcTimestamp,
+    weekly_reset_at: UtcTimestamp,
 }
 
 fn reset_expiry_reminder(snapshot: &Snapshot) -> Option<ResetExpiryReminder> {
@@ -2281,11 +2280,11 @@ struct SummaryBarHitbox {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SummaryDailyHitbox {
     plot: Rect,
-    dates: Vec<NaiveDateTime>,
+    dates: Vec<CivilDateTime>,
 }
 
 impl SummaryDailyHitbox {
-    fn exact(plot: Rect, dates: Vec<NaiveDateTime>) -> Option<Self> {
+    fn exact(plot: Rect, dates: Vec<CivilDateTime>) -> Option<Self> {
         if plot.is_empty() {
             return None;
         }
@@ -2297,7 +2296,7 @@ impl SummaryDailyHitbox {
         rect_contains(self.plot, column, row)
     }
 
-    fn date_at_column(&self, column: u16) -> Option<NaiveDateTime> {
+    fn date_at_column(&self, column: u16) -> Option<CivilDateTime> {
         if self.plot.is_empty() {
             return None;
         }
@@ -2439,9 +2438,9 @@ fn summary_daily_status_symbols(states: &[SummaryDailyState]) -> String {
 #[derive(Clone, Debug)]
 struct SummaryCache {
     range: SummaryRange,
-    snapshot_as_of: DateTime<Utc>,
+    snapshot_as_of: UtcTimestamp,
     query_bucket: i64,
-    query_local_date: NaiveDate,
+    query_local_date: Date,
     prepared: PreparedSummary,
     chart: SummaryChartData,
 }
@@ -2536,7 +2535,7 @@ struct TrendPanelSpec<'a> {
     graph_kind: TrendGraphKind,
     value_kind: TrendValueKind,
     fixed_y_bounds: Option<[f64; 2]>,
-    fixed_x_bounds: Option<[DateTime<Utc>; 2]>,
+    fixed_x_bounds: Option<[UtcTimestamp; 2]>,
     history_warning_count: usize,
     history_read_only: bool,
     readout_label: Option<&'static str>,
@@ -2828,7 +2827,7 @@ struct RemoteBandwidthHostStatus {
     rolling_bytes: Option<u64>,
     soft: RemoteBandwidthThresholdStatus,
     hard: RemoteBandwidthThresholdStatus,
-    resume_at: Option<DateTime<Utc>>,
+    resume_at: Option<UtcTimestamp>,
     error: Option<String>,
 }
 
@@ -3417,7 +3416,7 @@ struct App {
     summary_tree_marker_hitboxes: Vec<SummaryTreeMarkerHitbox>,
     summary_bar_hitboxes: Vec<SummaryBarHitbox>,
     summary_daily_hitbox: Option<SummaryDailyHitbox>,
-    summary_inspected_date: Option<NaiveDateTime>,
+    summary_inspected_date: Option<CivilDateTime>,
     summary_daily_dragging: bool,
     summary_scrollbar_hitbox: Option<ScrollbarHitbox>,
     summary_backfill_pending: bool,
@@ -3759,7 +3758,7 @@ impl App {
         let summary_inputs_unchanged =
             self.summary_cache.is_some() && summary_history_inputs_eq(&self.history, &history);
         if !self.summary_backfill_running {
-            let query_now = Utc::now().max(self.snapshot.as_of);
+            let query_now = UtcTimestamp::now().max(self.snapshot.as_of);
             self.summary_backfill_pending = summary_history_backfill_needed(&history, query_now);
         }
         self.history = history;
@@ -4983,7 +4982,7 @@ impl App {
             self.remote_health_store.as_ref(),
             self.remote_bandwidth_store.as_ref(),
             self.remote_sources.config.as_ref(),
-            Utc::now(),
+            UtcTimestamp::now(),
         );
         self.remote_config_retry_not_before =
             config_busy.then(|| now.checked_add(REMOTE_CONFIG_BUSY_RETRY).unwrap_or(now));
@@ -6420,13 +6419,13 @@ impl App {
     }
 
     fn replace_remote_live_states(&mut self, states: Vec<SourceRemoteLiveSnapshot>) -> bool {
-        self.replace_remote_live_states_at(states, Utc::now())
+        self.replace_remote_live_states_at(states, UtcTimestamp::now())
     }
 
     fn replace_remote_live_states_at(
         &mut self,
         states: Vec<SourceRemoteLiveSnapshot>,
-        now: DateTime<Utc>,
+        now: UtcTimestamp,
     ) -> bool {
         if self.remote_live_states == states
             && !remote_live_quality_requires_remerge(&self.snapshot, &states, now)
@@ -6475,7 +6474,7 @@ impl App {
             &mut self.snapshot,
             &self.remote_live_states,
             &self.remote_overview_history,
-            Utc::now(),
+            UtcTimestamp::now(),
         );
         self.summary_cache = None;
         self.expanded_task_threads.retain(|thread_id| {
@@ -6508,10 +6507,10 @@ impl App {
     }
 
     fn record_remote_live_load_error(&mut self, message: String) -> bool {
-        self.record_remote_live_load_error_at(message, Utc::now())
+        self.record_remote_live_load_error_at(message, UtcTimestamp::now())
     }
 
-    fn record_remote_live_load_error_at(&mut self, message: String, now: DateTime<Utc>) -> bool {
+    fn record_remote_live_load_error_at(&mut self, message: String, now: UtcTimestamp) -> bool {
         let mut changed = false;
         if remote_live_quality_requires_remerge(&self.snapshot, &self.remote_live_states, now) {
             self.snapshot = self.local_snapshot.clone();
@@ -6545,7 +6544,7 @@ impl App {
         &mut self,
         failure: RefreshWorkerFailure,
         now: Instant,
-        observed_at: DateTime<Utc>,
+        observed_at: UtcTimestamp,
     ) -> bool {
         fn push_warning(snapshot: &mut Snapshot, warning: &str) {
             snapshot.partial = true;
@@ -7150,7 +7149,7 @@ impl App {
         true
     }
 
-    fn default_summary_inspection_date(&self) -> Option<NaiveDateTime> {
+    fn default_summary_inspection_date(&self) -> Option<CivilDateTime> {
         let hitbox = self.summary_daily_hitbox.as_ref()?;
         let cache = self.summary_cache.as_ref()?;
         hitbox
@@ -9286,7 +9285,7 @@ fn run_with_theme_override(config: CollectConfig, theme_override: Option<Theme>)
 }
 
 fn initial_loading_result(config: &CollectConfig) -> CollectionResult {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let app_server_status = if config.offline { "offline" } else { "loading" };
     let app_server_message = if config.offline {
         "disabled by --offline"
@@ -9460,7 +9459,7 @@ fn tui_history_store_from_binding(
 fn prepare_tui_history_runtime(
     runtime: &mut HistoryRuntime,
     profile_lease: &HistoryProfileLeaseGuard,
-    now: DateTime<Utc>,
+    now: UtcTimestamp,
 ) -> TuiHistoryRuntimePreparation {
     let mut warnings = Vec::new();
     if profile_lease.state_root() != runtime.state_root()
@@ -9579,7 +9578,7 @@ fn stage_and_load_history(
     observation: &HistoryObservation,
     tasks: &[TaskRecord],
     evidence: &LocalSessionDigestEvidence,
-    now: DateTime<Utc>,
+    now: UtcTimestamp,
     perf_log: &PerfLog,
     force_flush: bool,
 ) -> (HistoryData, RecorderHealth) {
@@ -9602,7 +9601,7 @@ fn stage_and_load_history_selected(
     observation: &HistoryObservation,
     tasks: &[TaskRecord],
     evidence: &LocalSessionDigestEvidence,
-    now: DateTime<Utc>,
+    now: UtcTimestamp,
     perf_log: &PerfLog,
     force_flush: bool,
     selection: &HistorySourceSelection,
@@ -9624,7 +9623,7 @@ fn stage_full_and_load_history_selected(
     observation: &HistoryObservation,
     tasks: &[TaskRecord],
     evidence: &LocalSessionDigestEvidence,
-    now: DateTime<Utc>,
+    now: UtcTimestamp,
     perf_log: &PerfLog,
     selection: &HistorySourceSelection,
 ) -> (TuiHistoryProjection, RecorderHealth) {
@@ -9713,7 +9712,7 @@ fn stage_and_load_history_selected_with_mode(
     observation: &HistoryObservation,
     tasks: &[TaskRecord],
     evidence: &LocalSessionDigestEvidence,
-    now: DateTime<Utc>,
+    now: UtcTimestamp,
     perf_log: &PerfLog,
     mode: TuiHistoryStageMode,
     selection: &HistorySourceSelection,
@@ -9843,7 +9842,7 @@ fn history_source_scope_label(selection: &HistorySourceSelection) -> &'static st
 
 fn flush_or_reload_history_if_due(
     store: &mut TuiHistoryStore,
-    now: DateTime<Utc>,
+    now: UtcTimestamp,
     perf_log: &PerfLog,
     selection: &HistorySourceSelection,
 ) -> Option<(TuiHistoryProjection, RecorderHealth)> {
@@ -10034,7 +10033,7 @@ pub fn debug_startup(
 }
 
 fn apply_refresh_completion(app: &mut App, completion: RefreshCompletion) -> bool {
-    apply_refresh_completion_at(app, completion, Instant::now(), Utc::now())
+    apply_refresh_completion_at(app, completion, Instant::now(), UtcTimestamp::now())
 }
 
 fn poll_refresh_worker(
@@ -10051,7 +10050,8 @@ fn poll_refresh_worker(
         && !app.refresh_stopped
     {
         if let Some(failure) = poisoned_refresh_state(rollout_cache, history_store) {
-            changed |= app.record_refresh_worker_failure(failure, Instant::now(), Utc::now());
+            changed |=
+                app.record_refresh_worker_failure(failure, Instant::now(), UtcTimestamp::now());
         } else {
             app.apply_deleted_session_records(initial.deleted_sessions);
             app.replace_displayed_collection(initial.result, false);
@@ -10087,7 +10087,7 @@ fn apply_refresh_completion_at(
     app: &mut App,
     mut completion: RefreshCompletion,
     now: Instant,
-    observed_at: DateTime<Utc>,
+    observed_at: UtcTimestamp,
 ) -> bool {
     if completion.worker_failure == Some(RefreshWorkerFailure::Initial)
         && app.history_initialization_pending
@@ -10290,7 +10290,7 @@ impl App {
                     .status
                     .as_ref()
                     .map_or("not-observed", |status| {
-                        if status.heartbeat_is_recent(Utc::now()) {
+                        if status.heartbeat_is_recent(UtcTimestamp::now()) {
                             "heartbeat-recent"
                         } else {
                             "heartbeat-stale"
@@ -10560,7 +10560,7 @@ fn collect_initial_refresh_with_snapshot(
         let preparation = history_store.prepare_deferred_runtime(
             &config.codex_home,
             config.redact_content,
-            Utc::now(),
+            UtcTimestamp::now(),
         );
         let source_state = history_store.ui_source_state();
         (preparation, source_state)
@@ -10731,7 +10731,7 @@ fn collect_initial_refresh_with_snapshot(
 }
 
 fn initial_refresh_panic_completion(config: &CollectConfig) -> RefreshCompletion {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let mut result = initial_loading_result(config);
     result.snapshot.as_of = now;
     result.snapshot.errors.push(
@@ -10899,7 +10899,7 @@ fn start_refresh_if_due(
     // immediately stops the session. The lock sites also check poison because
     // a worker may be interrupted after this preflight.
     if let Some(failure) = poisoned_refresh_state(rollout_cache, history_store) {
-        return app.record_refresh_worker_failure(failure, now, Utc::now());
+        return app.record_refresh_worker_failure(failure, now, UtcTimestamp::now());
     }
     if app.session_delete_visible() || app.session_delete_busy() {
         return false;
@@ -10909,7 +10909,7 @@ fn start_refresh_if_due(
             return app.record_refresh_worker_failure(
                 RefreshWorkerFailure::RolloutCachePoisoned,
                 now,
-                Utc::now(),
+                UtcTimestamp::now(),
             );
         };
         cache.invalidate_after_session_mutation();
@@ -10976,7 +10976,7 @@ fn start_refresh_if_due(
                     };
                     let projection = history_store.load_since_with_staged_selected(
                         &worker_selection,
-                        history_view_since(Utc::now()),
+                        history_view_since(UtcTimestamp::now()),
                     );
                     RefreshCompletion {
                         deleted_sessions: None,
@@ -11015,7 +11015,7 @@ fn start_refresh_if_due(
         && app.summary_range == SummaryRange::ThirtyDays
         && !app.summary_backfill_running
     {
-        let query_now = Utc::now().max(app.snapshot.as_of);
+        let query_now = UtcTimestamp::now().max(app.snapshot.as_of);
         app.summary_backfill_pending = summary_history_backfill_needed(&app.history, query_now);
     }
     let summary_backfill_due = !forced_local_refresh
@@ -11148,7 +11148,7 @@ fn start_refresh_if_due(
                     };
                     let query_now = result
                         .as_ref()
-                        .map_or_else(Utc::now, |result| result.snapshot.as_of);
+                        .map_or_else(UtcTimestamp::now, |result| result.snapshot.as_of);
                     history_store.with_query_request(query_now, |history_store| {
                         let history = match result.as_ref() {
                             Some(result) => {
@@ -11495,7 +11495,7 @@ fn load_remote_sources_state(
     health_store: Option<&RemoteSyncHealthStore>,
     bandwidth_store: Option<&RemoteBandwidthBudgetStore>,
     previous_config: Option<&RemotesConfig>,
-    now: DateTime<Utc>,
+    now: UtcTimestamp,
 ) -> (RemoteSourcesState, bool) {
     let (config, config_error, config_busy) = match config_store.try_load_or_create() {
         Ok(TryLoadRemotesConfig::Loaded(config)) => (Some(config), None, false),
@@ -11582,7 +11582,7 @@ fn unavailable_remote_bandwidth_host_status(
 fn load_remote_bandwidth_statuses(
     config: &RemotesConfig,
     store: Option<&RemoteBandwidthBudgetStore>,
-    now: DateTime<Utc>,
+    now: UtcTimestamp,
 ) -> Vec<RemoteBandwidthHostStatus> {
     let Some(store) = store else {
         return config
@@ -12322,10 +12322,10 @@ fn append_remote_ui_action_args(command: &mut Command, request: &RemoteUiActionR
 }
 
 fn render(frame: &mut Frame<'_>, app: &mut App) {
-    render_at(frame, app, Utc::now());
+    render_at(frame, app, UtcTimestamp::now());
 }
 
-fn render_at(frame: &mut Frame<'_>, app: &mut App, now: DateTime<Utc>) {
+fn render_at(frame: &mut Frame<'_>, app: &mut App, now: UtcTimestamp) {
     let area = frame.area();
     app.task_table_hitbox = None;
     app.turn_table_hitbox = None;
@@ -14958,7 +14958,7 @@ fn summary_snapshot_inputs_eq(
     incoming: &Snapshot,
     cache: &SummaryCache,
     range: SummaryRange,
-    query_now: DateTime<Utc>,
+    query_now: UtcTimestamp,
 ) -> bool {
     cache.range == range
         && summary_cache_window_matches(cache, incoming, range, query_now)
@@ -14969,7 +14969,7 @@ fn summary_cache_window_matches(
     cache: &SummaryCache,
     snapshot: &Snapshot,
     range: SummaryRange,
-    query_now: DateTime<Utc>,
+    query_now: UtcTimestamp,
 ) -> bool {
     if range != SummaryRange::Cycle {
         return true;
@@ -15025,7 +15025,7 @@ fn summary_history_inputs_eq(current: &HistoryData, incoming: &HistoryData) -> b
             })
 }
 
-fn prepare_summary(app: &App, query_now: DateTime<Utc>) -> PreparedSummary {
+fn prepare_summary(app: &App, query_now: UtcTimestamp) -> PreparedSummary {
     let snapshot = if matches!(
         app.history_source_applied_selection,
         HistorySourceSelection::Remote(_)
@@ -15050,13 +15050,11 @@ fn prepare_summary(app: &App, query_now: DateTime<Utc>) -> PreparedSummary {
 }
 
 #[cfg(test)]
-fn expected_summary_daily_coverage(
-    window: SummaryWindow,
-) -> BTreeMap<NaiveDate, SummaryDailyCoverage> {
+fn expected_summary_daily_coverage(window: SummaryWindow) -> BTreeMap<Date, SummaryDailyCoverage> {
     expected_summary_coverage(window, display_local_date)
 }
 
-fn ensure_summary_cache(app: &mut App, query_now: DateTime<Utc>) {
+fn ensure_summary_cache(app: &mut App, query_now: UtcTimestamp) {
     let query_now = query_now.max(app.snapshot.as_of);
     let query_bucket = query_now.timestamp().div_euclid(LOCAL_BUCKET_MINUTES * 60);
     let query_local_date = display_local_date(query_now);
@@ -15793,7 +15791,7 @@ fn render_summary_tree(
         && app.history.summary_backfill_attempt_complete == Some(false)
         && !summary_history_coverage_complete(
             &app.history,
-            prepared.usage.window.ends_at - ChronoDuration::nanoseconds(1),
+            prepared.usage.window.ends_at - SignedDuration::nanoseconds(1),
         );
     let mut title = format!(
         "Usage tree · {} · {range_label} · {total} · {:.0}% coverage",
@@ -16405,13 +16403,13 @@ fn summary_project_series(
     series
 }
 
-fn summary_bucket_label(starts_at: NaiveDateTime, grain: SummaryGrain, axis: bool) -> String {
+fn summary_bucket_label(starts_at: CivilDateTime, grain: SummaryGrain, axis: bool) -> String {
     if grain == SummaryGrain::Day {
-        starts_at.format("%m-%d").to_string()
+        starts_at.strftime("%m-%d").to_string()
     } else if axis {
-        starts_at.format("%m-%d %Hh").to_string()
+        starts_at.strftime("%m-%d %Hh").to_string()
     } else {
-        starts_at.format("%m-%d %H:%M").to_string()
+        starts_at.strftime("%m-%d %H:%M").to_string()
     }
 }
 
@@ -17086,7 +17084,7 @@ fn render_summary_daily(
     }
 }
 
-fn render_summary_at(frame: &mut Frame<'_>, area: Rect, app: &mut App, now: DateTime<Utc>) {
+fn render_summary_at(frame: &mut Frame<'_>, area: Rect, app: &mut App, now: UtcTimestamp) {
     ensure_summary_cache(app, now);
     let rows = app.summary_rows();
     if rows.is_empty() {
@@ -17369,7 +17367,7 @@ fn append_trend_control(
     hitbox
 }
 
-fn prepare_trend_data_at(app: &App, now: DateTime<Utc>) -> TrendsReport {
+fn prepare_trend_data_at(app: &App, now: UtcTimestamp) -> TrendsReport {
     build_trends_report(
         &app.history,
         now,
@@ -17378,7 +17376,7 @@ fn prepare_trend_data_at(app: &App, now: DateTime<Utc>) -> TrendsReport {
     )
 }
 
-fn render_trends_at(frame: &mut Frame<'_>, area: Rect, app: &mut App, now: DateTime<Utc>) {
+fn render_trends_at(frame: &mut Frame<'_>, area: Rect, app: &mut App, now: UtcTimestamp) {
     let compact = area.width < 120 || area.height < 29;
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -17623,7 +17621,7 @@ fn render_remaining_trend_panel(
             title: "Quota Remaining · GLOBAL",
             source_scope: None,
             graph_kind: TrendGraphKind::Line {
-                maximum_gap: ChronoDuration::minutes(15),
+                maximum_gap: SignedDuration::minutes(15),
             },
             value_kind: TrendValueKind::Percent,
             fixed_y_bounds: Some([0.0, 100.0]),
@@ -17661,7 +17659,7 @@ fn render_weekly_token_trend_panel(
             title: "Weekly Local Tokens",
             source_scope: Some(source_scope),
             graph_kind: TrendGraphKind::Line {
-                maximum_gap: ChronoDuration::minutes(45),
+                maximum_gap: SignedDuration::minutes(45),
             },
             value_kind: TrendValueKind::Tokens,
             fixed_y_bounds: None,
@@ -17724,7 +17722,7 @@ fn render_weekly_estimated_trend_panel(
             title: base_title,
             source_scope: Some(source_scope),
             graph_kind: TrendGraphKind::Line {
-                maximum_gap: ChronoDuration::minutes(45),
+                maximum_gap: SignedDuration::minutes(45),
             },
             value_kind: TrendValueKind::Percent,
             fixed_y_bounds: Some([0.0, 100.0]),
@@ -17762,7 +17760,7 @@ fn render_half_hour_token_trend_panel(
             title: "15m Local Tokens",
             source_scope: Some(source_scope),
             graph_kind: TrendGraphKind::Bar {
-                expected_step: ChronoDuration::minutes(LOCAL_BUCKET_MINUTES),
+                expected_step: SignedDuration::minutes(LOCAL_BUCKET_MINUTES),
             },
             value_kind: TrendValueKind::Tokens,
             fixed_y_bounds: None,
@@ -17825,7 +17823,7 @@ fn render_half_hour_estimated_trend_panel(
             title: base_title,
             source_scope: Some(source_scope),
             graph_kind: TrendGraphKind::Bar {
-                expected_step: ChronoDuration::minutes(LOCAL_BUCKET_MINUTES),
+                expected_step: SignedDuration::minutes(LOCAL_BUCKET_MINUTES),
             },
             value_kind: TrendValueKind::Percent,
             fixed_y_bounds: None,
@@ -17895,7 +17893,7 @@ fn render_time_series_panel(
         }
         partial |= point.partial;
     }
-    let minimum_time = minimum_time.unwrap_or_else(Utc::now);
+    let minimum_time = minimum_time.unwrap_or_else(UtcTimestamp::now);
     let maximum_time = maximum_time.unwrap_or(minimum_time);
     let mut x_bounds = [
         minimum_time.timestamp() as f64,
@@ -18201,7 +18199,7 @@ fn render_time_series_panel(
     })
 }
 
-fn latest_inspectable_time(series: &[TrendSeries<'_>]) -> Option<DateTime<Utc>> {
+fn latest_inspectable_time(series: &[TrendSeries<'_>]) -> Option<UtcTimestamp> {
     series
         .iter()
         .flat_map(|series| series.points.iter())
@@ -18212,9 +18210,9 @@ fn latest_inspectable_time(series: &[TrendSeries<'_>]) -> Option<DateTime<Utc>> 
 
 fn nearest_inspectable_time(
     series: &[TrendSeries<'_>],
-    at: DateTime<Utc>,
+    at: UtcTimestamp,
     graph_kind: TrendGraphKind,
-) -> Option<DateTime<Utc>> {
+) -> Option<UtcTimestamp> {
     let tolerance_ms = graph_kind
         .selection_tolerance()
         .num_milliseconds()
@@ -18231,7 +18229,7 @@ fn nearest_inspectable_time(
 
 fn nearest_inspectable_point(
     points: &[TrendPoint],
-    at: DateTime<Utc>,
+    at: UtcTimestamp,
     graph_kind: TrendGraphKind,
 ) -> Option<&TrendPoint> {
     let tolerance_ms = graph_kind
@@ -18544,7 +18542,7 @@ fn prepare_trend_segments(
 
     let maximum_gap = match graph_kind {
         TrendGraphKind::Line { maximum_gap } => maximum_gap,
-        TrendGraphKind::Bar { .. } => chrono::Duration::zero(),
+        TrendGraphKind::Bar { .. } => SignedDuration::ZERO,
     };
     let mut segments = Vec::new();
     let mut segment = Vec::new();
@@ -18585,7 +18583,7 @@ fn nice_trend_maximum(value: f64) -> f64 {
     rounded * magnitude
 }
 
-fn trend_time_axis_labels(start: DateTime<Utc>, end: DateTime<Utc>, width: u16) -> Vec<String> {
+fn trend_time_axis_labels(start: UtcTimestamp, end: UtcTimestamp, width: u16) -> Vec<String> {
     let format = if width < 50 { "%H:%M" } else { "%m-%d %H:%M" };
     if width < 70 {
         vec![
@@ -18632,13 +18630,15 @@ fn reset_expiry_gauge_alert_lines(reminder: ResetExpiryReminder, width: u16) -> 
         }
     }
 
-    let date = format_local_time(reminder.expires_at, "%Y-%m-%d");
-    let time = format_local_time(reminder.expires_at, "%H:%M:%S %:z");
-    let date_line = format!("! EXP {date}");
-    if UnicodeWidthStr::width(date_line.as_str()) <= max_width
-        && UnicodeWidthStr::width(time.as_str()) <= max_width
-    {
-        return vec![date_line, time];
+    if let Some(instant) = reminder.expires_at.as_jiff_checked() {
+        let local = instant.to_zoned_datetime(display_time_zone());
+        let date_line = format!("! EXP {}", local.strftime("%Y-%m-%d"));
+        let time = local.strftime("%H:%M:%S %:z").to_string();
+        if UnicodeWidthStr::width(date_line.as_str()) <= max_width
+            && UnicodeWidthStr::width(time.as_str()) <= max_width
+        {
+            return vec![date_line, time];
+        }
     }
 
     split_exact_display_lines(&format!("! {expires_at}"), width)
@@ -19442,10 +19442,10 @@ fn diagnostics_issue_lines(app: &App) -> Vec<Line<'static>> {
 }
 
 fn recorder_panel_status(app: &App) -> String {
-    recorder_panel_status_at(app, Utc::now())
+    recorder_panel_status_at(app, UtcTimestamp::now())
 }
 
-fn recorder_panel_status_at(app: &App, now: DateTime<Utc>) -> String {
+fn recorder_panel_status_at(app: &App, now: UtcTimestamp) -> String {
     if app.recorder_health.error.is_some() {
         return "error".to_string();
     }
@@ -19475,13 +19475,13 @@ fn reset_window_count(snapshot: &Snapshot) -> usize {
         .sum()
 }
 
-fn local_full_time_label(value: Option<chrono::DateTime<chrono::Utc>>, missing: &str) -> String {
+fn local_full_time_label(value: Option<UtcTimestamp>, missing: &str) -> String {
     value
         .map(|value| format_local_time(value, "%Y-%m-%d %H:%M:%S %:z"))
         .unwrap_or_else(|| missing.to_string())
 }
 
-fn local_granted_time_label(value: chrono::DateTime<chrono::Utc>, compact: bool) -> String {
+fn local_granted_time_label(value: UtcTimestamp, compact: bool) -> String {
     format_local_time(
         value,
         if compact {
@@ -21479,7 +21479,7 @@ fn format_duration(duration_ms: Option<u64>) -> String {
     }
 }
 
-fn format_turn_timestamp(value: Option<&chrono::DateTime<chrono::Utc>>) -> String {
+fn format_turn_timestamp(value: Option<&UtcTimestamp>) -> String {
     value
         .map(|value| format_local_time(*value, "%m-%d %H:%M:%S"))
         .unwrap_or_else(|| "-".to_string())
@@ -22460,14 +22460,14 @@ fn merge_remote_live_into_snapshot(
     states: &[SourceRemoteLiveSnapshot],
     history: &RemoteOverviewHistory,
 ) -> HashSet<(String, String)> {
-    merge_remote_live_into_snapshot_at(snapshot, states, history, Utc::now())
+    merge_remote_live_into_snapshot_at(snapshot, states, history, UtcTimestamp::now())
 }
 
 fn merge_remote_live_into_snapshot_at(
     snapshot: &mut Snapshot,
     states: &[SourceRemoteLiveSnapshot],
     history: &RemoteOverviewHistory,
-    now: DateTime<Utc>,
+    now: UtcTimestamp,
 ) -> HashSet<(String, String)> {
     // A manual/automatic remote sync can finish after the local rollout
     // snapshot was captured. Project through the merge time so a newly
@@ -23189,7 +23189,7 @@ fn apply_preferred_remote_window_usage(snapshot: &mut Snapshot) {
 
 fn remote_live_quality(
     state: &SourceRemoteLiveSnapshot,
-    now: DateTime<Utc>,
+    now: UtcTimestamp,
 ) -> (&'static str, bool) {
     let stale = now.signed_duration_since(state.received_at) > REMOTE_LIVE_STALE_AFTER;
     let partial = !state.range_complete
@@ -23211,7 +23211,7 @@ fn remote_live_quality(
 fn remote_live_quality_requires_remerge(
     snapshot: &Snapshot,
     states: &[SourceRemoteLiveSnapshot],
-    now: DateTime<Utc>,
+    now: UtcTimestamp,
 ) -> bool {
     states.iter().any(|state| {
         let source_name = format!(

@@ -58,7 +58,7 @@ fn preview_turn_harness(width: u16, height: u16, theme: Theme, message: &str) ->
 }
 
 fn recorded_preview_messages(
-    captured: DateTime<Utc>,
+    captured: UtcTimestamp,
     turn_id: &str,
     message: &str,
 ) -> crate::session_details::SessionDetails {
@@ -88,7 +88,7 @@ fn recorded_preview_messages(
         data.messages.push(DetailMessage {
             role: role.into(),
             text: body.into(),
-            timestamp: Some(captured - ChronoDuration::seconds(1)),
+            timestamp: Some(captured - SignedDuration::seconds(1)),
             turn_id: id.map(str::to_owned),
             phase: None,
         });
@@ -182,9 +182,7 @@ fn screenshot_usage_harness(width: u16, height: u16, theme: Theme) -> TuiHarness
     let mut harness = detail_harness(width, height, theme);
     set_task_parent(&mut harness.app, 1, 0);
     set_task_parent(&mut harness.app, 2, 1);
-    let captured = DateTime::parse_from_rfc3339("2026-10-04T21:13:36Z")
-        .unwrap()
-        .with_timezone(&Utc);
+    let captured = UtcTimestamp::parse_from_rfc3339("2026-10-04T21:13:36Z").unwrap();
     harness.app.snapshot.as_of = captured;
     // Preserve every known token component and Own pricing field from the
     // screenshot. The two descendant splits and delegated quota/cost are
@@ -217,7 +215,7 @@ fn screenshot_usage_harness(width: u16, height: u16, theme: Theme) -> TuiHarness
     ];
     for (task, usage) in harness.app.snapshot.tasks.iter_mut().zip(usages) {
         task.token_usage = usage;
-        task.created_at = Some(captured - ChronoDuration::hours(50));
+        task.created_at = Some(captured - SignedDuration::hours(50));
         task.updated_at = Some(captured);
     }
     harness.app.snapshot.tasks[0].title = "Session usage comparison".into();
@@ -277,10 +275,8 @@ fn screenshot_usage_harness(width: u16, height: u16, theme: Theme) -> TuiHarness
     analysis.attribution.unattributed_percent = 44.0;
     let window = analysis.attribution.window.as_mut().unwrap();
     window.used_percent = 44.0;
-    window.starts_at = DateTime::parse_from_rfc3339("2026-10-02T21:13:36Z")
-        .unwrap()
-        .with_timezone(&Utc);
-    window.ends_at = window.starts_at + ChronoDuration::weeks(1);
+    window.starts_at = UtcTimestamp::parse_from_rfc3339("2026-10-02T21:13:36Z").unwrap();
+    window.ends_at = window.starts_at + SignedDuration::weeks(1);
     harness.app.window_scope = WindowScope::Week;
     harness.app.local_snapshot.tasks.clear();
     harness.app.task_list_mode = TaskListMode::Tree;
@@ -1177,7 +1173,7 @@ fn entity_detail_sticky_scrollbar_drag_reaches_the_end_after_the_thumb_shrinks()
 }
 
 fn recorded_tools_fixture(
-    captured: DateTime<Utc>,
+    captured: UtcTimestamp,
     with_tools: bool,
 ) -> crate::session_details::SessionDetails {
     use crate::session_details::{DetailMessage, DetailTool, DetailUsage, SessionDetails};
@@ -3109,7 +3105,7 @@ fn entity_detail_message_preview_falls_back_for_missing_stale_ambiguous_and_reda
                 } else {
                     message.clone()
                 },
-                timestamp: Some(captured - ChronoDuration::seconds(1)),
+                timestamp: Some(captured - SignedDuration::seconds(1)),
                 turn_id: Some(
                     if case == "other-turn" {
                         "other-turn"
@@ -3339,7 +3335,7 @@ fn entity_detail_derived_turn_statistics_keep_duration_and_count_meanings_distin
     let captured_at = harness.app.snapshot.as_of;
     harness.app.snapshot.turns[0].status = TurnStatus::InProgress;
     harness.app.snapshot.turns[0].started_at =
-        Some(captured_at - ChronoDuration::milliseconds(3_210));
+        Some(captured_at - SignedDuration::milliseconds(3_210));
     harness.app.snapshot.turns[0].completed_at = None;
     harness.app.snapshot.turns[0].duration_ms = None;
     harness.app.snapshot.turns[0].token_usage = TokenUsage::default();
@@ -3456,7 +3452,7 @@ fn historical_summary_harness(width: u16, height: u16, theme: Theme) -> TuiHarne
     let mut harness = detail_harness(width, height, theme);
     harness.app.snapshot.tasks.clear();
     harness.app.snapshot.turns.clear();
-    let starts_at = harness.app.snapshot.as_of - ChronoDuration::hours(1);
+    let starts_at = harness.app.snapshot.as_of - SignedDuration::hours(1);
     let groups = [
         ("historical-root", None, Some("historical-turn"), 101),
         ("historical-root", None, None, 202),
@@ -3493,8 +3489,8 @@ fn historical_summary_harness(width: u16, height: u16, theme: Theme) -> TuiHarne
     .collect::<Vec<_>>();
     harness.app.history.half_hour_buckets = vec![LocalHalfHourBucket {
         starts_at,
-        ends_at: starts_at + ChronoDuration::minutes(15),
-        sampled_at: starts_at + ChronoDuration::minutes(15),
+        ends_at: starts_at + SignedDuration::minutes(15),
+        sampled_at: starts_at + SignedDuration::minutes(15),
         token_usage: TokenUsage {
             input_tokens: 606,
             total_tokens: 606,
@@ -3685,7 +3681,7 @@ fn entity_detail_summary_requires_entity_selection_and_preserves_history_only_me
 fn entity_detail_summary_rankings_exclude_unassigned_and_unpriced_turns() {
     let mut harness = historical_summary_harness(80, 24, Theme::Dark);
     let bucket = &mut harness.app.history.half_hour_buckets[0];
-    bucket.project_groups[0].turn_started_at = Some(bucket.starts_at - ChronoDuration::hours(1));
+    bucket.project_groups[0].turn_started_at = Some(bucket.starts_at - SignedDuration::hours(1));
     bucket.project_groups[0].api_equivalent_cost = ApiCostAmount {
         observed_samples: 1,
         observed_tokens: 101,
@@ -3693,7 +3689,7 @@ fn entity_detail_summary_rankings_exclude_unassigned_and_unpriced_turns() {
     };
     // This unassigned row is larger and more recent than either known user turn.
     bucket.project_groups[1].turn_started_at = Some(bucket.starts_at);
-    let latest_known = bucket.starts_at - ChronoDuration::minutes(5);
+    let latest_known = bucket.starts_at - SignedDuration::minutes(5);
     let mut priced_zero = bucket.project_groups[0].clone();
     priced_zero.turn_id = Some("priced-zero-turn".to_string());
     priced_zero.session_turn_id = priced_zero.turn_id.clone();
@@ -3739,9 +3735,12 @@ fn entity_detail_summary_rankings_exclude_unassigned_and_unpriced_turns() {
     assert!(content.contains("Largest priced user-turn subtotal (range): priced-zero-turn ("));
     assert!(!content.contains("Largest priced user-turn subtotal (range): historical-turn"));
     assert!(content.contains(&format!(
-        "Latest known user-turn start: {}",
-        latest_known.with_timezone(&Local).format("%Y-%m-%d %H:%M:%S %:z")
-    )));
+            "Latest known user-turn start: {}",
+            latest_known
+                .as_jiff()
+                .to_zoned_datetime(TimeZone::system())
+                .strftime("%Y-%m-%d %H:%M:%S %:z")
+        )));
 }
 
 #[test]
@@ -3828,7 +3827,7 @@ fn entity_detail_local_enrichment_updates_the_modal_and_keeps_remote_content_sep
     let captured = snapshot.as_of;
     let thread_id = snapshot.tasks[0].thread_id.clone();
     let turn_id = snapshot.turns[0].turn_id.clone();
-    let record = |timestamp: DateTime<Utc>, kind: &str, payload: serde_json::Value| {
+    let record = |timestamp: UtcTimestamp, kind: &str, payload: serde_json::Value| {
         serde_json::json!({"timestamp": timestamp, "type": kind, "payload": payload}).to_string()
     };
     let full_message = format!(
@@ -3837,9 +3836,9 @@ fn entity_detail_local_enrichment_updates_the_modal_and_keeps_remote_content_sep
     );
     snapshot.turns[0].message_preview = Some(snapshot_preview(&full_message));
     let log = [
-        record(captured - ChronoDuration::seconds(2), "session_meta", serde_json::json!({"id": thread_id})),
-        record(captured - ChronoDuration::seconds(1), "event_msg", serde_json::json!({"type": "user_message", "turn_id": turn_id, "message": full_message})),
-        record(captured + ChronoDuration::seconds(1), "event_msg", serde_json::json!({"type": "user_message", "turn_id": turn_id, "message": "FUTURE-MESSAGE-MUST-NOT-APPEAR"})),
+        record(captured - SignedDuration::seconds(2), "session_meta", serde_json::json!({"id": thread_id})),
+        record(captured - SignedDuration::seconds(1), "event_msg", serde_json::json!({"type": "user_message", "turn_id": turn_id, "message": full_message})),
+        record(captured + SignedDuration::seconds(1), "event_msg", serde_json::json!({"type": "user_message", "turn_id": turn_id, "message": "FUTURE-MESSAGE-MUST-NOT-APPEAR"})),
     ].join("\n");
     std::fs::write(sessions.join(format!("rollout-{thread_id}.jsonl")), log).unwrap();
     let mut harness = TuiHarness::from_snapshot(snapshot.clone(), 80, 24, Theme::Dark);
@@ -3872,7 +3871,7 @@ fn entity_detail_local_enrichment_updates_the_modal_and_keeps_remote_content_sep
     assert!(content.contains("Message bodies: hidden"));
     assert!(content.contains(&format!(
         "user | phase unrecorded | {} | turn {turn_id}",
-        (captured - ChronoDuration::seconds(1)).to_rfc3339()
+        (captured - SignedDuration::seconds(1)).to_rfc3339()
     )));
     assert!(
         content.contains(&full_message),
@@ -3932,11 +3931,11 @@ fn entity_detail_message_preview_survives_an_exhausted_tool_retention_budget() {
     );
     assert_eq!(message.chars().count(), 90);
     snapshot.turns[0].message_preview = Some(snapshot_preview(&message));
-    let record = |timestamp: DateTime<Utc>, kind: &str, payload: serde_json::Value| {
+    let record = |timestamp: UtcTimestamp, kind: &str, payload: serde_json::Value| {
         serde_json::json!({"timestamp": timestamp, "type": kind, "payload": payload}).to_string()
     };
     let mut records = vec![record(
-        captured - ChronoDuration::seconds(4),
+        captured - SignedDuration::seconds(4),
         "session_meta",
         serde_json::json!({"id": thread_id}),
     )];
@@ -3944,7 +3943,7 @@ fn entity_detail_message_preview_survives_an_exhausted_tool_retention_budget() {
     // retained-content exhaustion, independent of other-turn filtering.
     for index in 0..TOOL_COUNT {
         records.push(record(
-            captured - ChronoDuration::seconds(3),
+            captured - SignedDuration::seconds(3),
             "response_item",
             serde_json::json!({
                 "type": "function_call", "call_id": format!("budget-{index:02}"),
@@ -3955,7 +3954,7 @@ fn entity_detail_message_preview_survives_an_exhausted_tool_retention_budget() {
     }
     assert_eq!(TOOL_COUNT * TOOL_FIELD_BYTES, 2 * 1024 * 1024);
     records.push(record(
-        captured - ChronoDuration::seconds(2),
+        captured - SignedDuration::seconds(2),
         "event_msg",
         serde_json::json!({
             "type": "item_completed", "thread_id": thread_id, "turn_id": turn_id,
@@ -3963,7 +3962,7 @@ fn entity_detail_message_preview_survives_an_exhausted_tool_retention_budget() {
         }),
     ));
     records.push(record(
-        captured - ChronoDuration::seconds(1),
+        captured - SignedDuration::seconds(1),
         "response_item",
         serde_json::json!({
             "type": "function_call", "call_id": "late-budget-call", "turn_id": turn_id,
@@ -3971,7 +3970,7 @@ fn entity_detail_message_preview_survives_an_exhausted_tool_retention_budget() {
         }),
     ));
     records.push(record(
-        captured - ChronoDuration::seconds(1),
+        captured - SignedDuration::seconds(1),
         "response_item",
         serde_json::json!({
             "type": "function_call_output", "call_id": "late-budget-call", "turn_id": turn_id,
@@ -4101,8 +4100,8 @@ fn entity_detail_message_preview_handles_missing_owner_and_redacted_local_reads(
                 &thread_id
             };
             let records = [
-                serde_json::json!({"timestamp": captured - ChronoDuration::seconds(2), "type": "session_meta", "payload": {"id": owner}}).to_string(),
-                serde_json::json!({"timestamp": captured - ChronoDuration::seconds(1), "type": "event_msg", "payload": {"type": "user_message", "turn_id": turn_id, "message": message}}).to_string(),
+                serde_json::json!({"timestamp": captured - SignedDuration::seconds(2), "type": "session_meta", "payload": {"id": owner}}).to_string(),
+                serde_json::json!({"timestamp": captured - SignedDuration::seconds(1), "type": "event_msg", "payload": {"type": "user_message", "turn_id": turn_id, "message": message}}).to_string(),
             ].join("\n");
             std::fs::write(sessions.join(format!("rollout-{thread_id}.jsonl")), records).unwrap();
         }
@@ -4157,7 +4156,7 @@ fn entity_detail_reads_local_summary_sessions_that_have_aged_out_of_overview() {
         .usage
         .window;
     let captured = harness.app.snapshot.as_of;
-    let message = |time: DateTime<Utc>, id: &str, body: &str| {
+    let message = |time: UtcTimestamp, id: &str, body: &str| {
         serde_json::json!({
             "timestamp": time,
             "type": "event_msg",
@@ -4169,10 +4168,10 @@ fn entity_detail_reads_local_summary_sessions_that_have_aged_out_of_overview() {
     };
     let body = "HISTORICAL-CONTENT-OUTSIDE-OVERVIEW-WITHIN-SUMMARY-RANGE";
     let log = [
-        serde_json::json!({"timestamp": range.starts_at - ChronoDuration::seconds(2), "type": "session_meta", "payload": {"id": "historical-root"}}).to_string(),
-        message(range.starts_at - ChronoDuration::seconds(1), "before", "BEFORE-SUMMARY-RANGE-MUST-NOT-APPEAR"),
-        message(captured - ChronoDuration::minutes(30), "within", body),
-        message(captured.max(range.ends_at) + ChronoDuration::hours(2), "future", "AFTER-CAPTURE-MUST-NOT-APPEAR"),
+        serde_json::json!({"timestamp": range.starts_at - SignedDuration::seconds(2), "type": "session_meta", "payload": {"id": "historical-root"}}).to_string(),
+        message(range.starts_at - SignedDuration::seconds(1), "before", "BEFORE-SUMMARY-RANGE-MUST-NOT-APPEAR"),
+        message(captured - SignedDuration::minutes(30), "within", body),
+        message(captured.max(range.ends_at) + SignedDuration::hours(2), "future", "AFTER-CAPTURE-MUST-NOT-APPEAR"),
         message(range.ends_at, "exact-end", "EXACT-RANGE-END-MUST-NOT-APPEAR"),
     ].join("\n");
     std::fs::write(sessions.join("rollout-historical-root.jsonl"), log).unwrap();
@@ -4217,7 +4216,7 @@ fn entity_detail_reads_local_summary_sessions_that_have_aged_out_of_overview() {
             harness.render();
             // A capture can happen after a historical report has ended; its end stays exclusive.
             harness.app.summary_cache.as_mut().unwrap().snapshot_as_of =
-                range.ends_at + ChronoDuration::hours(1);
+                range.ends_at + SignedDuration::hours(1);
             open_expanded(&mut harness);
             assert!(
                 harness.app.entity_detail_loading(),
@@ -4237,11 +4236,11 @@ fn entity_detail_reads_local_summary_sessions_that_have_aged_out_of_overview() {
             assert!(content.contains("Messages (1)"));
             assert!(content.contains(&format!(
                 "user | phase unrecorded | {} | turn historical-turn",
-                (captured - ChronoDuration::minutes(30)).to_rfc3339()
+                (captured - SignedDuration::minutes(30)).to_rfc3339()
             )));
             for excluded in [
-                range.starts_at - ChronoDuration::seconds(1),
-                captured.max(range.ends_at) + ChronoDuration::hours(2),
+                range.starts_at - SignedDuration::seconds(1),
+                captured.max(range.ends_at) + SignedDuration::hours(2),
                 range.ends_at,
             ] {
                 assert!(!content.contains(&format!(
@@ -4348,11 +4347,11 @@ fn entity_detail_restores_only_known_local_scopes_for_historical_summary_ids() {
             let captured = harness.app.snapshot.as_of;
             let log = [
                 serde_json::json!({
-                    "timestamp": captured - ChronoDuration::hours(1),
+                    "timestamp": captured - SignedDuration::hours(1),
                     "type": "session_meta", "payload": {"id": "historical-root"}
                 }).to_string(),
                 serde_json::json!({
-                    "timestamp": captured - ChronoDuration::minutes(30),
+                    "timestamp": captured - SignedDuration::minutes(30),
                     "type": "event_msg",
                     "payload": {
                         "type": "item_completed", "thread_id": "historical-root", "turn_id": "historical-turn",
@@ -4418,7 +4417,7 @@ fn entity_detail_restores_only_known_local_scopes_for_historical_summary_ids() {
                     );
                     assert!(popup_text(&harness.app).contains(&format!(
                         "user | phase unrecorded | {} | turn historical-turn",
-                        (captured - ChronoDuration::minutes(30)).to_rfc3339()
+                        (captured - SignedDuration::minutes(30)).to_rfc3339()
                     )));
                 } else {
                     assert!(!harness.app.poll_entity_detail());
@@ -4461,7 +4460,7 @@ fn entity_detail_refresh_keeps_the_open_identity_and_frozen_values() {
     for turn in &mut snapshot.turns {
         turn.message_preview = Some("new snapshot message".to_string());
     }
-    snapshot.as_of += ChronoDuration::seconds(30);
+    snapshot.as_of += SignedDuration::seconds(30);
     harness.app.replace(
         CollectionResult {
             snapshot,

@@ -18,7 +18,7 @@ fn harness(width: u16, height: u16, theme: Theme) -> TuiHarness {
     harness
 }
 
-fn record(task: &TaskRecord, at: DateTime<Utc>, status: DeletionStatus) -> DeletedSessionRecord {
+fn record(task: &TaskRecord, at: UtcTimestamp, status: DeletionStatus) -> DeletedSessionRecord {
     DeletedSessionRecord {
         thread_id: task.thread_id.clone(),
         title: task.title.clone(),
@@ -41,7 +41,7 @@ fn install_deleted(harness: &mut TuiHarness) {
     let records = vec![
         record(
             &harness.app.snapshot.tasks[1],
-            at - ChronoDuration::minutes(1),
+            at - SignedDuration::minutes(1),
             DeletionStatus::Deleted,
         ),
         record(&harness.app.snapshot.tasks[2], at, DeletionStatus::Deleted),
@@ -65,7 +65,7 @@ fn session_management_restored_raw_session_returns_to_the_normal_list() {
     };
     let mut harness = harness(120, 40, Theme::Dark);
     let task = harness.app.snapshot.tasks[1].clone();
-    let captured_at = Utc::now() - ChronoDuration::minutes(1);
+    let captured_at = UtcTimestamp::now() - SignedDuration::minutes(1);
     crate::deleted_sessions::prepare_delete(
         &config,
         "restore-case",
@@ -77,11 +77,15 @@ fn session_management_restored_raw_session_returns_to_the_normal_list() {
         "restore-case",
         &task.thread_id,
         DeletionStatus::Deleted,
-        Utc::now(),
+        UtcTimestamp::now(),
     )
     .unwrap();
     let cache = Arc::new(Mutex::new(RolloutCache::new()));
-    cache.lock().unwrap().scan(&config, Utc::now()).unwrap();
+    cache
+        .lock()
+        .unwrap()
+        .scan(&config, UtcTimestamp::now())
+        .unwrap();
     harness
         .app
         .apply_deleted_session_records(Ok(crate::tui::session_management::load_records(
@@ -97,14 +101,18 @@ fn session_management_restored_raw_session_returns_to_the_normal_list() {
         format!(
             "{}\n",
             serde_json::json!({
-                "timestamp":Utc::now(), "type":"session_meta",
+                "timestamp":UtcTimestamp::now(), "type":"session_meta",
                 "payload":{"id":task.thread_id,"source":"cli"},
             })
         ),
     )
     .unwrap();
     cache.lock().unwrap().invalidate_after_session_mutation();
-    cache.lock().unwrap().scan(&config, Utc::now()).unwrap();
+    cache
+        .lock()
+        .unwrap()
+        .scan(&config, UtcTimestamp::now())
+        .unwrap();
     harness
         .app
         .apply_deleted_session_records(Ok(crate::tui::session_management::load_records(
@@ -176,12 +184,16 @@ fn session_management_live_raw_unknown_receipt_does_not_repeat_inventory_reads()
         config.codex_home.join("sessions/live.jsonl"),
         format!(
             "{}\n",
-            serde_json::json!({"timestamp":Utc::now(),"type":"session_meta",
+            serde_json::json!({"timestamp":UtcTimestamp::now(),"type":"session_meta",
             "payload":{"id":"task-thread-2","source":"cli"}})
         ),
     )
     .unwrap();
-    cache.lock().unwrap().scan(&config, Utc::now()).unwrap();
+    cache
+        .lock()
+        .unwrap()
+        .scan(&config, UtcTimestamp::now())
+        .unwrap();
     assert!(cache.lock().unwrap().has_live_thread("task-thread-2"));
     let records =
         crate::tui::session_management::load_records_with_reconcile(&config, &cache, |_| {
@@ -350,7 +362,7 @@ fn session_management_readonly_recovery_reloads_ledger_without_repeating_a_compl
                 "readonly-ui",
                 "task-thread-2",
                 DeletionStatus::Deleted,
-                Utc::now(),
+                UtcTimestamp::now(),
             )
             .unwrap();
             Ok(vec!["task-thread-2".into()])
@@ -488,13 +500,13 @@ fn session_management_deleted_root_sorts_by_latest_deletion_time() {
             let at = harness.app.snapshot.as_of;
             for (index, age) in [(0, 0), (1, 100), (2, 120), (3, 5)] {
                 harness.app.snapshot.tasks[index].updated_at =
-                    Some(at - ChronoDuration::minutes(age));
+                    Some(at - SignedDuration::minutes(age));
             }
-            let latest_deletion = at + ChronoDuration::minutes(offset_minutes);
+            let latest_deletion = at + SignedDuration::minutes(offset_minutes);
             harness.app.apply_deleted_session_records(Ok(vec![
                 record(
                     &harness.app.snapshot.tasks[1],
-                    latest_deletion - ChronoDuration::minutes(1),
+                    latest_deletion - SignedDuration::minutes(1),
                     DeletionStatus::Deleted,
                 ),
                 record(
@@ -539,7 +551,7 @@ fn session_management_deleted_root_never_splits_a_recent_normal_subtree() {
     harness.app.task_list_mode = TaskListMode::Tree;
     let at = harness.app.snapshot.as_of;
     for (index, age) in [(0, 0), (1, 8), (2, 10), (3, 20), (4, 30)] {
-        harness.app.snapshot.tasks[index].updated_at = Some(at - ChronoDuration::minutes(age));
+        harness.app.snapshot.tasks[index].updated_at = Some(at - SignedDuration::minutes(age));
     }
     let parent = harness.app.snapshot.tasks[3].thread_id.clone();
     harness.app.snapshot.tasks[0].parent_thread_id = Some(parent.clone());
@@ -547,12 +559,12 @@ fn session_management_deleted_root_never_splits_a_recent_normal_subtree() {
     harness.app.apply_deleted_session_records(Ok(vec![
         record(
             &harness.app.snapshot.tasks[1],
-            at - ChronoDuration::minutes(6),
+            at - SignedDuration::minutes(6),
             DeletionStatus::Deleted,
         ),
         record(
             &harness.app.snapshot.tasks[4],
-            at - ChronoDuration::minutes(5),
+            at - SignedDuration::minutes(5),
             DeletionStatus::Deleted,
         ),
     ]));
@@ -592,18 +604,18 @@ fn session_management_deleted_root_sort_uses_matching_children_after_filtering()
     let at = harness.app.snapshot.as_of;
     harness.app.snapshot.tasks[0].title = "matched new task".into();
     harness.app.snapshot.tasks[3].title = "matched old task".into();
-    harness.app.snapshot.tasks[3].updated_at = Some(at - ChronoDuration::minutes(5));
+    harness.app.snapshot.tasks[3].updated_at = Some(at - SignedDuration::minutes(5));
     harness.app.snapshot.tasks[1].title = "hidden newest deletion".into();
     harness.app.snapshot.tasks[2].title = "matched old deletion".into();
     harness.app.apply_deleted_session_records(Ok(vec![
         record(
             &harness.app.snapshot.tasks[1],
-            at + ChronoDuration::minutes(1),
+            at + SignedDuration::minutes(1),
             DeletionStatus::Deleted,
         ),
         record(
             &harness.app.snapshot.tasks[2],
-            at - ChronoDuration::minutes(10),
+            at - SignedDuration::minutes(10),
             DeletionStatus::Deleted,
         ),
     ]));
@@ -751,7 +763,7 @@ fn session_management_deleted_filters_and_selection_survive_refresh_without_trea
     harness.app.select_task(DELETED_TASK_ROOT, true);
     let anchor = harness.app.overview_refresh_anchor();
     harness.app.snapshot.tasks.reverse();
-    let latest_deletion = harness.app.snapshot.as_of + ChronoDuration::minutes(1);
+    let latest_deletion = harness.app.snapshot.as_of + SignedDuration::minutes(1);
     for record in harness.app.session_management.deleted.values_mut() {
         record.deleted_at = Some(latest_deletion);
     }
@@ -895,7 +907,7 @@ fn stop_session_management_refresh(harness: &mut TuiHarness) {
     harness.app.record_refresh_worker_failure(
         RefreshWorkerFailure::RolloutCachePoisoned,
         Instant::now(),
-        Utc::now(),
+        UtcTimestamp::now(),
     );
     assert!(harness.app.refresh_stopped);
 }

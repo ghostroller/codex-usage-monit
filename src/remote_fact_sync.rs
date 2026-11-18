@@ -12,8 +12,6 @@ use std::io;
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::time::{Duration as StdDuration, Instant};
 
-use chrono::{DateTime, Utc};
-
 use crate::history_ownership::{
     HistoryOwnershipState, HistoryOwnershipStore, OwnershipManifestStatus, TryWriterLease,
 };
@@ -51,6 +49,7 @@ use crate::source_history::{
 };
 use crate::source_identity::NodeId;
 use crate::source_model::{SessionReplicaKey, ThreadId};
+use crate::time::UtcTimestamp;
 
 const REMOTE_FRAME_HEADER_BYTES: usize = 20;
 const DEFAULT_MAX_PAGES_PER_RUN: usize = 8;
@@ -285,9 +284,9 @@ pub(crate) enum ReplicaFactSyncPlan {
 pub(crate) struct ReplicaFactCandidateKey {
     source_id: NodeId,
     thread_id: ThreadId,
-    range_start: DateTime<Utc>,
-    range_end: DateTime<Utc>,
-    covered_through: DateTime<Utc>,
+    range_start: UtcTimestamp,
+    range_end: UtcTimestamp,
+    covered_through: UtcTimestamp,
     coverage_complete: bool,
     fingerprint: SessionDigestFingerprint,
     project_breakdown_fingerprint: SessionDigestFingerprint,
@@ -358,7 +357,8 @@ impl ReplicaFactCandidateKey {
 
     pub(crate) fn validate(&self) -> io::Result<()> {
         if self.range_end <= self.range_start
-            || self.range_end.signed_duration_since(self.range_start) > chrono::Duration::days(1)
+            || self.range_end.signed_duration_since(self.range_start)
+                > crate::time::Duration::days(1)
             || self.covered_through < self.range_start
             || self.covered_through > self.range_end
             || (self.coverage_complete && self.covered_through != self.range_end)
@@ -389,7 +389,7 @@ struct ReplicaFactPlannerQuery<'a> {
     selected: &'a RemoteSyncHostSnapshot,
     local_source_id: &'a NodeId,
     redaction_profile: RedactionProfile,
-    observed_at: chrono::DateTime<Utc>,
+    observed_at: UtcTimestamp,
     excluded_resource_candidates: &'a std::collections::BTreeSet<ReplicaFactCandidateKey>,
     resume_after: Option<&'a ReplicaFactCandidateKey>,
 }
@@ -402,7 +402,7 @@ pub(crate) fn plan_next_replica_fact_sync(
     selected: &RemoteSyncHostSnapshot,
     local_source_id: &NodeId,
     redaction_profile: RedactionProfile,
-    observed_at: chrono::DateTime<Utc>,
+    observed_at: UtcTimestamp,
     excluded_resource_candidates: &std::collections::BTreeSet<ReplicaFactCandidateKey>,
     resume_after: Option<&ReplicaFactCandidateKey>,
 ) -> io::Result<ReplicaFactSyncPlan> {
@@ -439,8 +439,8 @@ fn plan_next_replica_fact_sync_with_budget(
         .expected_source()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "selected host is unpaired"))?;
     let since = observed_at
-        .checked_sub_days(chrono::Days::new(u64::from(MAX_FACT_RETENTION_DAYS)))
-        .unwrap_or(chrono::DateTime::<Utc>::MIN_UTC);
+        .checked_sub_days(u64::from(MAX_FACT_RETENTION_DAYS))
+        .unwrap_or(UtcTimestamp::MIN);
     let metadata = history_store.list_source_metadata()?;
     if metadata.iter().any(|source| {
         source.source_id() == &selected_source.node_id
@@ -1446,7 +1446,7 @@ fn commit_complete_batch(
         remote_binding: Some(binding.history_binding.clone()),
         validated_digests,
         activate_cursor: cursor,
-        completed_at: Utc::now(),
+        completed_at: UtcTimestamp::now(),
         changes,
     };
     batch.validate().map_err(RemoteFactSyncError::Local)?;
@@ -1661,7 +1661,7 @@ mod tests {
     use std::thread;
     use std::time::Duration as StdDuration;
 
-    use chrono::{DateTime, Duration, TimeZone};
+    use crate::time::{Duration, UtcTimestamp};
     use tempfile::TempDir;
 
     use super::*;
@@ -1686,10 +1686,8 @@ mod tests {
     const OTHER_SOURCE: &str = "node-fedcba9876543210fedcba9876543210";
     const THREAD: &str = "01a11111-2222-7333-8444-555555555555";
 
-    fn at(day: u32, hour: u32) -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 8, day, hour, 0, 0)
-            .single()
-            .unwrap()
+    fn at(day: u32, hour: u32) -> UtcTimestamp {
+        UtcTimestamp::from_utc(2026, 8, day, hour, 0, 0).unwrap()
     }
 
     fn source(node_id: &str) -> SourceGeneration {
@@ -1872,7 +1870,7 @@ mod tests {
     fn remote_record(
         event_id: &str,
         revision: u64,
-        occurred_at: DateTime<Utc>,
+        occurred_at: UtcTimestamp,
         total: u64,
     ) -> RemoteUsageEventFactRecord {
         let event_id: crate::source_history::UsageEventId = event_id.parse().unwrap();
@@ -1911,7 +1909,7 @@ mod tests {
     fn digest_record(
         source_id: &str,
         thread_id: &str,
-        range_start: DateTime<Utc>,
+        range_start: UtcTimestamp,
         fingerprint: char,
         total: u64,
     ) -> SourceSessionDigestRecord {
@@ -1965,7 +1963,7 @@ mod tests {
                 continue;
             };
             by_day
-                .entry(fact.occurred_at().date_naive())
+                .entry(fact.occurred_at().utc_date())
                 .or_default()
                 .push(fact.as_ref());
         }
@@ -1973,7 +1971,7 @@ mod tests {
         by_day
             .into_iter()
             .map(|(day, facts)| {
-                let range_start = Utc.from_utc_datetime(&day.and_hms_opt(0, 0, 0).unwrap());
+                let range_start = day.start();
                 let range_end = range_start + Duration::days(1);
                 let (fingerprint, project_fingerprint) =
                     crate::source_export::canonical_fact_fingerprints_for_test(
@@ -2063,7 +2061,7 @@ mod tests {
 
     fn planner_with_budget(
         fixture: &Fixture,
-        observed_at: DateTime<Utc>,
+        observed_at: UtcTimestamp,
         budget: &mut SourceHistoryReadBudget,
     ) -> io::Result<ReplicaFactSyncPlan> {
         plan_next_replica_fact_sync_with_budget(
@@ -2083,7 +2081,7 @@ mod tests {
     fn remote_snapshot_decoded_bytes(
         fixture: &Fixture,
         source_id: &str,
-        since: DateTime<Utc>,
+        since: UtcTimestamp,
     ) -> u64 {
         let initial_bytes = u64::MAX / 4;
         let mut budget =
@@ -2452,7 +2450,7 @@ mod tests {
         assert!(record_error.to_string().contains("record budget"));
 
         let since = observed_at
-            .checked_sub_days(chrono::Days::new(u64::from(MAX_FACT_RETENTION_DAYS)))
+            .checked_sub_days(u64::from(MAX_FACT_RETENTION_DAYS))
             .unwrap();
         let selected_bytes = remote_snapshot_decoded_bytes(&fixture, SOURCE, since);
         let other_bytes = remote_snapshot_decoded_bytes(&fixture, OTHER_SOURCE, since);

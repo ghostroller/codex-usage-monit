@@ -673,7 +673,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::io;
 
-    use chrono::Utc;
+    use crate::time::UtcTimestamp;
     use tempfile::tempdir;
 
     use crate::remote_bandwidth_budget::{
@@ -1508,7 +1508,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let budget = RemoteBandwidthBudgetStore::new(directory.path().join("state"));
         let node: NodeId = NODE_A.parse().unwrap();
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         let RemoteBandwidthAdmission::Granted(reservation) = budget
             .begin_attempt(
                 "alpha",
@@ -1566,7 +1566,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let budget = RemoteBandwidthBudgetStore::new(directory.path().join("state"));
         let node: NodeId = NODE_A.parse().unwrap();
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         let RemoteBandwidthAdmission::Granted(reservation) = budget
             .begin_attempt(
                 "alpha",
@@ -1649,7 +1649,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let budget = RemoteBandwidthBudgetStore::new(directory.path().join("state"));
         let node: NodeId = NODE_A.parse().unwrap();
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         let RemoteBandwidthAdmission::Granted(reservation) = budget
             .begin_attempt(
                 "alpha",

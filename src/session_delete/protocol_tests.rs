@@ -2,13 +2,14 @@
 use super::*;
 use crate::history::history_namespace;
 use crate::rollout::RolloutCache;
-use chrono::Duration;
 use serde_json::{Value, json};
 use std::io::Write;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration as StdDuration;
+
+use crate::time::Duration;
 
 const ROOT: &str = "11111111-1111-4111-8111-111111111111";
 
@@ -79,7 +80,7 @@ fn fixture() -> (SharedFixture, CollectConfig) {
         app_server_timeout: std::time::Duration::from_secs(10),
         ..CollectConfig::default()
     };
-    let at = Utc::now() - Duration::minutes(20);
+    let at = UtcTimestamp::now() - Duration::minutes(20);
     let mut threads = serde_json::Map::new();
     for (index, id) in [
         ROOT,
@@ -440,7 +441,7 @@ fn shared_incomplete_inventory_keeps_unknown_receipts_without_retrying_delete() 
 #[test]
 fn shared_delete_saves_usage_before_rpc_and_preserves_restart_totals() {
     let (_temporary, config) = fixture();
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let mut before = crate::rollout::scan_rollouts(&config, now).unwrap();
     assert_eq!(
         before
@@ -467,7 +468,7 @@ fn shared_delete_saves_usage_before_rpc_and_preserves_restart_totals() {
             .all(|record| record.status == DeletionStatus::Deleted)
     );
     let mut reopened = RolloutCache::new();
-    let mut after = reopened.scan(&config, Utc::now()).unwrap();
+    let mut after = reopened.scan(&config, UtcTimestamp::now()).unwrap();
     for dataset in [&mut before, &mut after] {
         dataset.calls.sort_by(|left, right| {
             left.thread_id

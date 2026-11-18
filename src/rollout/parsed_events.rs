@@ -155,11 +155,11 @@ impl<'de> Deserialize<'de> for ParsedEvents {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{DateTime, Utc};
+    use crate::time::UtcTimestamp;
 
     #[test]
     fn rollout_memory_shared_partial_chunk_append_caps_allocation_and_preserves_prefix() {
-        let timestamp = DateTime::<Utc>::from_timestamp(1_800_000_000, 0).unwrap();
+        let timestamp = UtcTimestamp::from_timestamp(1_800_000_000, 0).unwrap();
         let mut events = ParsedEvents::default();
         for _ in 0..(CHUNK_EVENTS * 2 - 1) {
             events.push(ParsedEvent::Activity { timestamp });

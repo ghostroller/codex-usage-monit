@@ -10,8 +10,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 
-use chrono::Days;
-
 use crate::remote_delta_journal::{RemoteDeltaJournalRecord, encode_remote_delta_journal_record};
 use crate::remote_export_state::RemoteExportDesiredRecord;
 use crate::remote_protocol::{
@@ -60,7 +58,7 @@ fn plan_bucket_record(
     let logical_key = format!("bucket-v1:{}", bucket.starts_at.timestamp());
     let expires_at = bucket
         .ends_at
-        .checked_add_days(Days::new(USAGE_BUCKET_RETENTION_DAYS))
+        .checked_add_days(USAGE_BUCKET_RETENTION_DAYS)
         .ok_or_else(|| invalid_data("remote usage bucket retention bound overflows"))?;
     let referenced = bucket
         .project_groups
@@ -95,7 +93,7 @@ fn plan_session_digest_record(
     );
     let retention_through = digest
         .range_end
-        .checked_add_days(Days::new(SESSION_DIGEST_RETENTION_DAYS))
+        .checked_add_days(SESSION_DIGEST_RETENTION_DAYS)
         .ok_or_else(|| invalid_data("remote session digest retention bound overflows"))?;
     let referenced = digest
         .observed_project_keys
@@ -187,7 +185,7 @@ mod tests {
     use std::num::NonZeroU32;
     use std::str::FromStr;
 
-    use chrono::{DateTime, Utc};
+    use crate::time::UtcTimestamp;
 
     use super::*;
     use crate::remote_protocol::{
@@ -196,10 +194,8 @@ mod tests {
     };
     use crate::source_model::{ProjectDisplayLabel, ThreadId};
 
-    fn at(value: &str) -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339(value)
-            .unwrap()
-            .with_timezone(&Utc)
+    fn at(value: &str) -> UtcTimestamp {
+        UtcTimestamp::parse_from_rfc3339(value).unwrap()
     }
 
     fn project_key(seed: u8) -> ObservedProjectKey {
@@ -240,8 +236,8 @@ mod tests {
         let start = at("2026-08-30T10:00:00Z");
         RemoteUsageBucket {
             starts_at: start,
-            ends_at: start + chrono::Duration::minutes(15),
-            sampled_at: start + chrono::Duration::minutes(14),
+            ends_at: start + crate::time::Duration::minutes(15),
+            sampled_at: start + crate::time::Duration::minutes(14),
             token_usage: token_usage(10),
             estimated_cost_units: RemoteU128::new(11),
             api_long_context_extra_cost_units: Some(RemoteU128::new(0)),
@@ -353,7 +349,7 @@ mod tests {
             range_start: value.range_start,
             range_end: value.range_end,
             changed_at: value.covered_through,
-            retention_through: value.range_end + chrono::Duration::days(35),
+            retention_through: value.range_end + crate::time::Duration::days(35),
             mutation: RemoteSessionDigestMutation::Upsert(Box::new(value)),
         };
         assert!(partial::record_at_least(
@@ -441,7 +437,7 @@ mod tests {
         let second = plan_remote_export_records(&materialized).unwrap();
         assert_eq!(first[0].upsert(), second[0].upsert());
 
-        session.range_end = DateTime::<Utc>::MAX_UTC;
+        session.range_end = UtcTimestamp::MAX;
         session.covered_through = session.range_end;
         let overflowing = MaterializedSourceObservation {
             session_digests: vec![session],
@@ -451,7 +447,7 @@ mod tests {
 
         let bucket_key = project_key(0x44);
         let mut overflowing_bucket = bucket(bucket_key.clone());
-        overflowing_bucket.ends_at = DateTime::<Utc>::MAX_UTC;
+        overflowing_bucket.ends_at = UtcTimestamp::MAX;
         let overflowing = MaterializedSourceObservation {
             project_descriptors: vec![descriptor(bucket_key, "workspace")],
             buckets: vec![overflowing_bucket],

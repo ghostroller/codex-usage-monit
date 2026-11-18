@@ -11,7 +11,7 @@ struct TurnRequests<'a> {
 
 pub(super) fn request_covered_counters(
     events: &ParsedEvents,
-    as_of: Option<DateTime<Utc>>,
+    as_of: Option<UtcTimestamp>,
 ) -> HashSet<usize> {
     let mut turns = HashMap::<&str, TurnRequests<'_>>::new();
     let mut counters = Vec::new();

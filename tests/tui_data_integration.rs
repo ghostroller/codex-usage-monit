@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use chrono::{Duration, Utc};
+use codex_usage_monit::time::{Duration, UtcTimestamp};
 use serde_json::Value;
 
 fn binary() -> &'static str {
@@ -39,7 +39,7 @@ fn parse_json(output: &Output) -> Value {
 fn write_current_rollout_fixture(codex_home: &Path) {
     let sessions = codex_home.join("sessions");
     std::fs::create_dir_all(&sessions).unwrap();
-    let started_at = Utc::now() - Duration::minutes(2);
+    let started_at = UtcTimestamp::now() - Duration::minutes(2);
     let completed_at = started_at + Duration::seconds(5);
     let thread_id = "019f52ac-7a9f-7fd1-8dda-e775ef950786";
     let turn_id = "turn-cli-report-integration";

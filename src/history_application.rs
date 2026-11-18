@@ -29,7 +29,7 @@ use crate::summary_report::{
     history_view_since, retain_summary_backfill_evidence_buckets, summary_backfill_config,
     summary_backfill_scan_complete, summary_history_coverage_complete,
 };
-use chrono::{DateTime, Utc};
+use crate::time::UtcTimestamp;
 use std::borrow::Cow;
 use std::io;
 use std::path::PathBuf;
@@ -320,7 +320,7 @@ pub(crate) fn stage_calls() -> usize {
 pub(crate) fn query_runtime_history(
     runtime: &mut HistoryRuntime,
     selection: &HistorySourceSelection,
-    since: DateTime<Utc>,
+    since: UtcTimestamp,
     context: Option<&mut HistoryQueryContext>,
 ) -> io::Result<UnifiedHistorySnapshot> {
     if let Some(context) = context {
@@ -454,7 +454,7 @@ fn prepare_report_history_runtime(runtime: &mut HistoryRuntime) -> Vec<String> {
 
     let status_path = default_status_file(history_root);
     let incompatible =
-        incompatible_recorder_for_cutover(&status_path, runtime.namespace(), Utc::now());
+        incompatible_recorder_for_cutover(&status_path, runtime.namespace(), UtcTimestamp::now());
     match incompatible {
         Ok(Some(status)) => {
             if let Err(error) = runtime.ensure_ownership_initialized() {
@@ -550,7 +550,7 @@ pub(crate) fn merge_runtime_history_write_result(
 /// Collection and scheduling remain with the one-shot or interactive caller.
 pub(crate) struct SummaryBackfillObservation {
     pub scan_complete: bool,
-    pub observed_at: DateTime<Utc>,
+    pub observed_at: UtcTimestamp,
     pub tasks: Vec<TaskRecord>,
     pub local_session_digests: LocalSessionDigestEvidence,
     pub observation: HistoryObservation,
@@ -575,7 +575,7 @@ impl SummaryBackfillObservation {
 
 pub(crate) fn summary_backfill_attempt(
     history: &HistoryData,
-    observed_at: DateTime<Utc>,
+    observed_at: UtcTimestamp,
     scan_complete: bool,
 ) -> SummaryBackfillAttempt {
     SummaryBackfillAttempt {
@@ -605,7 +605,7 @@ pub(crate) fn backfill_summary_history_selected(
     config: &CollectConfig,
     store: &mut ReportHistoryStore,
     source_selector: &HistorySourceSelector,
-) -> (HistoryData, DateTime<Utc>) {
+) -> (HistoryData, UtcTimestamp) {
     let worker_config = summary_backfill_config(config);
     let SummaryBackfillObservation {
         scan_complete,
@@ -921,7 +921,7 @@ mod tests {
         (directory, runtime)
     }
 
-    fn record_projection_observation(runtime: &HistoryRuntime, observed_at: DateTime<Utc>) {
+    fn record_projection_observation(runtime: &HistoryRuntime, observed_at: UtcTimestamp) {
         let OwnershipManifestStatus::Initialized(active) =
             runtime.ownership().load_manifest().unwrap()
         else {
@@ -953,9 +953,7 @@ mod tests {
     fn projection_revision_reads_sql_inputs_once_within_a_bounded_read_budget() {
         let (_directory, mut runtime) = projection_runtime();
         let active = runtime.ensure_v2_active().unwrap();
-        let observed_at = DateTime::parse_from_rfc3339("2026-10-03T10:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
+        let observed_at = UtcTimestamp::parse_from_rfc3339("2026-10-03T10:00:00Z").unwrap();
         record_projection_observation(&runtime, observed_at);
         let database = runtime.source_history().sqlite_database().unwrap();
         let (revision, reads) = database.measure_io(|| {
@@ -998,9 +996,7 @@ mod tests {
     fn projection_revision_revalidates_receipt_after_external_ownership_change() {
         let (_directory, mut runtime) = projection_runtime();
         let active = runtime.ensure_v2_active().unwrap();
-        let observed_at = DateTime::parse_from_rfc3339("2026-10-03T10:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
+        let observed_at = UtcTimestamp::parse_from_rfc3339("2026-10-03T10:00:00Z").unwrap();
         record_projection_observation(&runtime, observed_at);
         let manifest_path = runtime.ownership().manifest_path();
         let original = std::fs::read(&manifest_path).unwrap();
@@ -1046,9 +1042,7 @@ mod tests {
 
         let (_directory, mut runtime) = projection_runtime();
         let active = runtime.ensure_v2_active().unwrap();
-        let observed_at = DateTime::parse_from_rfc3339("2026-10-03T10:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
+        let observed_at = UtcTimestamp::parse_from_rfc3339("2026-10-03T10:00:00Z").unwrap();
         record_projection_observation(&runtime, observed_at);
         let selection = HistorySourceSelection::Local(runtime.source_identity().node_id().clone());
         let before = history_projection_revision(&runtime, &selection)
@@ -1076,7 +1070,7 @@ mod tests {
                             "local",
                             redaction,
                             &HistoryObservation {
-                                observed_at: observed_at + chrono::Duration::minutes(1),
+                                observed_at: observed_at + crate::time::Duration::minutes(1),
                                 ..HistoryObservation::default()
                             },
                             crate::source_history::LocalObservationMode::Incremental,
@@ -1121,7 +1115,7 @@ mod tests {
             selected.source_selection_status,
             crate::history_query::HistorySourceSelectionStatus::AppliedExcludedFromAggregates
         );
-        record_projection_observation(&runtime, observed_at + chrono::Duration::minutes(2));
+        record_projection_observation(&runtime, observed_at + crate::time::Duration::minutes(2));
         let latest = history_projection_revision(&runtime, &selection)
             .unwrap()
             .unwrap();
@@ -1133,9 +1127,7 @@ mod tests {
     fn projection_revision_still_rejects_external_mapping_change_between_probes() {
         let (directory, mut runtime) = projection_runtime();
         runtime.ensure_v2_active().unwrap();
-        let observed_at = DateTime::parse_from_rfc3339("2026-10-03T10:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
+        let observed_at = UtcTimestamp::parse_from_rfc3339("2026-10-03T10:00:00Z").unwrap();
         record_projection_observation(&runtime, observed_at);
         let mappings = runtime.project_mapping_store().clone();
         let initial = mappings.load_or_create().unwrap();
@@ -1200,7 +1192,7 @@ mod tests {
         };
         let now = snapshot.as_of;
         let call = UsageCall {
-            timestamp: now - chrono::Duration::minutes(15),
+            timestamp: now - crate::time::Duration::minutes(15),
             thread_id: snapshot.tasks[0].thread_id.clone(),
             turn_id: None,
             usage_event_id: None,
@@ -1219,7 +1211,7 @@ mod tests {
             &[],
             &snapshot.limits,
             &[],
-            Some(now - chrono::Duration::days(30)),
+            Some(now - crate::time::Duration::days(30)),
         );
         assert!(!observation.quota_points.is_empty());
         assert!(!observation.weekly_local_points.is_empty());
@@ -1249,9 +1241,7 @@ mod tests {
 
     #[test]
     fn summary_backfill_marker_failure_prevents_an_immediate_rescan() {
-        let now = DateTime::parse_from_rfc3339("2026-09-26T12:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
+        let now = UtcTimestamp::parse_from_rfc3339("2026-09-26T12:00:00Z").unwrap();
         let mut history = HistoryData::default();
         assert!(summary_history_backfill_needed(&history, now));
         let requested = summary_backfill_attempt(&history, now, true);

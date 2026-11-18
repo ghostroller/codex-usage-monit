@@ -11,7 +11,6 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use super::remote_quota::{REMOTE_QUOTA_FILE, apply_remote_quota};
@@ -19,6 +18,7 @@ use super::session_evidence::DIGESTS_DIRECTORY;
 use super::*;
 use crate::remote_protocol::{ModelCatalogFingerprint, ProtocolRevisions, SourceGeneration};
 use crate::remote_quota::RemoteQuotaChange;
+use crate::time::UtcTimestamp;
 
 const REMOTE_HISTORY_DIRECTORY: &str = "remote-history-v1";
 const REMOTE_GENERATIONS_DIRECTORY: &str = "generations";
@@ -342,7 +342,7 @@ struct RemoteActiveManifest {
     redaction_profile: RedactionProfile,
     active_generation: SourceHistoryRemoteGenerationId,
     binding: SourceHistoryRemoteBinding,
-    activated_at: DateTime<Utc>,
+    activated_at: UtcTimestamp,
 }
 
 /// SQL generations retain the protocol/CAS identity while incremental pages
@@ -687,7 +687,7 @@ impl SourceHistoryStore {
         binding: &SourceHistoryRemoteBinding,
         buckets: &[SourceBucketRecord],
         digests: &[SourceSessionDigestRecord],
-        activated_at: DateTime<Utc>,
+        activated_at: UtcTimestamp,
         quotas: &[RemoteQuotaChange],
     ) -> io::Result<RemoteHistoryPageWriteReport> {
         let database = self.sqlite_database().expect("SQLite history backend");
@@ -767,7 +767,7 @@ impl SourceHistoryStore {
         expected: Option<&SourceHistoryRemoteActiveRef>,
         candidate: &SourceHistoryRemoteGenerationId,
         binding: &SourceHistoryRemoteBinding,
-        activated_at: DateTime<Utc>,
+        activated_at: UtcTimestamp,
     ) -> io::Result<()> {
         let database = self
             .sqlite_database()
@@ -937,7 +937,7 @@ impl SourceHistoryStore {
         &self,
         source_id: &NodeId,
         redaction_profile: RedactionProfile,
-        since: DateTime<Utc>,
+        since: UtcTimestamp,
     ) -> io::Result<SourceHistoryRemoteSnapshot> {
         let mut budget = SourceHistoryReadBudget::for_query();
         self.load_remote_history_snapshot_since_with_budget(
@@ -952,7 +952,7 @@ impl SourceHistoryStore {
         &self,
         source_id: &NodeId,
         redaction_profile: RedactionProfile,
-        since: DateTime<Utc>,
+        since: UtcTimestamp,
         budget: &mut SourceHistoryReadBudget,
     ) -> io::Result<SourceHistoryRemoteSnapshot> {
         budget.charge_source()?;
@@ -970,7 +970,7 @@ impl SourceHistoryStore {
         &self,
         source_id: &NodeId,
         redaction_profile: RedactionProfile,
-        since: DateTime<Utc>,
+        since: UtcTimestamp,
         between_families: impl FnOnce(),
     ) -> io::Result<SourceHistoryRemoteSnapshot> {
         let mut budget = SourceHistoryReadBudget::for_query();
@@ -988,7 +988,7 @@ impl SourceHistoryStore {
         &self,
         source_id: &NodeId,
         redaction_profile: RedactionProfile,
-        since: DateTime<Utc>,
+        since: UtcTimestamp,
         between_families: impl FnOnce(),
         budget: &mut SourceHistoryReadBudget,
     ) -> io::Result<SourceHistoryRemoteSnapshot> {
@@ -1110,7 +1110,7 @@ impl SourceHistoryStore {
         candidate_binding: &SourceHistoryRemoteBinding,
         bucket_records: &[SourceBucketRecord],
         digest_records: &[SourceSessionDigestRecord],
-        activated_at: DateTime<Utc>,
+        activated_at: UtcTimestamp,
         quota_records: &[RemoteQuotaChange],
     ) -> io::Result<RemoteHistoryPageWriteReport> {
         expected_active.validate_namespace(source_id)?;
@@ -1135,7 +1135,7 @@ impl SourceHistoryStore {
         expected_active: Option<&SourceHistoryRemoteActiveRef>,
         candidate_generation: &SourceHistoryRemoteGenerationId,
         candidate_binding: &SourceHistoryRemoteBinding,
-        activated_at: DateTime<Utc>,
+        activated_at: UtcTimestamp,
         #[cfg(test)] _before_manifest: Option<&dyn Fn()>,
     ) -> io::Result<()> {
         candidate_generation.validate()?;
@@ -1288,7 +1288,7 @@ impl SourceHistoryStore {
         candidate_binding: &SourceHistoryRemoteBinding,
         bucket_records: &[SourceBucketRecord],
         digest_records: &[SourceSessionDigestRecord],
-        activated_at: DateTime<Utc>,
+        activated_at: UtcTimestamp,
         quota_records: &[RemoteQuotaChange],
     ) -> io::Result<RemoteHistoryPageWriteReport> {
         self.apply_remote_history_active_page_unfenced(
@@ -1311,7 +1311,7 @@ impl SourceHistoryStore {
         expected_active: Option<&SourceHistoryRemoteActiveRef>,
         candidate_generation: &SourceHistoryRemoteGenerationId,
         candidate_binding: &SourceHistoryRemoteBinding,
-        activated_at: DateTime<Utc>,
+        activated_at: UtcTimestamp,
     ) -> io::Result<()> {
         self.activate_remote_history_generation_unfenced(
             source_id,
@@ -1412,7 +1412,7 @@ impl SourceHistoryWriter<'_, '_, '_> {
         candidate_binding: &SourceHistoryRemoteBinding,
         bucket_records: &[SourceBucketRecord],
         digest_records: &[SourceSessionDigestRecord],
-        activated_at: DateTime<Utc>,
+        activated_at: UtcTimestamp,
         quota_records: &[RemoteQuotaChange],
     ) -> io::Result<RemoteHistoryPageWriteReport> {
         self.validate_redaction(redaction_profile)?;
@@ -1437,7 +1437,7 @@ impl SourceHistoryWriter<'_, '_, '_> {
         expected_active: Option<&SourceHistoryRemoteActiveRef>,
         candidate_generation: &SourceHistoryRemoteGenerationId,
         candidate_binding: &SourceHistoryRemoteBinding,
-        activated_at: DateTime<Utc>,
+        activated_at: UtcTimestamp,
     ) -> io::Result<()> {
         self.validate_redaction(redaction_profile)?;
         self.transaction_fenced(|store| {
@@ -1538,7 +1538,7 @@ fn validate_binding_does_not_roll_back(
 mod tests {
     use std::num::{NonZeroU32, NonZeroU64};
 
-    use chrono::{Duration, TimeZone};
+    use crate::time::Duration;
     use tempfile::tempdir;
 
     use super::*;
@@ -1554,10 +1554,8 @@ mod tests {
     const GENERATION_B: &str = "ingest-gen-22222222222222222222222222222222";
     const GENERATION_C: &str = "ingest-gen-33333333333333333333333333333333";
 
-    fn at(hour: u32, minute: u32) -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 8, 30, hour, minute, 0)
-            .single()
-            .unwrap()
+    fn at(hour: u32, minute: u32) -> UtcTimestamp {
+        UtcTimestamp::from_utc(2026, 8, 30, hour, minute, 0).unwrap()
     }
 
     fn profile() -> HistoryProfileId {
@@ -1634,11 +1632,11 @@ mod tests {
         store
     }
 
-    fn bucket(starts_at: DateTime<Utc>, total: u64) -> SourceBucketRecord {
+    fn bucket(starts_at: UtcTimestamp, total: u64) -> SourceBucketRecord {
         bucket_revision(1, starts_at, total)
     }
 
-    fn bucket_revision(revision: u64, starts_at: DateTime<Utc>, total: u64) -> SourceBucketRecord {
+    fn bucket_revision(revision: u64, starts_at: UtcTimestamp, total: u64) -> SourceBucketRecord {
         SourceBucketRecord::upsert(
             revision,
             LocalHalfHourBucket {
@@ -1665,14 +1663,14 @@ mod tests {
         .unwrap()
     }
 
-    fn digest(thread: &str, starts_at: DateTime<Utc>, total: u64) -> SourceSessionDigestRecord {
+    fn digest(thread: &str, starts_at: UtcTimestamp, total: u64) -> SourceSessionDigestRecord {
         digest_revision(1, thread, starts_at, total)
     }
 
     fn digest_revision(
         revision: u64,
         thread: &str,
-        starts_at: DateTime<Utc>,
+        starts_at: UtcTimestamp,
         total: u64,
     ) -> SourceSessionDigestRecord {
         let ends_at = starts_at + Duration::minutes(15);

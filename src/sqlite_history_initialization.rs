@@ -3,7 +3,6 @@
 
 use std::io;
 
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::history_ownership::{
@@ -12,6 +11,7 @@ use crate::history_ownership::{
 };
 use crate::source_history::database::{self, HistoryDatabase};
 use crate::source_history::{HistoryProfileId, RedactionProfile, SourceHistoryStore};
+use crate::time::UtcTimestamp;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -23,7 +23,7 @@ struct SqliteInitializationReceipt {
     derived_history_imported: bool,
     sqlite_version: String,
     sqlite_source_id: String,
-    completed_at: DateTime<Utc>,
+    completed_at: UtcTimestamp,
 }
 
 pub(crate) fn activate_sqlite_history(
@@ -167,7 +167,7 @@ fn activate_sqlite_history_with_hook(
                 derived_history_imported: false,
                 sqlite_version: sqlite_version.clone(),
                 sqlite_source_id: sqlite_source_id.clone(),
-                completed_at: Utc::now(),
+                completed_at: UtcTimestamp::now(),
             };
             database::set_state(
                 connection,
@@ -334,7 +334,7 @@ mod tests {
     use std::io::Write;
     use std::path::Path;
 
-    use chrono::{Duration, TimeZone};
+    use crate::time::Duration;
     use serde_json::{Value, json};
     use tempfile::TempDir;
 
@@ -367,10 +367,8 @@ mod tests {
         (temp, ownership, store, identity)
     }
 
-    fn at() -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 10, 2, 10, 0, 0)
-            .single()
-            .unwrap()
+    fn at() -> UtcTimestamp {
+        UtcTimestamp::from_utc(2026, 10, 2, 10, 0, 0).unwrap()
     }
 
     fn point() -> QuotaPoint {

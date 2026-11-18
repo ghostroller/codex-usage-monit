@@ -10,7 +10,6 @@ use std::io::{Cursor, Read, Write};
 use std::num::{NonZeroU32, NonZeroU64};
 use std::str::FromStr;
 
-use chrono::{DateTime, Duration, Utc};
 use flate2::Compression;
 use flate2::bufread::GzDecoder;
 use flate2::write::GzEncoder;
@@ -21,6 +20,7 @@ use crate::domain::{TaskStatus, TurnStatus};
 use crate::source_history::{RedactionProfile, UsageEventId};
 use crate::source_identity::NodeId;
 use crate::source_model::{ObservedProjectKey, ProjectDisplayLabel, ThreadId};
+use crate::time::{Duration, UtcTimestamp};
 
 /// Third remote export schema: negotiated model catalogs carry an exact
 /// semantic content fingerprint in addition to their numeric revisions.
@@ -820,8 +820,8 @@ pub struct ProbeRequest {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ExportRange {
-    pub from: DateTime<Utc>,
-    pub to: DateTime<Utc>,
+    pub from: UtcTimestamp,
+    pub to: UtcTimestamp,
 }
 
 impl ExportRange {
@@ -899,9 +899,9 @@ pub struct SessionFactsRequest {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SessionFactsDigestBinding {
-    pub range_start: DateTime<Utc>,
-    pub range_end: DateTime<Utc>,
-    pub covered_through: DateTime<Utc>,
+    pub range_start: UtcTimestamp,
+    pub range_end: UtcTimestamp,
+    pub covered_through: UtcTimestamp,
     pub coverage_complete: bool,
     pub fingerprint: RemoteSessionDigestFingerprint,
     pub project_breakdown_fingerprint: RemoteSessionDigestFingerprint,
@@ -1621,9 +1621,9 @@ struct RemoteProjectUsageGroupSortKey<'a> {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RemoteUsageBucket {
-    pub starts_at: DateTime<Utc>,
-    pub ends_at: DateTime<Utc>,
-    pub sampled_at: DateTime<Utc>,
+    pub starts_at: UtcTimestamp,
+    pub ends_at: UtcTimestamp,
+    pub sampled_at: UtcTimestamp,
     pub token_usage: RemoteTokenUsage,
     pub estimated_cost_units: RemoteU128,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1718,7 +1718,7 @@ pub enum RemoteUsageBucketMutation {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RemoteUsageBucketChange {
     pub sequence: NonZeroU64,
-    pub starts_at: DateTime<Utc>,
+    pub starts_at: UtcTimestamp,
     pub revision: NonZeroU64,
     pub mutation: RemoteUsageBucketMutation,
 }
@@ -1789,7 +1789,7 @@ impl RemoteSessionUsageMetrics {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RemoteUsageEventFact {
     pub event_id: UsageEventId,
-    pub occurred_at: DateTime<Utc>,
+    pub occurred_at: UtcTimestamp,
     pub observed_project_key: ObservedProjectKey,
     pub emitting_thread_id: ThreadId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1821,7 +1821,7 @@ impl RemoteUsageEventFact {
         &self,
         expected_thread: &ThreadId,
         revisions: &ProtocolRevisions,
-        observed_at: DateTime<Utc>,
+        observed_at: UtcTimestamp,
     ) -> Result<(), RemoteProtocolError> {
         if &self.emitting_thread_id != expected_thread {
             return Err(invalid_message(
@@ -1894,7 +1894,7 @@ pub enum RemoteUsageEventFactMutation {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RemoteUsageEventFactRecord {
     pub event_id: UsageEventId,
-    pub occurred_at: DateTime<Utc>,
+    pub occurred_at: UtcTimestamp,
     pub revision: NonZeroU64,
     pub mutation: RemoteUsageEventFactMutation,
 }
@@ -1904,7 +1904,7 @@ impl RemoteUsageEventFactRecord {
         &self,
         expected_thread: &ThreadId,
         revisions: &ProtocolRevisions,
-        observed_at: DateTime<Utc>,
+        observed_at: UtcTimestamp,
     ) -> Result<(), RemoteProtocolError> {
         if self.occurred_at > observed_at {
             return Err(invalid_message(
@@ -1970,7 +1970,7 @@ pub struct RemoteFactPayloadContext<'a> {
     pub page: RemoteFactPageContext<'a>,
     pub request: Option<&'a SessionFactsRequest>,
     pub revisions: &'a ProtocolRevisions,
-    pub observed_at: DateTime<Utc>,
+    pub observed_at: UtcTimestamp,
 }
 
 impl RemotePagePayload for RemoteSessionFactPayload {
@@ -2081,9 +2081,9 @@ fn validate_fact_schema_version(version: u32) -> Result<(), RemoteProtocolError>
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RemoteSessionDigest {
     pub thread_id: ThreadId,
-    pub range_start: DateTime<Utc>,
-    pub range_end: DateTime<Utc>,
-    pub covered_through: DateTime<Utc>,
+    pub range_start: UtcTimestamp,
+    pub range_end: UtcTimestamp,
+    pub covered_through: UtcTimestamp,
     pub fingerprint: RemoteSessionDigestFingerprint,
     pub project_breakdown_fingerprint: RemoteSessionDigestFingerprint,
     pub event_count: u64,
@@ -2150,10 +2150,10 @@ pub enum RemoteSessionDigestMutation {
 pub struct RemoteSessionDigestChange {
     pub sequence: NonZeroU64,
     pub thread_id: ThreadId,
-    pub range_start: DateTime<Utc>,
-    pub range_end: DateTime<Utc>,
-    pub changed_at: DateTime<Utc>,
-    pub retention_through: DateTime<Utc>,
+    pub range_start: UtcTimestamp,
+    pub range_end: UtcTimestamp,
+    pub changed_at: UtcTimestamp,
+    pub retention_through: UtcTimestamp,
     pub revision: NonZeroU64,
     pub mutation: RemoteSessionDigestMutation,
 }
@@ -2197,8 +2197,8 @@ pub struct RemoteLiveTask {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title_preview: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub created_at: Option<DateTime<Utc>>,
-    pub updated_at: DateTime<Utc>,
+    pub created_at: Option<UtcTimestamp>,
+    pub updated_at: UtcTimestamp,
     pub status: TaskStatus,
     pub token_usage: RemoteTokenUsage,
     pub turn_count: u32,
@@ -2207,7 +2207,7 @@ pub struct RemoteLiveTask {
 impl RemoteLiveTask {
     fn validate(
         &self,
-        captured_at: DateTime<Utc>,
+        captured_at: UtcTimestamp,
         profile: RedactionProfile,
     ) -> Result<(), RemoteProtocolError> {
         if self.updated_at > captured_at
@@ -2236,9 +2236,9 @@ pub struct RemoteLiveTurn {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message_preview: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub started_at: Option<DateTime<Utc>>,
+    pub started_at: Option<UtcTimestamp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub completed_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<UtcTimestamp>,
     pub status: TurnStatus,
     pub token_usage: RemoteTokenUsage,
 }
@@ -2246,7 +2246,7 @@ pub struct RemoteLiveTurn {
 impl RemoteLiveTurn {
     fn validate(
         &self,
-        captured_at: DateTime<Utc>,
+        captured_at: UtcTimestamp,
         profile: RedactionProfile,
     ) -> Result<(), RemoteProtocolError> {
         validate_required_protocol_text(&self.turn_id, MAX_TURN_ID_BYTES, "live turn ID")?;
@@ -2285,7 +2285,7 @@ impl RemoteLiveTurn {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RemoteLiveSnapshot {
-    pub captured_at: DateTime<Utc>,
+    pub captured_at: UtcTimestamp,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tasks: Vec<RemoteLiveTask>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -2541,7 +2541,7 @@ pub struct RemoteDeltaPayloadContext<'a> {
     pub source: &'a SourceGeneration,
     pub redaction_profile: RedactionProfile,
     pub revisions: &'a ProtocolRevisions,
-    pub observed_at: DateTime<Utc>,
+    pub observed_at: UtcTimestamp,
 }
 
 impl RemotePagePayload for DeltaPayload {
@@ -2620,7 +2620,7 @@ impl DeltaPayload {
                 .quota
                 .validate()
                 .map_err(|error| invalid_message(error.to_string()))?;
-            if change.quota.day > context.observed_at.date_naive()
+            if change.quota.day > context.observed_at.utc_date()
                 || change.sequence.get() < context.page.from_sequence
                 || change.sequence.get() > context.page.through_sequence
                 || change
@@ -2963,8 +2963,8 @@ pub enum RemoteExportResponseBody<D = EmptyRemotePayload, F = EmptyRemotePayload
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RemoteTiming {
-    pub remote_received_at: DateTime<Utc>,
-    pub remote_sent_at: DateTime<Utc>,
+    pub remote_received_at: UtcTimestamp,
+    pub remote_sent_at: UtcTimestamp,
 }
 
 impl RemoteTiming {
@@ -2987,7 +2987,7 @@ pub struct RemoteExportResponse<D = EmptyRemotePayload, F = EmptyRemotePayload> 
     pub source: SourceGeneration,
     pub redaction_profile: RedactionProfile,
     pub revisions: ProtocolRevisions,
-    pub observed_at: DateTime<Utc>,
+    pub observed_at: UtcTimestamp,
     pub timing: RemoteTiming,
     pub result: RemoteExportResponseBody<D, F>,
 }
@@ -3293,7 +3293,7 @@ fn validate_repository_relative_root(root: &str) -> Result<(), RemoteProtocolErr
     Ok(())
 }
 
-fn validate_aligned_bucket_start(starts_at: DateTime<Utc>) -> Result<(), RemoteProtocolError> {
+fn validate_aligned_bucket_start(starts_at: UtcTimestamp) -> Result<(), RemoteProtocolError> {
     if starts_at.timestamp_subsec_nanos() != 0
         || starts_at.timestamp().rem_euclid(SOURCE_BUCKET_MINUTES * 60) != 0
     {
@@ -3305,8 +3305,8 @@ fn validate_aligned_bucket_start(starts_at: DateTime<Utc>) -> Result<(), RemoteP
 }
 
 fn validate_bucket_bounds(
-    starts_at: DateTime<Utc>,
-    ends_at: DateTime<Utc>,
+    starts_at: UtcTimestamp,
+    ends_at: UtcTimestamp,
 ) -> Result<(), RemoteProtocolError> {
     validate_aligned_bucket_start(starts_at)?;
     if starts_at.checked_add_signed(Duration::minutes(SOURCE_BUCKET_MINUTES)) != Some(ends_at) {
@@ -3528,10 +3528,8 @@ mod tests {
         }
     }
 
-    fn at(value: &str) -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339(value)
-            .unwrap()
-            .with_timezone(&Utc)
+    fn at(value: &str) -> UtcTimestamp {
+        UtcTimestamp::parse_from_rfc3339(value).unwrap()
     }
 
     fn observed_project_key(hex: u64) -> ObservedProjectKey {
@@ -3918,9 +3916,7 @@ mod tests {
     fn response_with(
         result: RemoteExportResponseBody<EmptyRemotePayload, EmptyRemotePayload>,
     ) -> RemoteExportResponse {
-        let received = DateTime::parse_from_rfc3339("2026-08-30T01:02:03Z")
-            .unwrap()
-            .with_timezone(&Utc);
+        let received = UtcTimestamp::parse_from_rfc3339("2026-08-30T01:02:03Z").unwrap();
         RemoteExportResponse {
             protocol_version: REMOTE_PROTOCOL_VERSION,
             server_version: "0.4.0-test".parse().unwrap(),
@@ -4000,6 +3996,19 @@ mod tests {
         frame.extend_from_slice(&(json.len() as u32).to_be_bytes());
         frame.extend_from_slice(json);
         frame
+    }
+
+    #[test]
+    fn remote_timing_keeps_existing_rfc3339_wire_bytes() {
+        let legacy = br#"{"remoteReceivedAt":"2026-08-30T01:02:03.120Z","remoteSentAt":"2026-08-30T01:02:03.120340Z"}"#;
+        let timing: RemoteTiming = serde_json::from_slice(legacy).unwrap();
+
+        assert_eq!(
+            timing.remote_received_at,
+            at("2026-08-29T21:02:03.12-04:00")
+        );
+        assert_eq!(timing.remote_sent_at.timestamp_subsec_nanos(), 120_340_000);
+        assert_eq!(serde_json::to_vec(&timing).unwrap().as_slice(), legacy);
     }
 
     #[test]
@@ -4085,7 +4094,7 @@ mod tests {
 
     #[test]
     fn data_requests_require_a_pinned_source_identity() {
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         let mut request = probe_request();
         request.expected_source = None;
         request.request = RemoteExportRequestBody::Delta(DeltaRequest {
@@ -4239,8 +4248,8 @@ mod tests {
                 sequence: 10,
             }),
             range: ExportRange {
-                from: Utc::now() - Duration::hours(1),
-                to: Utc::now(),
+                from: UtcTimestamp::now() - Duration::hours(1),
+                to: UtcTimestamp::now(),
             },
             overlap_minutes: 60,
             include_live: true,

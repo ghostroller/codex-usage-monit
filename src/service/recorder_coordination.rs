@@ -13,7 +13,6 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -22,6 +21,7 @@ use super::{
 };
 #[cfg(windows)]
 use crate::source_identity::{validate_windows_private_directory, validate_windows_private_file};
+use crate::time::UtcTimestamp;
 
 const STATUS_SCHEMA_VERSION: u32 = 3;
 const LEGACY_RECORDER_STALE_SECONDS: u64 = 12 * 60;
@@ -60,9 +60,9 @@ pub struct RecorderStatusFile {
     pub version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_definition_id: Option<String>,
-    pub started_at: DateTime<Utc>,
-    pub last_attempt_at: DateTime<Utc>,
-    pub last_history_heartbeat: Option<DateTime<Utc>>,
+    pub started_at: UtcTimestamp,
+    pub last_attempt_at: UtcTimestamp,
+    pub last_history_heartbeat: Option<UtcTimestamp>,
     pub last_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub heartbeat_interval_seconds: Option<u64>,
@@ -84,7 +84,7 @@ pub enum RecorderHistoryBackend {
 }
 
 impl RecorderStatusFile {
-    pub fn started(now: DateTime<Utc>, history_namespace: String) -> Self {
+    pub fn started(now: UtcTimestamp, history_namespace: String) -> Self {
         Self {
             schema_version: STATUS_SCHEMA_VERSION,
             history_namespace: Some(history_namespace),
@@ -103,7 +103,7 @@ impl RecorderStatusFile {
     }
 
     pub fn started_with_interval(
-        now: DateTime<Utc>,
+        now: UtcTimestamp,
         history_namespace: String,
         heartbeat_interval_seconds: u64,
     ) -> Self {
@@ -113,29 +113,29 @@ impl RecorderStatusFile {
         }
     }
 
-    pub fn record_success(&mut self, now: DateTime<Utc>) {
+    pub fn record_success(&mut self, now: UtcTimestamp) {
         self.last_attempt_at = now;
         self.last_history_heartbeat = Some(now);
         self.last_error = None;
     }
 
-    pub fn record_heartbeat(&mut self, now: DateTime<Utc>) {
+    pub fn record_heartbeat(&mut self, now: UtcTimestamp) {
         self.last_attempt_at = now;
         self.last_history_heartbeat = Some(now);
     }
 
-    pub fn record_error(&mut self, now: DateTime<Utc>, error: impl Into<String>) {
+    pub fn record_error(&mut self, now: UtcTimestamp, error: impl Into<String>) {
         self.last_attempt_at = now;
         self.last_error = Some(error.into());
     }
 
-    pub fn record_degraded(&mut self, now: DateTime<Utc>, error: impl Into<String>) {
+    pub fn record_degraded(&mut self, now: UtcTimestamp, error: impl Into<String>) {
         self.last_attempt_at = now;
         self.last_history_heartbeat = Some(now);
         self.last_error = Some(error.into());
     }
 
-    pub fn heartbeat_is_recent(&self, now: DateTime<Utc>) -> bool {
+    pub fn heartbeat_is_recent(&self, now: UtcTimestamp) -> bool {
         self.last_history_heartbeat
             .is_some_and(|heartbeat| self.activity_timestamp_is_recent(heartbeat, now))
     }
@@ -160,22 +160,22 @@ impl RecorderStatusFile {
         .filter(|epoch| *epoch > 1)
     }
 
-    pub fn incompatible_writer_may_be_active(&self, now: DateTime<Utc>) -> bool {
+    pub fn incompatible_writer_may_be_active(&self, now: UtcTimestamp) -> bool {
         self.source_aware_v2_epoch().is_none() && self.writer_may_be_active(now)
     }
 
-    pub fn writer_may_be_active(&self, now: DateTime<Utc>) -> bool {
+    pub fn writer_may_be_active(&self, now: UtcTimestamp) -> bool {
         self.activity_timestamp_is_recent(self.last_activity_at(), now)
     }
 
-    pub(super) fn last_activity_at(&self) -> DateTime<Utc> {
+    pub(super) fn last_activity_at(&self) -> UtcTimestamp {
         self.last_history_heartbeat
             .map_or(self.last_attempt_at, |heartbeat| {
                 heartbeat.max(self.last_attempt_at)
             })
     }
 
-    fn activity_timestamp_is_recent(&self, timestamp: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+    fn activity_timestamp_is_recent(&self, timestamp: UtcTimestamp, now: UtcTimestamp) -> bool {
         let age_seconds = now.signed_duration_since(timestamp).num_seconds();
         let stale_after_seconds =
             self.heartbeat_interval_seconds
@@ -719,7 +719,7 @@ pub fn read_recorder_status(path: &Path) -> io::Result<Option<RecorderStatusFile
 pub fn incompatible_recorder_for_cutover(
     path: &Path,
     expected_namespace: &str,
-    now: DateTime<Utc>,
+    now: UtcTimestamp,
 ) -> io::Result<Option<RecorderStatusFile>> {
     let Some(status) = read_recorder_status(path)? else {
         return Ok(None);

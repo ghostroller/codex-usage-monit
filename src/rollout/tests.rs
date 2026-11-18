@@ -1,12 +1,8 @@
 use super::*;
-use chrono::TimeZone;
 
 #[test]
 fn fallback_usage_event_identity_is_path_independent_and_semantically_stable() {
-    let timestamp = Utc
-        .with_ymd_and_hms(2026, 8, 30, 10, 11, 12)
-        .single()
-        .unwrap();
+    let timestamp = UtcTimestamp::from_utc(2026, 8, 30, 10, 11, 12).unwrap();
     let cumulative = TokenUsage {
         input_tokens: 120,
         cached_input_tokens: 80,
@@ -46,10 +42,7 @@ fn fallback_usage_event_identity_is_path_independent_and_semantically_stable() {
 
 #[test]
 fn normalized_token_counter_event_is_exportable_as_exact_replica_identity() {
-    let timestamp = Utc
-        .with_ymd_and_hms(2026, 8, 30, 10, 11, 12)
-        .single()
-        .unwrap();
+    let timestamp = UtcTimestamp::from_utc(2026, 8, 30, 10, 11, 12).unwrap();
     let usage = TokenUsage {
         input_tokens: 120,
         cached_input_tokens: 80,
@@ -220,7 +213,7 @@ fn malformed_rollout_warning_floods_are_bounded_and_summarized() {
     };
 
     let mut cache = RolloutCache::new();
-    let dataset = cache.scan(&config, Utc::now()).unwrap();
+    let dataset = cache.scan(&config, UtcTimestamp::now()).unwrap();
 
     assert!(dataset.warnings.len() <= ROLLOUT_MAX_WARNINGS);
     assert_eq!(
@@ -251,8 +244,8 @@ fn warning_collection_is_bounded_before_materialization() {
 fn continuous_local_coverage_materializes_at_quarter_hour_boundaries() {
     let temp = tempfile::tempdir().unwrap();
     fs::create_dir_all(temp.path().join("sessions")).unwrap();
-    let boundary = DateTime::from_timestamp(1_800_000_000, 0).unwrap();
-    let initial_at = boundary - ChronoDuration::seconds(10);
+    let boundary = UtcTimestamp::from_timestamp(1_800_000_000, 0).unwrap();
+    let initial_at = boundary - SignedDuration::seconds(10);
     let config = CollectConfig {
         codex_home: temp.path().to_owned(),
         ..CollectConfig::default()
@@ -271,7 +264,7 @@ fn continuous_local_coverage_materializes_at_quarter_hour_boundaries() {
     );
     assert!(
         cache
-            .scan_if_changed(&config, boundary - ChronoDuration::seconds(1))
+            .scan_if_changed(&config, boundary - SignedDuration::seconds(1))
             .unwrap()
             .is_none()
     );
@@ -281,7 +274,7 @@ fn continuous_local_coverage_materializes_at_quarter_hour_boundaries() {
         Some(initial_at)
     );
 
-    let rolled_back = initial_at - ChronoDuration::seconds(1);
+    let rolled_back = initial_at - SignedDuration::seconds(1);
     assert_eq!(
         cache.update_local_coverage(rolled_back, true),
         Some(rolled_back)
@@ -295,8 +288,8 @@ fn continuous_local_coverage_materializes_at_quarter_hour_boundaries() {
 fn external_as_of_boundary_materializes_without_rollout_changes() {
     let temp = tempfile::tempdir().unwrap();
     fs::create_dir_all(temp.path().join("sessions")).unwrap();
-    let now = DateTime::from_timestamp(1_800_000_000, 0).unwrap();
-    let boundary = now + ChronoDuration::seconds(10);
+    let now = UtcTimestamp::from_timestamp(1_800_000_000, 0).unwrap();
+    let boundary = now + SignedDuration::seconds(10);
     let config = CollectConfig {
         codex_home: temp.path().to_owned(),
         ..CollectConfig::default()
@@ -313,7 +306,7 @@ fn external_as_of_boundary_materializes_without_rollout_changes() {
         cache
             .scan_if_changed_with_external_boundary(
                 &config,
-                boundary - ChronoDuration::seconds(1),
+                boundary - SignedDuration::seconds(1),
                 Some(boundary),
             )
             .unwrap()
@@ -332,7 +325,7 @@ fn interactive_materialization_coalesces_bursts_without_losing_pending_state() {
     let temp = tempfile::tempdir().unwrap();
     let sessions = temp.path().join("sessions");
     fs::create_dir_all(&sessions).unwrap();
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let path = sessions.join("rollout.jsonl");
     fs::write(
         &path,
@@ -359,7 +352,7 @@ fn interactive_materialization_coalesces_bursts_without_losing_pending_state() {
         sessions.join("rollout-second.jsonl"),
         format!(
             "{{\"timestamp\":\"{}\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"second-thread\"}}}}\n",
-            (now + ChronoDuration::seconds(1)).to_rfc3339()
+            (now + SignedDuration::seconds(1)).to_rfc3339()
         ),
     )
     .unwrap();
@@ -371,7 +364,7 @@ fn interactive_materialization_coalesces_bursts_without_losing_pending_state() {
         cache
             .scan_if_changed_coalesced_with_external_boundary(
                 &config,
-                now + ChronoDuration::seconds(1),
+                now + SignedDuration::seconds(1),
                 None,
             )
             .unwrap()
@@ -386,7 +379,7 @@ fn interactive_materialization_coalesces_bursts_without_losing_pending_state() {
         cache
             .scan_if_changed_coalesced_with_external_boundary(
                 &config,
-                now + ChronoDuration::seconds(9),
+                now + SignedDuration::seconds(9),
                 None,
             )
             .unwrap()
@@ -395,7 +388,7 @@ fn interactive_materialization_coalesces_bursts_without_losing_pending_state() {
     let materialized = cache
         .scan_if_changed_coalesced_with_external_boundary(
             &config,
-            now + ChronoDuration::seconds(10),
+            now + SignedDuration::seconds(10),
             None,
         )
         .unwrap()
@@ -409,8 +402,8 @@ fn coalesced_rebuild_invalidates_cached_as_of_projection_before_deadline() {
     let temp = tempfile::tempdir().unwrap();
     let sessions = temp.path().join("sessions");
     fs::create_dir_all(&sessions).unwrap();
-    let base = Utc::now() - ChronoDuration::seconds(1);
-    let future = base + ChronoDuration::seconds(60);
+    let base = UtcTimestamp::now() - SignedDuration::seconds(1);
+    let future = base + SignedDuration::seconds(60);
     let path = sessions.join("rollout-as-of-coalesced.jsonl");
     let records = [
         serde_json::json!({
@@ -424,7 +417,7 @@ fn coalesced_rebuild_invalidates_cached_as_of_projection_before_deadline() {
             "payload": {"type": "task_started", "turn_id": "turn"}
         }),
         serde_json::json!({
-            "timestamp": (base + ChronoDuration::seconds(1)).to_rfc3339(),
+            "timestamp": (base + SignedDuration::seconds(1)).to_rfc3339(),
             "type": "event_msg",
             "payload": {"type": "token_count", "info": {"total_token_usage": {
                 "input_tokens": 100,
@@ -462,7 +455,7 @@ fn coalesced_rebuild_invalidates_cached_as_of_projection_before_deadline() {
         ..CollectConfig::default()
     };
     let mut cache = RolloutCache::new();
-    let initial_at = base + ChronoDuration::seconds(5);
+    let initial_at = base + SignedDuration::seconds(5);
 
     let initial = cache
         .scan_if_changed_coalesced_with_external_boundary(&config, initial_at, None)
@@ -471,7 +464,7 @@ fn coalesced_rebuild_invalidates_cached_as_of_projection_before_deadline() {
     assert_eq!(initial.tasks[0].token_usage.total_tokens, 100);
     assert!(cache.as_of_reduced.is_some());
 
-    let appended_at = base + ChronoDuration::seconds(6);
+    let appended_at = base + SignedDuration::seconds(6);
     fs::write(
         sessions.join("rollout-as-of-coalesced-new-thread.jsonl"),
         serde_json::json!({
@@ -503,7 +496,7 @@ fn coalesced_rebuild_invalidates_cached_as_of_projection_before_deadline() {
     let due = cache
         .scan_if_changed_coalesced_with_external_boundary(
             &config,
-            initial_at + ChronoDuration::seconds(10),
+            initial_at + SignedDuration::seconds(10),
             None,
         )
         .unwrap()
@@ -523,7 +516,7 @@ fn coalesced_rebuild_invalidates_cached_as_of_projection_before_deadline() {
 fn local_coverage_restarts_after_a_gap_longer_than_the_scan_lookback() {
     let temp = tempfile::tempdir().unwrap();
     fs::create_dir_all(temp.path().join("sessions")).unwrap();
-    let initial_at = DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+    let initial_at = UtcTimestamp::from_timestamp(1_800_000_000, 0).unwrap();
     let config = CollectConfig {
         codex_home: temp.path().to_owned(),
         lookback_days: 1,
@@ -536,13 +529,13 @@ fn local_coverage_restarts_after_a_gap_longer_than_the_scan_lookback() {
         cache.update_local_coverage(initial_at, true),
         Some(initial_at)
     );
-    let within_lookback = initial_at + ChronoDuration::hours(23);
+    let within_lookback = initial_at + SignedDuration::hours(23);
     assert_eq!(
         cache.update_local_coverage(within_lookback, true),
         Some(initial_at)
     );
 
-    let after_gap = within_lookback + ChronoDuration::days(1) + ChronoDuration::seconds(1);
+    let after_gap = within_lookback + SignedDuration::days(1) + SignedDuration::seconds(1);
     assert_eq!(
         cache.update_local_coverage(after_gap, true),
         Some(after_gap)
@@ -560,7 +553,7 @@ fn nested_rollout_discovery_preserves_the_initial_cumulative_sample() {
         .join("08")
         .join("30");
     fs::create_dir_all(&sessions).unwrap();
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let records = [
         serde_json::json!({
             "timestamp": now.to_rfc3339(),
@@ -606,7 +599,7 @@ fn incomplete_discovery_inventory_retries_with_a_bounded_backoff() {
     let temp = tempfile::tempdir().unwrap();
     let sessions = temp.path().join("sessions");
     fs::create_dir_all(&sessions).unwrap();
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     fs::write(
         sessions.join("rollout.jsonl"),
         format!(
@@ -634,12 +627,12 @@ fn incomplete_discovery_inventory_retries_with_a_bounded_backoff() {
     writeln!(
         source,
         "{{\"timestamp\":\"{}\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_started\",\"turn_id\":\"turn\"}}}}",
-        (now + ChronoDuration::seconds(1)).to_rfc3339()
+        (now + SignedDuration::seconds(1)).to_rfc3339()
     )
     .unwrap();
 
     let cached = cache
-        .scan(&config, now + ChronoDuration::seconds(1))
+        .scan(&config, now + SignedDuration::seconds(1))
         .unwrap();
     assert!(cache.last_refresh().discovery_cache_hit);
     assert!(!cache.last_refresh().discovery_full_scan);
@@ -667,13 +660,13 @@ fn incomplete_discovery_makes_the_selected_counter_boundary_partial() {
     let temp = tempfile::tempdir().unwrap();
     let sessions = temp.path().join("sessions");
     fs::create_dir_all(&sessions).unwrap();
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     fs::write(
         sessions.join("rollout.jsonl"),
         format!(
             "{{\"timestamp\":\"{}\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"thread\"}}}}\n{{\"timestamp\":\"{}\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"total_token_usage\":{{\"input_tokens\":10,\"cached_input_tokens\":0,\"output_tokens\":0,\"reasoning_output_tokens\":0,\"total_tokens\":10}}}}}}}}\n",
             now.to_rfc3339(),
-            (now + ChronoDuration::seconds(1)).to_rfc3339(),
+            (now + SignedDuration::seconds(1)).to_rfc3339(),
         ),
     )
     .unwrap();
@@ -684,7 +677,7 @@ fn incomplete_discovery_makes_the_selected_counter_boundary_partial() {
     let mut cache = RolloutCache::new();
 
     let complete = cache
-        .scan(&config, now + ChronoDuration::seconds(1))
+        .scan(&config, now + SignedDuration::seconds(1))
         .unwrap();
     assert_eq!(complete.calls.len(), 1);
     let discovery = cache.discovery_cache.as_mut().unwrap();
@@ -693,7 +686,7 @@ fn incomplete_discovery_makes_the_selected_counter_boundary_partial() {
     discovery.full_scan_at = Instant::now();
 
     let incomplete = cache
-        .scan(&config, now + ChronoDuration::seconds(2))
+        .scan(&config, now + SignedDuration::seconds(2))
         .unwrap();
     assert!(cache.last_refresh().discovery_cache_hit);
     assert!(incomplete.calls.is_empty());
@@ -933,7 +926,7 @@ fn compatible_flat_cache_entry_is_reused_and_migrated_to_the_current_generation(
     let sessions = temp.path().join("sessions");
     fs::create_dir_all(&sessions).unwrap();
     let source = sessions.join("rollout-legacy-compatible.jsonl");
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     fs::write(
         &source,
         format!(
@@ -992,7 +985,7 @@ fn incompatible_flat_cache_entry_is_a_miss_and_is_outside_the_current_budget() {
     let sessions = temp.path().join("sessions");
     fs::create_dir_all(&sessions).unwrap();
     let source = sessions.join("rollout-legacy-incompatible.jsonl");
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     fs::write(
         &source,
         format!(
@@ -1142,7 +1135,7 @@ fn incomplete_in_memory_entry_is_reparsed_instead_of_hydrated_from_disk() {
     let sessions = temp.path().join("sessions");
     fs::create_dir_all(&sessions).unwrap();
     let source = sessions.join("rollout-incomplete.jsonl");
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     fs::write(
             &source,
             format!(
@@ -1255,22 +1248,22 @@ fn persistent_write_backoff_is_bounded() {
 
 #[test]
 fn future_timestamps_are_not_fresh_but_the_as_of_boundary_is() {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let grace = Duration::from_secs(30);
 
     assert!(timestamp_is_fresh(Some(now), now, grace));
     assert!(timestamp_is_fresh(
-        Some(now - ChronoDuration::seconds(30)),
+        Some(now - SignedDuration::seconds(30)),
         now,
         grace
     ));
     assert!(!timestamp_is_fresh(
-        Some(now - ChronoDuration::seconds(31)),
+        Some(now - SignedDuration::seconds(31)),
         now,
         grace
     ));
     assert!(!timestamp_is_fresh(
-        Some(now + ChronoDuration::nanoseconds(1)),
+        Some(now + SignedDuration::nanoseconds(1)),
         now,
         grace
     ));
@@ -1281,11 +1274,11 @@ fn clock_rollback_hides_cached_future_rollout_evidence_until_catchup() {
     let temp = tempfile::tempdir().unwrap();
     let sessions = temp.path().join("sessions");
     fs::create_dir_all(&sessions).unwrap();
-    let base = Utc::now() - ChronoDuration::seconds(1);
-    let task_at = base + ChronoDuration::seconds(10);
-    let usage_at = base + ChronoDuration::seconds(11);
-    let future_thread_at = base + ChronoDuration::seconds(12);
-    let completion_at = base + ChronoDuration::seconds(13);
+    let base = UtcTimestamp::now() - SignedDuration::seconds(1);
+    let task_at = base + SignedDuration::seconds(10);
+    let usage_at = base + SignedDuration::seconds(11);
+    let future_thread_at = base + SignedDuration::seconds(12);
+    let completion_at = base + SignedDuration::seconds(13);
     let records = [
         serde_json::json!({
             "timestamp": base.to_rfc3339(),
@@ -1352,7 +1345,7 @@ fn clock_rollback_hides_cached_future_rollout_evidence_until_catchup() {
     let mut cache = RolloutCache::new();
 
     let caught_up = cache
-        .scan(&config, base + ChronoDuration::seconds(20))
+        .scan(&config, base + SignedDuration::seconds(20))
         .unwrap();
     assert_eq!(caught_up.tasks.len(), 2);
     assert_eq!(caught_up.turns.len(), 1);
@@ -1370,7 +1363,7 @@ fn clock_rollback_hides_cached_future_rollout_evidence_until_catchup() {
     );
 
     let rolled_back = cache
-        .scan(&config, base + ChronoDuration::seconds(5))
+        .scan(&config, base + SignedDuration::seconds(5))
         .unwrap();
     assert_eq!(rolled_back.tasks.len(), 1);
     assert_eq!(rolled_back.tasks[0].thread_id, "clock-thread");
@@ -1395,7 +1388,7 @@ fn clock_rollback_hides_cached_future_rollout_evidence_until_catchup() {
     assert_eq!(at_usage_boundary.tasks[0].token_usage.total_tokens, 10);
 
     let rolled_back_again = cache
-        .scan(&config, base + ChronoDuration::seconds(5))
+        .scan(&config, base + SignedDuration::seconds(5))
         .unwrap();
     assert!(rolled_back_again.calls.is_empty());
     assert!(rolled_back_again.rate_observations.is_empty());
@@ -1403,7 +1396,7 @@ fn clock_rollback_hides_cached_future_rollout_evidence_until_catchup() {
 
     assert!(
         cache
-            .scan_if_changed(&config, base + ChronoDuration::seconds(6))
+            .scan_if_changed(&config, base + SignedDuration::seconds(6))
             .unwrap()
             .is_none()
     );
@@ -1444,8 +1437,8 @@ fn clock_rollback_hides_cached_future_rollout_evidence_until_catchup() {
 
 #[test]
 fn future_session_metadata_does_not_decorate_an_older_visible_call() {
-    let now = Utc::now();
-    let future = now + ChronoDuration::hours(1);
+    let now = UtcTimestamp::now();
+    let future = now + SignedDuration::hours(1);
     let thread_id = "mixed-clock-thread".to_string();
     let turn_id = "past-turn".to_string();
     let thread = ThreadBuilder {
@@ -1463,7 +1456,7 @@ fn future_session_metadata_does_not_decorate_an_older_visible_call() {
             turn_id.clone(),
             TurnBuilder {
                 turn_id: turn_id.clone(),
-                started_at: Some(now - ChronoDuration::minutes(1)),
+                started_at: Some(now - SignedDuration::minutes(1)),
                 status: TurnStatus::Completed,
                 ..TurnBuilder::default()
             },
@@ -1471,7 +1464,7 @@ fn future_session_metadata_does_not_decorate_an_older_visible_call() {
         ..ThreadBuilder::default()
     };
     let calls = vec![UsageCall {
-        timestamp: now - ChronoDuration::seconds(30),
+        timestamp: now - SignedDuration::seconds(30),
         thread_id: thread_id.clone(),
         turn_id: Some(turn_id),
         usage_event_id: None,
@@ -1538,13 +1531,13 @@ fn as_of_replay_excludes_future_state_and_counter_resets_until_each_boundary() {
     let temp = tempfile::tempdir().unwrap();
     let sessions = temp.path().join("sessions");
     fs::create_dir_all(&sessions).unwrap();
-    let base = Utc::now() - ChronoDuration::seconds(1);
-    let future_meta = base + ChronoDuration::seconds(20);
-    let future_message = base + ChronoDuration::seconds(21);
-    let future_settings = base + ChronoDuration::seconds(22);
-    let future_counter = base + ChronoDuration::seconds(23);
-    let future_activity = base + ChronoDuration::seconds(24);
-    let effective_completion = base + ChronoDuration::seconds(30);
+    let base = UtcTimestamp::now() - SignedDuration::seconds(1);
+    let future_meta = base + SignedDuration::seconds(20);
+    let future_message = base + SignedDuration::seconds(21);
+    let future_settings = base + SignedDuration::seconds(22);
+    let future_counter = base + SignedDuration::seconds(23);
+    let future_activity = base + SignedDuration::seconds(24);
+    let effective_completion = base + SignedDuration::seconds(30);
     let records = [
         serde_json::json!({
             "timestamp": base.to_rfc3339(),
@@ -1556,17 +1549,17 @@ fn as_of_replay_excludes_future_state_and_counter_resets_until_each_boundary() {
             }
         }),
         serde_json::json!({
-            "timestamp": (base + ChronoDuration::seconds(1)).to_rfc3339(),
+            "timestamp": (base + SignedDuration::seconds(1)).to_rfc3339(),
             "type": "event_msg",
             "payload": {"type": "task_started", "turn_id": "turn"}
         }),
         serde_json::json!({
-            "timestamp": (base + ChronoDuration::seconds(1)).to_rfc3339(),
+            "timestamp": (base + SignedDuration::seconds(1)).to_rfc3339(),
             "type": "turn_context",
             "payload": {"turn_id": "turn", "model": "past-model", "effort": "low"}
         }),
         serde_json::json!({
-            "timestamp": (base + ChronoDuration::seconds(1)).to_rfc3339(),
+            "timestamp": (base + SignedDuration::seconds(1)).to_rfc3339(),
             "type": "response_item",
             "payload": {
                 "type": "function_call",
@@ -1576,7 +1569,7 @@ fn as_of_replay_excludes_future_state_and_counter_resets_until_each_boundary() {
             }
         }),
         serde_json::json!({
-            "timestamp": (base + ChronoDuration::seconds(2)).to_rfc3339(),
+            "timestamp": (base + SignedDuration::seconds(2)).to_rfc3339(),
             "type": "event_msg",
             "payload": {
                 "type": "token_count",
@@ -1592,7 +1585,7 @@ fn as_of_replay_excludes_future_state_and_counter_resets_until_each_boundary() {
         // The record timestamp predates the payload's effective timestamp.
         // Neither half may make the session metadata visible early.
         serde_json::json!({
-            "timestamp": (base + ChronoDuration::seconds(3)).to_rfc3339(),
+            "timestamp": (base + SignedDuration::seconds(3)).to_rfc3339(),
             "type": "session_meta",
             "payload": {
                 "id": "as-of-thread",
@@ -1640,7 +1633,7 @@ fn as_of_replay_excludes_future_state_and_counter_resets_until_each_boundary() {
         // This record is appended after the future reset but has a corrected
         // wall-clock timestamp. It must not use the hidden reset as evidence.
         serde_json::json!({
-            "timestamp": (base + ChronoDuration::seconds(3)).to_rfc3339(),
+            "timestamp": (base + SignedDuration::seconds(3)).to_rfc3339(),
             "type": "event_msg",
             "payload": {
                 "type": "token_count",
@@ -1663,11 +1656,11 @@ fn as_of_replay_excludes_future_state_and_counter_resets_until_each_boundary() {
                 "kind": "started",
                 "event_id": "future-activity-call",
                 "agent_thread_id": "future-child",
-                "occurred_at_ms": (base + ChronoDuration::seconds(2)).timestamp_millis()
+                "occurred_at_ms": (base + SignedDuration::seconds(2)).timestamp_millis()
             }
         }),
         serde_json::json!({
-            "timestamp": (base + ChronoDuration::seconds(4)).to_rfc3339(),
+            "timestamp": (base + SignedDuration::seconds(4)).to_rfc3339(),
             "type": "event_msg",
             "payload": {
                 "type": "task_complete",
@@ -1694,7 +1687,7 @@ fn as_of_replay_excludes_future_state_and_counter_resets_until_each_boundary() {
     let mut cache = RolloutCache::new();
 
     let current = cache
-        .scan(&config, base + ChronoDuration::seconds(5))
+        .scan(&config, base + SignedDuration::seconds(5))
         .unwrap();
     assert_eq!(current.tasks.len(), 1);
     assert_eq!(current.tasks[0].title, "Untitled task");
@@ -1716,7 +1709,7 @@ fn as_of_replay_excludes_future_state_and_counter_resets_until_each_boundary() {
     assert_eq!(cache.as_of_reduce_count, 1);
 
     let forced_same_interval = cache
-        .scan(&config, base + ChronoDuration::seconds(6))
+        .scan(&config, base + SignedDuration::seconds(6))
         .unwrap();
     assert_eq!(forced_same_interval.tasks[0].token_usage.total_tokens, 100);
     assert_eq!(
@@ -1772,7 +1765,7 @@ fn as_of_replay_excludes_future_state_and_counter_resets_until_each_boundary() {
             .occurred_at
             .unwrap()
             .timestamp_millis(),
-        (base + ChronoDuration::seconds(2)).timestamp_millis()
+        (base + SignedDuration::seconds(2)).timestamp_millis()
     );
 
     let completed = cache
@@ -1782,7 +1775,7 @@ fn as_of_replay_excludes_future_state_and_counter_resets_until_each_boundary() {
     assert_eq!(completed.tasks[0].status, TaskStatus::Completed);
 
     let rolled_back = cache
-        .scan(&config, base + ChronoDuration::seconds(5))
+        .scan(&config, base + SignedDuration::seconds(5))
         .unwrap();
     assert_eq!(rolled_back.tasks[0].title, "Untitled task");
     assert_eq!(rolled_back.tasks[0].status, TaskStatus::Running);
@@ -1794,8 +1787,8 @@ fn future_quota_only_sample_does_not_break_the_visible_token_counter() {
     let temp = tempfile::tempdir().unwrap();
     let sessions = temp.path().join("sessions");
     fs::create_dir_all(&sessions).unwrap();
-    let base = Utc::now() - ChronoDuration::seconds(1);
-    let future = base + ChronoDuration::seconds(20);
+    let base = UtcTimestamp::now() - SignedDuration::seconds(1);
+    let future = base + SignedDuration::seconds(20);
     let records = [
         serde_json::json!({
             "timestamp": base.to_rfc3339(),
@@ -1830,7 +1823,7 @@ fn future_quota_only_sample_does_not_break_the_visible_token_counter() {
             }
         }),
         serde_json::json!({
-            "timestamp": (base + ChronoDuration::seconds(1)).to_rfc3339(),
+            "timestamp": (base + SignedDuration::seconds(1)).to_rfc3339(),
             "type": "event_msg",
             "payload": {"type": "token_count", "info": {
                 "total_token_usage": {
@@ -1867,7 +1860,7 @@ fn future_quota_only_sample_does_not_break_the_visible_token_counter() {
     let mut cache = RolloutCache::new();
 
     let current = cache
-        .scan(&config, base + ChronoDuration::seconds(2))
+        .scan(&config, base + SignedDuration::seconds(2))
         .unwrap();
     assert_eq!(current.calls.len(), 2);
     assert_eq!(current.tasks[0].token_usage.total_tokens, 110);
@@ -1885,9 +1878,9 @@ fn redacted_nonprojected_activity_keeps_each_as_of_boundary() {
     let temp = tempfile::tempdir().unwrap();
     let sessions = temp.path().join("sessions");
     fs::create_dir_all(&sessions).unwrap();
-    let base = Utc::now() - ChronoDuration::seconds(1);
-    let middle = base + ChronoDuration::seconds(10);
-    let future = base + ChronoDuration::seconds(20);
+    let base = UtcTimestamp::now() - SignedDuration::seconds(1);
+    let middle = base + SignedDuration::seconds(10);
+    let future = base + SignedDuration::seconds(20);
     let records = [
         serde_json::json!({
             "timestamp": base.to_rfc3339(),
@@ -1943,9 +1936,9 @@ fn future_file_overlap_does_not_poison_the_current_replay_plan() {
     let temp = tempfile::tempdir().unwrap();
     let sessions = temp.path().join("sessions");
     fs::create_dir_all(&sessions).unwrap();
-    let base = Utc::now() - ChronoDuration::seconds(1);
-    let second_file_at = base + ChronoDuration::seconds(20);
-    let first_file_future = base + ChronoDuration::seconds(30);
+    let base = UtcTimestamp::now() - SignedDuration::seconds(1);
+    let second_file_at = base + SignedDuration::seconds(20);
+    let first_file_future = base + SignedDuration::seconds(30);
     fs::write(
         sessions.join("rollout-a.jsonl"),
         [
@@ -1955,7 +1948,7 @@ fn future_file_overlap_does_not_poison_the_current_replay_plan() {
                 "payload": {"id": "overlap-thread", "timestamp": base.to_rfc3339()}
             }),
             serde_json::json!({
-                "timestamp": (base + ChronoDuration::seconds(1)).to_rfc3339(),
+                "timestamp": (base + SignedDuration::seconds(1)).to_rfc3339(),
                 "type": "event_msg",
                 "payload": {"type": "token_count", "info": {"total_token_usage": {
                     "input_tokens": 100,
@@ -1990,7 +1983,7 @@ fn future_file_overlap_does_not_poison_the_current_replay_plan() {
                 }
             }),
             serde_json::json!({
-                "timestamp": (second_file_at + ChronoDuration::seconds(1)).to_rfc3339(),
+                "timestamp": (second_file_at + SignedDuration::seconds(1)).to_rfc3339(),
                 "type": "event_msg",
                 "payload": {"type": "token_count", "info": {"total_token_usage": {
                     "input_tokens": 120,
@@ -2015,7 +2008,7 @@ fn future_file_overlap_does_not_poison_the_current_replay_plan() {
     let mut cache = RolloutCache::new();
 
     let current = cache
-        .scan(&config, base + ChronoDuration::seconds(2))
+        .scan(&config, base + SignedDuration::seconds(2))
         .unwrap();
 
     assert_eq!(current.tasks[0].token_usage.total_tokens, 100);
@@ -2034,8 +2027,8 @@ fn foreign_settings_timeline_restores_the_latest_visible_inheritance() {
     let temp = tempfile::tempdir().unwrap();
     let sessions = temp.path().join("sessions");
     fs::create_dir_all(&sessions).unwrap();
-    let base = Utc::now() - ChronoDuration::seconds(1);
-    let future = base + ChronoDuration::seconds(20);
+    let base = UtcTimestamp::now() - SignedDuration::seconds(1);
+    let future = base + SignedDuration::seconds(20);
     let records = [
         serde_json::json!({
             "timestamp": base.to_rfc3339(),
@@ -2050,12 +2043,12 @@ fn foreign_settings_timeline_restores_the_latest_visible_inheritance() {
             }
         }),
         serde_json::json!({
-            "timestamp": (base - ChronoDuration::seconds(2)).to_rfc3339(),
+            "timestamp": (base - SignedDuration::seconds(2)).to_rfc3339(),
             "type": "session_meta",
             "payload": {"id": "settings-parent"}
         }),
         serde_json::json!({
-            "timestamp": (base - ChronoDuration::seconds(1)).to_rfc3339(),
+            "timestamp": (base - SignedDuration::seconds(1)).to_rfc3339(),
             "type": "event_msg",
             "payload": {"type": "thread_settings_applied", "thread_settings": {
                 "model": "gpt-child",
@@ -2071,16 +2064,16 @@ fn foreign_settings_timeline_restores_the_latest_visible_inheritance() {
             }}
         }),
         serde_json::json!({
-            "timestamp": (base + ChronoDuration::seconds(1)).to_rfc3339(),
+            "timestamp": (base + SignedDuration::seconds(1)).to_rfc3339(),
             "type": "event_msg",
             "payload": {
                 "type": "task_started",
                 "turn_id": "child-turn",
-                "started_at": (base + ChronoDuration::seconds(1)).to_rfc3339()
+                "started_at": (base + SignedDuration::seconds(1)).to_rfc3339()
             }
         }),
         serde_json::json!({
-            "timestamp": (base + ChronoDuration::seconds(1)).to_rfc3339(),
+            "timestamp": (base + SignedDuration::seconds(1)).to_rfc3339(),
             "type": "turn_context",
             "payload": {"turn_id": "child-turn", "model": "gpt-child"}
         }),
@@ -2102,7 +2095,7 @@ fn foreign_settings_timeline_restores_the_latest_visible_inheritance() {
     let mut cache = RolloutCache::new();
 
     let current = cache
-        .scan(&config, base + ChronoDuration::seconds(2))
+        .scan(&config, base + SignedDuration::seconds(2))
         .unwrap();
     assert_eq!(current.turns[0].service_tier.as_deref(), Some("default"));
 
@@ -2115,8 +2108,8 @@ fn cached_session_titles_rematerialize_at_updated_at_without_file_changes() {
     let temp = tempfile::tempdir().unwrap();
     let sessions = temp.path().join("sessions");
     fs::create_dir_all(&sessions).unwrap();
-    let now = Utc::now() - ChronoDuration::seconds(1);
-    let future = now + ChronoDuration::seconds(10);
+    let now = UtcTimestamp::now() - SignedDuration::seconds(1);
+    let future = now + SignedDuration::seconds(10);
     fs::write(
         sessions.join("rollout-title.jsonl"),
         serde_json::json!({
@@ -2132,7 +2125,7 @@ fn cached_session_titles_rematerialize_at_updated_at_without_file_changes() {
         temp.path().join("session_index.jsonl"),
         format!(
             "{{\"id\":\"title-thread\",\"thread_name\":\"Current\",\"updated_at\":\"{}\"}}\n{{\"id\":\"title-thread\",\"thread_name\":\"Future\",\"updated_at\":\"{}\"}}\n",
-            (now - ChronoDuration::seconds(1)).to_rfc3339(),
+            (now - SignedDuration::seconds(1)).to_rfc3339(),
             future.to_rfc3339(),
         ),
     )
@@ -2147,7 +2140,7 @@ fn cached_session_titles_rematerialize_at_updated_at_without_file_changes() {
     assert_eq!(current.tasks[0].title, "Current");
     assert!(
         cache
-            .scan_if_changed(&config, future - ChronoDuration::seconds(1))
+            .scan_if_changed(&config, future - SignedDuration::seconds(1))
             .unwrap()
             .is_none()
     );

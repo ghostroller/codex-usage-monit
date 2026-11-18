@@ -11,6 +11,10 @@ All notable changes to this project are documented in this file.
 - Add exact pricing profiles for GPT-6.2 Astra, GPT-6.2 Sol, and GPT-6.1 Terra. The profiles cover Codex credit estimates and Standard/Fast API-equivalent pricing, including published long-context and 30-minute cache-write rates. See the [November pricing audit](docs/model-catalog-maintenance.md#pricing-audit-on-november-18-2026).
 - Price recorded Ultrafast usage for GPT-6.2 Astra and Sol, GPT-6 Astra, and GPT-6.1 Sol. The GPT-6.2 API-equivalent rate follows the promotion end at midnight Pacific on March 1, 2027. Included Codex credit estimates use the separate subscription multipliers.
 
+### Changed
+
+- Use Jiff for UTC timestamps, elapsed time, and local time zones. Preserve the existing timestamp encoding for supported history and sync data, including fractional seconds and stable event identities.
+
 ### Security
 
 - Update bundled SQLite and rustix to address [RUSTSEC-2026-0459](https://rustsec.org/advisories/RUSTSEC-2026-0459.html) and [RUSTSEC-2026-0486](https://rustsec.org/advisories/RUSTSEC-2026-0486.html).

@@ -12,7 +12,7 @@ fn backfill_fixture(directory: &Path) -> CollectConfig {
         ("recent", 1, RESUMABLE_THREAD_ID, 100),
         ("older", 20, "019f52ac-7a9f-7fd1-8dda-e775ef950786", 200),
     ] {
-        let observed_at = Utc::now() - ChronoDuration::days(days);
+        let observed_at = UtcTimestamp::now() - SignedDuration::days(days);
         let timestamp = observed_at.to_rfc3339();
         let records = [
             json!({"timestamp": timestamp, "type": "session_meta", "payload": {
@@ -47,7 +47,7 @@ fn backfill_fixture(directory: &Path) -> CollectConfig {
             .write(true)
             .open(path)
             .unwrap()
-            .set_modified(observed_at.into())
+            .set_modified(observed_at.as_jiff().try_into().unwrap())
             .unwrap();
     }
     CollectConfig {

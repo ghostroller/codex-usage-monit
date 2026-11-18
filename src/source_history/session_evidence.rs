@@ -3,10 +3,10 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use chrono::{DateTime, Duration, NaiveDate, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use super::*;
+use crate::time::{Duration, UtcDay, UtcTimestamp};
 
 #[path = "sqlite_evidence.rs"]
 mod sqlite_evidence;
@@ -240,9 +240,9 @@ impl SessionUsageMetrics {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SourceSessionDigest {
     replica: SessionReplicaKey,
-    range_start: DateTime<Utc>,
-    range_end: DateTime<Utc>,
-    covered_through: DateTime<Utc>,
+    range_start: UtcTimestamp,
+    range_end: UtcTimestamp,
+    covered_through: UtcTimestamp,
     fingerprint: SessionDigestFingerprint,
     /// Content-free hash of the normalized per-bucket project/turn metric
     /// breakdown represented by this digest. It prevents fresh event totals
@@ -260,9 +260,9 @@ impl SourceSessionDigest {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         replica: SessionReplicaKey,
-        range_start: DateTime<Utc>,
-        range_end: DateTime<Utc>,
-        covered_through: DateTime<Utc>,
+        range_start: UtcTimestamp,
+        range_end: UtcTimestamp,
+        covered_through: UtcTimestamp,
         fingerprint: SessionDigestFingerprint,
         project_breakdown_fingerprint: SessionDigestFingerprint,
         event_count: u64,
@@ -292,15 +292,15 @@ impl SourceSessionDigest {
         &self.replica
     }
 
-    pub fn range_start(&self) -> DateTime<Utc> {
+    pub fn range_start(&self) -> UtcTimestamp {
         self.range_start
     }
 
-    pub fn range_end(&self) -> DateTime<Utc> {
+    pub fn range_end(&self) -> UtcTimestamp {
         self.range_end
     }
 
-    pub fn covered_through(&self) -> DateTime<Utc> {
+    pub fn covered_through(&self) -> UtcTimestamp {
         self.covered_through
     }
 
@@ -376,9 +376,9 @@ impl SourceSessionDigest {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FactDigestBinding {
-    range_start: DateTime<Utc>,
-    range_end: DateTime<Utc>,
-    covered_through: DateTime<Utc>,
+    range_start: UtcTimestamp,
+    range_end: UtcTimestamp,
+    covered_through: UtcTimestamp,
     coverage_complete: bool,
     fingerprint: SessionDigestFingerprint,
     project_breakdown_fingerprint: SessionDigestFingerprint,
@@ -413,15 +413,15 @@ impl FactDigestBinding {
         Ok(binding)
     }
 
-    pub fn range_start(&self) -> DateTime<Utc> {
+    pub fn range_start(&self) -> UtcTimestamp {
         self.range_start
     }
 
-    pub fn range_end(&self) -> DateTime<Utc> {
+    pub fn range_end(&self) -> UtcTimestamp {
         self.range_end
     }
 
-    pub fn covered_through(&self) -> DateTime<Utc> {
+    pub fn covered_through(&self) -> UtcTimestamp {
         self.covered_through
     }
 
@@ -511,14 +511,14 @@ fn validate_fact_digest_bindings(bindings: &[FactDigestBinding]) -> io::Result<(
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SourceSessionDigestRecord {
     thread_id: ThreadId,
-    range_start: DateTime<Utc>,
-    range_end: DateTime<Utc>,
-    changed_at: DateTime<Utc>,
+    range_start: UtcTimestamp,
+    range_end: UtcTimestamp,
+    changed_at: UtcTimestamp,
     /// Monotonic suppression horizon for older revisions of this key. A later
     /// correction may shrink its visible range, but it must not let GC forget
     /// the revision floor while an older, wider upsert could still intersect a
     /// retained query window.
-    retention_through: DateTime<Utc>,
+    retention_through: UtcTimestamp,
     revision: u64,
     change: SourceSessionDigestChange,
 }
@@ -536,7 +536,7 @@ impl SourceSessionDigestRecord {
     pub fn upsert_with_retention_through(
         revision: u64,
         digest: SourceSessionDigest,
-        retention_through: DateTime<Utc>,
+        retention_through: UtcTimestamp,
     ) -> io::Result<Self> {
         let record = Self {
             thread_id: digest.replica.thread_id().clone(),
@@ -553,9 +553,9 @@ impl SourceSessionDigestRecord {
 
     pub fn tombstone(
         thread_id: ThreadId,
-        range_start: DateTime<Utc>,
-        range_end: DateTime<Utc>,
-        changed_at: DateTime<Utc>,
+        range_start: UtcTimestamp,
+        range_end: UtcTimestamp,
+        changed_at: UtcTimestamp,
         revision: u64,
     ) -> io::Result<Self> {
         let retention_through = range_end.max(changed_at);
@@ -573,10 +573,10 @@ impl SourceSessionDigestRecord {
     /// horizon. See [`Self::upsert_with_retention_through`].
     pub fn tombstone_with_retention_through(
         thread_id: ThreadId,
-        range_start: DateTime<Utc>,
-        range_end: DateTime<Utc>,
-        changed_at: DateTime<Utc>,
-        retention_through: DateTime<Utc>,
+        range_start: UtcTimestamp,
+        range_end: UtcTimestamp,
+        changed_at: UtcTimestamp,
+        retention_through: UtcTimestamp,
         revision: u64,
     ) -> io::Result<Self> {
         let record = Self {
@@ -596,7 +596,7 @@ impl SourceSessionDigestRecord {
         &self.thread_id
     }
 
-    pub fn range_start(&self) -> DateTime<Utc> {
+    pub fn range_start(&self) -> UtcTimestamp {
         self.range_start
     }
 
@@ -604,15 +604,15 @@ impl SourceSessionDigestRecord {
         self.revision
     }
 
-    pub fn range_end(&self) -> DateTime<Utc> {
+    pub fn range_end(&self) -> UtcTimestamp {
         self.range_end
     }
 
-    pub fn changed_at(&self) -> DateTime<Utc> {
+    pub fn changed_at(&self) -> UtcTimestamp {
         self.changed_at
     }
 
-    pub fn retention_through(&self) -> DateTime<Utc> {
+    pub fn retention_through(&self) -> UtcTimestamp {
         self.retention_through
     }
 
@@ -664,7 +664,7 @@ pub enum SourceSessionDigestChange {
 pub struct UsageEventFact {
     replica: SessionReplicaKey,
     event_id: UsageEventId,
-    occurred_at: DateTime<Utc>,
+    occurred_at: UtcTimestamp,
     observed_project_key: ObservedProjectKey,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     emitting_turn_id: Option<String>,
@@ -696,7 +696,7 @@ impl UsageEventFact {
     pub fn new(
         replica: SessionReplicaKey,
         event_id: UsageEventId,
-        occurred_at: DateTime<Utc>,
+        occurred_at: UtcTimestamp,
         observed_project_key: ObservedProjectKey,
         emitting_turn_id: Option<String>,
         parent_thread_id: Option<ThreadId>,
@@ -739,7 +739,7 @@ impl UsageEventFact {
         &self.event_id
     }
 
-    pub fn occurred_at(&self) -> DateTime<Utc> {
+    pub fn occurred_at(&self) -> UtcTimestamp {
         self.occurred_at
     }
 
@@ -832,7 +832,7 @@ impl UsageEventFact {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct UsageEventFactRecord {
     event_id: UsageEventId,
-    occurred_at: DateTime<Utc>,
+    occurred_at: UtcTimestamp,
     revision: u64,
     change: UsageEventFactChange,
 }
@@ -851,7 +851,7 @@ impl UsageEventFactRecord {
 
     pub fn tombstone(
         event_id: UsageEventId,
-        occurred_at: DateTime<Utc>,
+        occurred_at: UtcTimestamp,
         revision: u64,
     ) -> io::Result<Self> {
         let record = Self {
@@ -868,7 +868,7 @@ impl UsageEventFactRecord {
         &self.event_id
     }
 
-    pub fn occurred_at(&self) -> DateTime<Utc> {
+    pub fn occurred_at(&self) -> UtcTimestamp {
         self.occurred_at
     }
 
@@ -932,7 +932,7 @@ pub struct ActiveFactVersion {
     /// the compare-and-swap identity invalidates a batch staged before GC even
     /// when the active fact generation and remote cursor did not otherwise
     /// change.
-    retained_since: Option<DateTime<Utc>>,
+    retained_since: Option<UtcTimestamp>,
 }
 
 impl ActiveFactVersion {
@@ -952,7 +952,7 @@ impl ActiveFactVersion {
         &self.validated_digests
     }
 
-    pub fn retained_since(&self) -> Option<DateTime<Utc>> {
+    pub fn retained_since(&self) -> Option<UtcTimestamp> {
         self.retained_since
     }
 
@@ -1012,7 +1012,7 @@ pub struct CompleteFactBatch {
     pub remote_binding: Option<SourceHistoryRemoteBinding>,
     pub validated_digests: Vec<FactDigestBinding>,
     pub activate_cursor: FactCursor,
-    pub completed_at: DateTime<Utc>,
+    pub completed_at: UtcTimestamp,
     pub changes: Vec<UsageEventFactRecord>,
 }
 
@@ -1104,7 +1104,7 @@ pub struct ActiveFactSet {
     pub remote_binding: Option<SourceHistoryRemoteBinding>,
     /// Center-local activation time used only for bounded/fair refresh
     /// planning. It is never sent to another source.
-    pub activated_at: DateTime<Utc>,
+    pub activated_at: UtcTimestamp,
     pub records: Vec<UsageEventFactRecord>,
 }
 
@@ -1141,10 +1141,10 @@ struct StagedFactBatch {
     remote_binding: Option<SourceHistoryRemoteBinding>,
     #[serde(default)]
     validated_digests: Vec<FactDigestBinding>,
-    retained_since: Option<DateTime<Utc>>,
+    retained_since: Option<UtcTimestamp>,
     activate_cursor: FactCursor,
-    completed_at: DateTime<Utc>,
-    shard_days: Vec<NaiveDate>,
+    completed_at: UtcTimestamp,
+    shard_days: Vec<UtcDay>,
     change_count: usize,
     record_count: usize,
 }
@@ -1163,9 +1163,9 @@ struct ActiveFactManifest {
     remote_binding: Option<SourceHistoryRemoteBinding>,
     #[serde(default)]
     validated_digests: Vec<FactDigestBinding>,
-    retained_since: Option<DateTime<Utc>>,
-    activated_at: DateTime<Utc>,
-    shard_days: Vec<NaiveDate>,
+    retained_since: Option<UtcTimestamp>,
+    activated_at: UtcTimestamp,
+    shard_days: Vec<UtcDay>,
     record_count: usize,
 }
 
@@ -1309,7 +1309,7 @@ impl SourceHistoryStore {
         &self,
         source_id: &NodeId,
         redaction_profile: RedactionProfile,
-        since: DateTime<Utc>,
+        since: UtcTimestamp,
     ) -> io::Result<SourceSessionDigestRecordsData> {
         let mut budget = SourceHistoryReadBudget::for_query();
         self.load_source_session_digest_records_since_with_budget(
@@ -1324,7 +1324,7 @@ impl SourceHistoryStore {
         &self,
         source_id: &NodeId,
         redaction_profile: RedactionProfile,
-        since: DateTime<Utc>,
+        since: UtcTimestamp,
         budget: &mut SourceHistoryReadBudget,
     ) -> io::Result<SourceSessionDigestRecordsData> {
         budget.charge_source()?;
@@ -1367,7 +1367,7 @@ impl SourceHistoryStore {
         &self,
         source_id: &NodeId,
         _redaction_profile: RedactionProfile,
-        since: DateTime<Utc>,
+        since: UtcTimestamp,
         directory: &Path,
         budget: &mut SourceHistoryReadBudget,
     ) -> io::Result<Vec<SourceSessionDigestRecord>> {
@@ -1570,7 +1570,7 @@ fn validate_api_cost(amount: ApiCostAmount) -> io::Result<()> {
 fn group_digest_records_by_day(
     source_id: &NodeId,
     records: &[SourceSessionDigestRecord],
-) -> io::Result<BTreeMap<NaiveDate, Vec<SourceSessionDigestRecord>>> {
+) -> io::Result<BTreeMap<UtcDay, Vec<SourceSessionDigestRecord>>> {
     let mut result = BTreeMap::new();
     for record in records {
         record.validate()?;
@@ -1582,14 +1582,14 @@ fn group_digest_records_by_day(
             ));
         }
         result
-            .entry(record.range_start.date_naive())
+            .entry(record.range_start.utc_date())
             .or_insert_with(Vec::new)
             .push(record.clone());
     }
     Ok(result)
 }
 
-type DigestRecordKey = (ThreadId, DateTime<Utc>);
+type DigestRecordKey = (ThreadId, UtcTimestamp);
 type DigestRecordIndex = HashMap<DigestRecordKey, usize>;
 
 fn digest_record_index(records: &[SourceSessionDigestRecord]) -> io::Result<DigestRecordIndex> {
@@ -1662,10 +1662,7 @@ fn sort_digest_records(records: &mut [SourceSessionDigestRecord]) {
     });
 }
 
-fn digest_record_intersects_since(
-    record: &SourceSessionDigestRecord,
-    since: DateTime<Utc>,
-) -> bool {
+fn digest_record_intersects_since(record: &SourceSessionDigestRecord, since: UtcTimestamp) -> bool {
     // The record query is also the revision-floor surface used by remote
     // import. A corrected upsert may end before `since` while its retained
     // older revision could still overlap the window, so both upserts and
@@ -1871,7 +1868,7 @@ fn validate_active_manifest(
     validate_sorted_unique_days(&manifest.shard_days)
 }
 
-fn validate_sorted_unique_days(days: &[NaiveDate]) -> io::Result<()> {
+fn validate_sorted_unique_days(days: &[UtcDay]) -> io::Result<()> {
     if days.len() > MAX_FACT_RETENTION_UTC_DAYS {
         return Err(invalid_data(
             "fact shard set exceeds the 35-day retention window",
@@ -1880,9 +1877,11 @@ fn validate_sorted_unique_days(days: &[NaiveDate]) -> io::Result<()> {
     if days.windows(2).any(|window| window[0] >= window[1]) {
         return Err(invalid_data("fact shard days must be sorted and unique"));
     }
-    if days.first().zip(days.last()).is_some_and(|(first, last)| {
-        last.signed_duration_since(*first).num_days() > MAX_FACT_RETENTION_DAYS
-    }) {
+    if days
+        .first()
+        .zip(days.last())
+        .is_some_and(|(first, last)| last.days_since(*first) > MAX_FACT_RETENTION_DAYS)
+    {
         return Err(invalid_data(
             "fact shard set exceeds the 35-day retention window",
         ));
@@ -1919,8 +1918,8 @@ fn garbage_collect_session_evidence_for_source(
     store: &SourceHistoryStore,
     source_id: &NodeId,
     redaction_profile: RedactionProfile,
-    cutoff_day: NaiveDate,
-    trusted_at: DateTime<Utc>,
+    cutoff_day: UtcDay,
+    trusted_at: UtcTimestamp,
 ) -> io::Result<usize> {
     garbage_collect_session_evidence_for_source_with_changes(
         store,
@@ -1937,8 +1936,8 @@ pub(super) fn garbage_collect_session_evidence_for_source_with_changes(
     store: &SourceHistoryStore,
     source_id: &NodeId,
     redaction_profile: RedactionProfile,
-    cutoff_day: NaiveDate,
-    trusted_at: DateTime<Utc>,
+    cutoff_day: UtcDay,
+    trusted_at: UtcTimestamp,
 ) -> io::Result<(usize, bool)> {
     sqlite_evidence::garbage_collect_session_evidence(
         store,
@@ -1951,7 +1950,7 @@ pub(super) fn garbage_collect_session_evidence_for_source_with_changes(
 
 #[cfg(test)]
 mod tests {
-    use chrono::{Duration, TimeZone};
+    use crate::time::Duration;
     use tempfile::tempdir;
 
     use super::*;
@@ -1960,10 +1959,8 @@ mod tests {
     const PROFILE: &str = "0123456789abcdef";
     const SOURCE: &str = "node-0123456789abcdef0123456789abcdef";
 
-    fn at(month: u32, day: u32, hour: u32) -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, month, day, hour, 0, 0)
-            .single()
-            .unwrap()
+    fn at(month: u32, day: u32, hour: u32) -> UtcTimestamp {
+        UtcTimestamp::from_utc(2026, month, day, hour, 0, 0).unwrap()
     }
 
     fn source_id() -> NodeId {
@@ -2040,8 +2037,8 @@ mod tests {
 
     fn digest(
         thread_id: &str,
-        start: DateTime<Utc>,
-        end: DateTime<Utc>,
+        start: UtcTimestamp,
+        end: UtcTimestamp,
         total: u64,
     ) -> SourceSessionDigest {
         SourceSessionDigest::new(
@@ -2063,7 +2060,7 @@ mod tests {
     fn fact(
         thread_id: &str,
         event_id: &str,
-        occurred_at: DateTime<Utc>,
+        occurred_at: UtcTimestamp,
         total: u64,
     ) -> UsageEventFact {
         fact_with_project(thread_id, event_id, occurred_at, total, project('c'))
@@ -2157,7 +2154,7 @@ mod tests {
     fn fact_with_project(
         thread_id: &str,
         event_id: &str,
-        occurred_at: DateTime<Utc>,
+        occurred_at: UtcTimestamp,
         total: u64,
         observed_project_key: ObservedProjectKey,
     ) -> UsageEventFact {
@@ -2183,8 +2180,8 @@ mod tests {
 
     fn canonical_digest_for_fact(
         fact: &UsageEventFact,
-        range_start: DateTime<Utc>,
-        range_end: DateTime<Utc>,
+        range_start: UtcTimestamp,
+        range_end: UtcTimestamp,
     ) -> SourceSessionDigest {
         let (fingerprint, project_breakdown_fingerprint) =
             crate::source_export::canonical_fact_fingerprints_for_test(
@@ -2216,7 +2213,7 @@ mod tests {
         thread_id: &str,
         expected: Option<ActiveFactVersion>,
         activate: FactCursor,
-        completed_at: DateTime<Utc>,
+        completed_at: UtcTimestamp,
         changes: Vec<UsageEventFactRecord>,
     ) -> CompleteFactBatch {
         CompleteFactBatch {
@@ -2456,8 +2453,8 @@ mod tests {
             &store,
             &source_id(),
             RedactionProfile::Redacted,
-            at(7, 26, 0).date_naive(),
-            Utc::now(),
+            at(7, 26, 0).utc_date(),
+            UtcTimestamp::now(),
         )
         .unwrap();
         assert_eq!(
@@ -2530,8 +2527,8 @@ mod tests {
             &store,
             &source_id(),
             RedactionProfile::Redacted,
-            cutoff.date_naive(),
-            Utc::now(),
+            cutoff.utc_date(),
+            UtcTimestamp::now(),
         )
         .unwrap();
         let retained = store
@@ -2598,8 +2595,8 @@ mod tests {
             &store,
             &source_id(),
             RedactionProfile::Redacted,
-            cutoff.date_naive(),
-            Utc::now(),
+            cutoff.utc_date(),
+            UtcTimestamp::now(),
         )
         .unwrap();
 
@@ -3030,7 +3027,7 @@ mod tests {
             &store,
             &source_id(),
             RedactionProfile::Redacted,
-            cutoff.date_naive(),
+            cutoff.utc_date(),
             at(9, 5, 0),
         )
         .unwrap();
@@ -3086,7 +3083,7 @@ mod tests {
     fn gc_preserves_crossing_digest_and_atomically_rewrites_active_facts() {
         let root = tempdir().unwrap();
         let store = store(root.path());
-        let cutoff_day = at(7, 26, 0).date_naive();
+        let cutoff_day = at(7, 26, 0).utc_date();
         let expired =
             SourceSessionDigestRecord::upsert(1, digest("thread-old", at(7, 1, 0), at(7, 2, 0), 5))
                 .unwrap();
@@ -3149,7 +3146,7 @@ mod tests {
             &source_id(),
             RedactionProfile::Redacted,
             cutoff_day,
-            Utc::now() + Duration::hours(FACT_STAGING_TTL_HOURS + 1),
+            UtcTimestamp::now() + Duration::hours(FACT_STAGING_TTL_HOURS + 1),
         )
         .unwrap();
         let digests = store
@@ -3233,8 +3230,8 @@ mod tests {
             &store,
             &source_id(),
             RedactionProfile::Redacted,
-            at(8, 10, 0).date_naive(),
-            Utc::now(),
+            at(8, 10, 0).utc_date(),
+            UtcTimestamp::now(),
         )
         .unwrap();
         let after_gc = store
@@ -3390,13 +3387,12 @@ mod tests {
         assert_eq!(
             crosses_thirty_six_utc_days_within_window[1]
                 .occurred_at()
-                .date_naive()
-                .signed_duration_since(
+                .utc_date()
+                .days_since(
                     crosses_thirty_six_utc_days_within_window[0]
                         .occurred_at()
-                        .date_naive(),
-                )
-                .num_days(),
+                        .utc_date(),
+                ),
             MAX_FACT_RETENTION_DAYS
         );
         assert!(
@@ -3492,7 +3488,7 @@ mod tests {
             changes
                 .iter()
                 .map(UsageEventFactRecord::occurred_at)
-                .map(|timestamp| timestamp.date_naive())
+                .map(|timestamp| timestamp.utc_date())
                 .collect::<BTreeSet<_>>()
                 .len(),
             MAX_FACT_RETENTION_UTC_DAYS
@@ -3853,7 +3849,7 @@ mod tests {
             &store,
             &source_id(),
             RedactionProfile::Redacted,
-            at(8, 2, 0).date_naive(),
+            at(8, 2, 0).utc_date(),
             at(8, 2, 0),
         )
         .unwrap();
@@ -3935,8 +3931,8 @@ mod tests {
             &store,
             &source_id(),
             RedactionProfile::Redacted,
-            at(8, 1, 0).date_naive(),
-            Utc::now(),
+            at(8, 1, 0).utc_date(),
+            UtcTimestamp::now(),
         )
         .unwrap();
         let before = store
@@ -4005,8 +4001,8 @@ mod tests {
                 &store,
                 &source_id(),
                 RedactionProfile::Redacted,
-                at(8, 1, 0).date_naive(),
-                Utc::now(),
+                at(8, 1, 0).utc_date(),
+                UtcTimestamp::now(),
             )
             .unwrap();
         assert_eq!(pruned, 0);
@@ -4123,8 +4119,8 @@ mod tests {
                 &store,
                 &source_id(),
                 RedactionProfile::Redacted,
-                at(7, 26, 0).date_naive(),
-                Utc::now(),
+                at(7, 26, 0).utc_date(),
+                UtcTimestamp::now(),
             )
             .unwrap()
         };
@@ -4465,7 +4461,7 @@ mod tests {
             &sql,
             &source_id(),
             RedactionProfile::Redacted,
-            at(8, 1, 0).date_naive(),
+            at(8, 1, 0).utc_date(),
             at(8, 30, 0),
         )
         .unwrap();
@@ -4491,7 +4487,7 @@ mod tests {
             &sql,
             &source_id(),
             RedactionProfile::Redacted,
-            at(8, 1, 0).date_naive(),
+            at(8, 1, 0).utc_date(),
             at(8, 30, 0),
         )
         .unwrap();
@@ -4553,7 +4549,7 @@ mod tests {
         let namespace = database
             .namespace(&sql.source_digests_directory(&source_id(), RedactionProfile::Redacted))
             .unwrap();
-        let start = Utc.with_ymd_and_hms(2010, 1, 1, 0, 0, 0).single().unwrap();
+        let start = UtcTimestamp::from_utc(2010, 1, 1, 0, 0, 0).unwrap();
         database
             .write(|connection| {
                 for offset in 0..4100 {

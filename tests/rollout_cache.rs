@@ -3,20 +3,20 @@ use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
-use chrono::{DateTime, Utc};
 use codex_usage_monit::config::CollectConfig;
 use codex_usage_monit::domain::{RolloutDataset, TaskStatus, TurnStatus};
 use codex_usage_monit::rollout::{RolloutCache, scan_rollouts};
 use codex_usage_monit::snapshot::{collect_snapshot_cached, collect_snapshot_cached_if_changed};
 use codex_usage_monit::startup::StartupTrace;
+use codex_usage_monit::time::{Duration as SignedDuration, UtcTimestamp};
 use codex_usage_monit::trace::TraceLog;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
 const LARGE_TEST_PADDING_BYTES: usize = 8 * 1024 * 1024 + 4096;
 
-fn timestamp(value: DateTime<Utc>) -> String {
-    value.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+fn timestamp(value: UtcTimestamp) -> String {
+    value.to_rfc3339_millis_z()
 }
 
 fn usage(total: u64) -> Value {
@@ -45,7 +45,7 @@ fn append_jsonl(path: &std::path::Path, records: &[Value]) {
     file.flush().unwrap();
 }
 
-fn write_large_rollout(path: &Path, now: DateTime<Utc>, thread_id: &str) {
+fn write_large_rollout(path: &Path, now: UtcTimestamp, thread_id: &str) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     let mut file = File::create(path).unwrap();
     writeln!(
@@ -150,7 +150,7 @@ fn assert_dataset_eq(left: &RolloutDataset, right: &RolloutDataset) {
 #[test]
 fn trace_only_rollout_reduce_reports_real_counts() {
     let temp = TempDir::new().unwrap();
-    let now = Utc::now() - chrono::Duration::seconds(1);
+    let now = UtcTimestamp::now() - SignedDuration::seconds(1);
     write_jsonl(
         &temp.path().join("sessions/rollout-trace.jsonl"),
         &[
@@ -193,9 +193,9 @@ fn trace_only_rollout_reduce_reports_real_counts() {
 fn cached_refresh_rebuilds_truncated_replay_warnings_in_file_order() {
     let temp = TempDir::new().unwrap();
     let sessions = temp.path().join("sessions");
-    let now = Utc::now();
-    let base = now - chrono::Duration::hours(1);
-    let write_resets = |path: &Path, thread_id: &str, at: DateTime<Utc>, reset_count: usize| {
+    let now = UtcTimestamp::now();
+    let base = now - SignedDuration::hours(1);
+    let write_resets = |path: &Path, thread_id: &str, at: UtcTimestamp, reset_count: usize| {
         let mut records = vec![
             json!({
                 "timestamp": timestamp(at),
@@ -212,7 +212,7 @@ fn cached_refresh_rebuilds_truncated_replay_warnings_in_file_order() {
             }),
         ];
         for reset in 0..reset_count {
-            let at = at + chrono::Duration::milliseconds((reset + 1) as i64);
+            let at = at + SignedDuration::milliseconds((reset + 1) as i64);
             records.push(json!({
                 "timestamp": timestamp(at),
                 "type": "event_msg",
@@ -234,7 +234,7 @@ fn cached_refresh_rebuilds_truncated_replay_warnings_in_file_order() {
         write_resets(
             &path,
             &format!("thread-{index:03}"),
-            base + chrono::Duration::seconds(index),
+            base + SignedDuration::seconds(index),
             if index == 0 { 2 } else { 1 },
         );
     }
@@ -252,9 +252,9 @@ fn cached_refresh_rebuilds_truncated_replay_warnings_in_file_order() {
 
     write_resets(first_path.as_ref().unwrap(), "thread-000", base, 0);
     let cached = cache
-        .scan(&scan_config, now + chrono::Duration::seconds(1))
+        .scan(&scan_config, now + SignedDuration::seconds(1))
         .unwrap();
-    let fresh = scan_rollouts(&scan_config, now + chrono::Duration::seconds(1)).unwrap();
+    let fresh = scan_rollouts(&scan_config, now + SignedDuration::seconds(1)).unwrap();
 
     assert!(cache.last_refresh().full_rebuild);
     assert_eq!(cached.stats.ambiguous_token_resets, 126);
@@ -270,7 +270,7 @@ fn cached_refresh_rebuilds_truncated_replay_warnings_in_file_order() {
 #[test]
 fn cached_snapshot_skips_derive_until_rollout_changes() {
     let temp = TempDir::new().unwrap();
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let path = temp
         .path()
         .join("sessions/rollout-snapshot-fast-path.jsonl");
@@ -296,7 +296,7 @@ fn cached_snapshot_skips_derive_until_rollout_changes() {
     append_jsonl(
         &path,
         &[json!({
-            "timestamp": timestamp(Utc::now()),
+            "timestamp": timestamp(UtcTimestamp::now()),
             "type": "event_msg",
             "payload": {"type": "task_started", "turn_id": "snapshot-fast-path-turn"}
         })],
@@ -309,7 +309,7 @@ fn cached_snapshot_skips_derive_until_rollout_changes() {
 #[test]
 fn tail_cache_joins_an_agent_activity_appended_after_its_function_call() {
     let temp = TempDir::new().unwrap();
-    let now = DateTime::from_timestamp_millis(Utc::now().timestamp_millis()).unwrap();
+    let now = UtcTimestamp::from_timestamp_millis(UtcTimestamp::now().timestamp_millis()).unwrap();
     let parent_path = temp.path().join("sessions/rollout-agent-parent.jsonl");
     write_jsonl(
         &parent_path,
@@ -362,7 +362,7 @@ fn tail_cache_joins_an_agent_activity_appended_after_its_function_call() {
     append_jsonl(
         &parent_path,
         &[json!({
-            "timestamp": timestamp(now + chrono::Duration::seconds(1)),
+            "timestamp": timestamp(now + SignedDuration::seconds(1)),
             "type": "event_msg",
             "payload": {
                 "type": "sub_agent_activity",
@@ -373,7 +373,7 @@ fn tail_cache_joins_an_agent_activity_appended_after_its_function_call() {
         })],
     );
     let cached = cache
-        .scan(&scan_config, now + chrono::Duration::seconds(2))
+        .scan(&scan_config, now + SignedDuration::seconds(2))
         .unwrap();
     assert_eq!(cache.last_refresh().tail_parsed_files, 1);
     assert_eq!(cache.last_refresh().incrementally_reduced_threads, 1);
@@ -384,7 +384,7 @@ fn tail_cache_joins_an_agent_activity_appended_after_its_function_call() {
     );
     assert_eq!(cached.agent_interactions[0].child_thread_id, "agent-child");
 
-    let fresh = scan_rollouts(&scan_config, now + chrono::Duration::seconds(2)).unwrap();
+    let fresh = scan_rollouts(&scan_config, now + SignedDuration::seconds(2)).unwrap();
     assert_dataset_eq(&cached, &fresh);
 }
 
@@ -392,7 +392,7 @@ fn tail_cache_joins_an_agent_activity_appended_after_its_function_call() {
 fn persistent_cache_is_reused_by_a_new_instance_and_recomputes_freshness() {
     let temp = TempDir::new().unwrap();
     let cache_root = temp.path().join("cache");
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     write_jsonl(
         &temp.path().join("sessions/rollout-persistent-active.jsonl"),
         &[
@@ -417,7 +417,7 @@ fn persistent_cache_is_reused_by_a_new_instance_and_recomputes_freshness() {
 
     let mut reopened = RolloutCache::new();
     let second = reopened
-        .scan(&scan_config, now + chrono::Duration::minutes(2))
+        .scan(&scan_config, now + SignedDuration::minutes(2))
         .unwrap();
     assert_eq!(second.tasks[0].status, TaskStatus::Stale);
     assert_eq!(reopened.last_refresh().disk_reused_files, 1);
@@ -432,7 +432,7 @@ fn persistent_cache_is_reused_by_a_new_instance_and_recomputes_freshness() {
 fn large_persistent_cache_exact_hit_reads_no_source_content() {
     let temp = TempDir::new().unwrap();
     let cache_root = temp.path().join("cache");
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let path = temp.path().join("sessions/rollout-large-exact.jsonl");
     write_large_rollout(&path, now, "large-exact-thread");
     let scan_config = persistent_config(temp.path(), &cache_root);
@@ -450,7 +450,7 @@ fn large_persistent_cache_exact_hit_reads_no_source_content() {
 
     let mut reopened = RolloutCache::new();
     let cached = reopened
-        .scan(&scan_config, now + chrono::Duration::seconds(1))
+        .scan(&scan_config, now + SignedDuration::seconds(1))
         .unwrap();
 
     assert_eq!(cached.tasks[0].thread_id, first.tasks[0].thread_id);
@@ -468,7 +468,7 @@ fn large_persistent_cache_exact_hit_reads_no_source_content() {
 fn large_persistent_cache_restart_parses_only_the_appended_tail() {
     let temp = TempDir::new().unwrap();
     let cache_root = temp.path().join("cache");
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let path = temp.path().join("sessions/rollout-large-tail.jsonl");
     write_large_rollout(&path, now, "large-tail-thread");
     let scan_config = persistent_config(temp.path(), &cache_root);
@@ -478,7 +478,7 @@ fn large_persistent_cache_restart_parses_only_the_appended_tail() {
     append_jsonl(
         &path,
         &[json!({
-            "timestamp": timestamp(now + chrono::Duration::seconds(1)),
+            "timestamp": timestamp(now + SignedDuration::seconds(1)),
             "type": "event_msg",
             "payload": {"type": "task_started", "turn_id": "large-tail-turn"}
         })],
@@ -486,7 +486,7 @@ fn large_persistent_cache_restart_parses_only_the_appended_tail() {
     let appended_bytes = fs::metadata(&path).unwrap().len() - prefix_len;
     let mut reopened = RolloutCache::new();
     let cached = reopened
-        .scan(&scan_config, now + chrono::Duration::seconds(2))
+        .scan(&scan_config, now + SignedDuration::seconds(2))
         .unwrap();
 
     assert_eq!(cached.turns[0].turn_id, "large-tail-turn");
@@ -501,7 +501,7 @@ fn large_persistent_cache_restart_parses_only_the_appended_tail() {
 
     let mut uncached = scan_config.clone();
     uncached.rollout_cache_dir = None;
-    let fresh = scan_rollouts(&uncached, now + chrono::Duration::seconds(2)).unwrap();
+    let fresh = scan_rollouts(&uncached, now + SignedDuration::seconds(2)).unwrap();
     assert_dataset_eq(&cached, &fresh);
 }
 
@@ -509,7 +509,7 @@ fn large_persistent_cache_restart_parses_only_the_appended_tail() {
 fn large_persistent_cache_rejects_a_rewritten_cached_boundary() {
     let temp = TempDir::new().unwrap();
     let cache_root = temp.path().join("cache");
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let path = temp
         .path()
         .join("sessions/rollout-large-boundary-rewrite.jsonl");
@@ -530,7 +530,7 @@ fn large_persistent_cache_rejects_a_rewritten_cached_boundary() {
         file,
         "{}",
         serde_json::to_string(&json!({
-            "timestamp": timestamp(now + chrono::Duration::seconds(1)),
+            "timestamp": timestamp(now + SignedDuration::seconds(1)),
             "type": "event_msg",
             "payload": {"type": "task_started", "turn_id": "boundary-rewrite-turn"}
         }))
@@ -541,7 +541,7 @@ fn large_persistent_cache_rejects_a_rewritten_cached_boundary() {
 
     let mut reopened = RolloutCache::new();
     let reparsed = reopened
-        .scan(&scan_config, now + chrono::Duration::seconds(2))
+        .scan(&scan_config, now + SignedDuration::seconds(2))
         .unwrap();
     assert_eq!(reparsed.turns[0].turn_id, "boundary-rewrite-turn");
     assert_eq!(reopened.last_refresh().disk_large_tail_reused_files, 0);
@@ -556,7 +556,7 @@ fn large_persistent_cache_rejects_a_rewritten_cached_boundary() {
 fn reopened_cache_reparses_only_a_changed_file_and_matches_a_fresh_scan() {
     let temp = TempDir::new().unwrap();
     let cache_root = temp.path().join("cache");
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let first_path = temp.path().join("sessions/rollout-persistent-a.jsonl");
     let changed_path = temp.path().join("sessions/rollout-persistent-b.jsonl");
     write_jsonl(
@@ -583,7 +583,7 @@ fn reopened_cache_reparses_only_a_changed_file_and_matches_a_fresh_scan() {
     append_jsonl(
         &changed_path,
         &[json!({
-            "timestamp": timestamp(now + chrono::Duration::seconds(1)),
+            "timestamp": timestamp(now + SignedDuration::seconds(1)),
             "type": "event_msg",
             "payload": {"type": "token_count", "info": {"total_token_usage": usage(20)}}
         })],
@@ -594,7 +594,7 @@ fn reopened_cache_reparses_only_a_changed_file_and_matches_a_fresh_scan() {
         .saturating_sub(previous_len);
     let mut reopened = RolloutCache::new();
     let cached = reopened
-        .scan(&scan_config, now + chrono::Duration::seconds(2))
+        .scan(&scan_config, now + SignedDuration::seconds(2))
         .unwrap();
     assert_eq!(reopened.last_refresh().disk_reused_files, 2);
     assert_eq!(reopened.last_refresh().disk_tail_reused_files, 1);
@@ -607,13 +607,13 @@ fn reopened_cache_reparses_only_a_changed_file_and_matches_a_fresh_scan() {
 
     let mut uncached_config = scan_config.clone();
     uncached_config.rollout_cache_dir = None;
-    let fresh = scan_rollouts(&uncached_config, now + chrono::Duration::seconds(2)).unwrap();
+    let fresh = scan_rollouts(&uncached_config, now + SignedDuration::seconds(2)).unwrap();
     assert_dataset_eq(&cached, &fresh);
 
     fs::remove_file(&changed_path).unwrap();
     let mut after_delete = RolloutCache::new();
     let deleted = after_delete
-        .scan(&scan_config, now + chrono::Duration::seconds(3))
+        .scan(&scan_config, now + SignedDuration::seconds(3))
         .unwrap();
     assert_eq!(deleted.stats.scanned_files, 1);
     assert!(deleted.turns.iter().all(|turn| turn.turn_id != "turn-b"));
@@ -625,7 +625,7 @@ fn reopened_cache_reparses_only_a_changed_file_and_matches_a_fresh_scan() {
 fn changed_in_memory_file_skips_the_stale_disk_entry() {
     let temp = TempDir::new().unwrap();
     let cache_root = temp.path().join("cache");
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let path = temp.path().join("sessions/rollout-active-cache.jsonl");
     write_jsonl(
         &path,
@@ -643,13 +643,13 @@ fn changed_in_memory_file_skips_the_stale_disk_entry() {
     append_jsonl(
         &path,
         &[json!({
-            "timestamp": timestamp(now + chrono::Duration::seconds(1)),
+            "timestamp": timestamp(now + SignedDuration::seconds(1)),
             "type": "event_msg",
             "payload": {"type": "task_complete", "turn_id": "active-cache-turn"}
         })],
     );
     let dataset = cache
-        .scan(&scan_config, now + chrono::Duration::seconds(1))
+        .scan(&scan_config, now + SignedDuration::seconds(1))
         .unwrap();
 
     assert_eq!(dataset.turns[0].status, TurnStatus::Completed);
@@ -660,7 +660,7 @@ fn changed_in_memory_file_skips_the_stale_disk_entry() {
 #[test]
 fn warm_owner_probe_cache_cannot_bypass_the_omitted_candidate_cap() {
     let temp = TempDir::new().unwrap();
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let old_modified = SystemTime::now() - Duration::from_secs(2 * 24 * 60 * 60);
     for index in 0..64 {
         let path = temp
@@ -691,7 +691,7 @@ fn warm_owner_probe_cache_cannot_bypass_the_omitted_candidate_cap() {
                 "payload": {"id": "selected-owner"}
             }),
             json!({
-                "timestamp": timestamp(now + chrono::Duration::seconds(1)),
+                "timestamp": timestamp(now + SignedDuration::seconds(1)),
                 "type": "event_msg",
                 "payload": {"type": "token_count", "info": {
                     "total_token_usage": usage(10)
@@ -704,7 +704,7 @@ fn warm_owner_probe_cache_cannot_bypass_the_omitted_candidate_cap() {
     let mut cache = RolloutCache::new();
 
     let first = cache
-        .scan(&scan_config, now + chrono::Duration::seconds(1))
+        .scan(&scan_config, now + SignedDuration::seconds(1))
         .unwrap();
     assert_eq!(first.calls.len(), 1);
     assert_eq!(first.stats.ambiguous_token_resets, 0);
@@ -727,14 +727,14 @@ fn warm_owner_probe_cache_cannot_bypass_the_omitted_candidate_cap() {
         .unwrap();
 
     let overflowed = cache
-        .scan(&scan_config, now + chrono::Duration::seconds(1))
+        .scan(&scan_config, now + SignedDuration::seconds(1))
         .unwrap();
     assert!(overflowed.calls.is_empty());
     assert_eq!(overflowed.tasks[0].token_usage.total_tokens, 0);
     assert_eq!(overflowed.stats.ambiguous_token_resets, 1);
 
     let warm = cache
-        .scan(&scan_config, now + chrono::Duration::seconds(2))
+        .scan(&scan_config, now + SignedDuration::seconds(2))
         .unwrap();
     assert!(cache.last_refresh().discovery_cache_hit);
     assert!(warm.calls.is_empty());
@@ -745,7 +745,7 @@ fn warm_owner_probe_cache_cannot_bypass_the_omitted_candidate_cap() {
 fn successful_persistent_write_debounces_a_changed_active_file() {
     let temp = TempDir::new().unwrap();
     let cache_root = temp.path().join("cache");
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let path = temp.path().join("sessions/rollout-write-debounce.jsonl");
     write_jsonl(
         &path,
@@ -763,13 +763,13 @@ fn successful_persistent_write_debounces_a_changed_active_file() {
     append_jsonl(
         &path,
         &[json!({
-            "timestamp": timestamp(now + chrono::Duration::seconds(1)),
+            "timestamp": timestamp(now + SignedDuration::seconds(1)),
             "type": "event_msg",
             "payload": {"type": "task_started", "turn_id": "write-debounce-turn"}
         })],
     );
     cache
-        .scan(&scan_config, now + chrono::Duration::seconds(1))
+        .scan(&scan_config, now + SignedDuration::seconds(1))
         .unwrap();
 
     assert_eq!(cache.last_refresh().reparsed_files, 1);
@@ -782,7 +782,7 @@ fn successful_persistent_write_debounces_a_changed_active_file() {
 fn corrupt_and_future_persistent_entries_fall_back_and_are_repaired() {
     let temp = TempDir::new().unwrap();
     let cache_root = temp.path().join("cache");
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     write_jsonl(
         &temp.path().join("sessions/rollout-cache-repair.jsonl"),
         &[json!({
@@ -826,7 +826,7 @@ fn corrupt_and_future_persistent_entries_fall_back_and_are_repaired() {
 fn redacted_persistent_cache_is_isolated_and_contains_no_message_preview() {
     let temp = TempDir::new().unwrap();
     let cache_root = temp.path().join("cache");
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let private_message = "private persistent cache message";
     write_jsonl(
         &temp.path().join("sessions/rollout-cache-redaction.jsonl"),
@@ -880,7 +880,7 @@ fn redacted_persistent_cache_is_isolated_and_contains_no_message_preview() {
 #[test]
 fn persistent_write_failure_does_not_fail_the_rollout_snapshot() {
     let temp = TempDir::new().unwrap();
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     write_jsonl(
         &temp
             .path()
@@ -903,7 +903,7 @@ fn persistent_write_failure_does_not_fail_the_rollout_snapshot() {
     assert_eq!(cache.last_refresh().disk_write_failures, 1);
 
     cache
-        .scan(&scan_config, now + chrono::Duration::seconds(1))
+        .scan(&scan_config, now + SignedDuration::seconds(1))
         .unwrap();
     assert_eq!(cache.last_refresh().disk_write_failures, 0);
     assert_eq!(cache.last_refresh().disk_deferred_files, 1);
@@ -914,7 +914,7 @@ fn persistent_write_failure_does_not_fail_the_rollout_snapshot() {
 fn persistent_cache_reuses_the_intersection_when_file_selection_expands() {
     let temp = TempDir::new().unwrap();
     let cache_root = temp.path().join("cache");
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     for index in 0..2 {
         write_jsonl(
             &temp
@@ -945,7 +945,7 @@ fn persistent_cache_reuses_the_intersection_when_file_selection_expands() {
 #[test]
 fn unchanged_scan_reuses_files_and_recomputes_freshness() {
     let temp = TempDir::new().unwrap();
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let path = temp.path().join("sessions/rollout-active.jsonl");
     write_jsonl(
         &path,
@@ -972,7 +972,7 @@ fn unchanged_scan_reuses_files_and_recomputes_freshness() {
     assert!(cache.last_refresh().rebuilt);
 
     let second = cache
-        .scan(&scan_config, now + chrono::Duration::minutes(2))
+        .scan(&scan_config, now + SignedDuration::minutes(2))
         .unwrap();
     assert_eq!(second.tasks[0].status, TaskStatus::Stale);
     assert_eq!(cache.last_refresh().reused_files, 1);
@@ -983,7 +983,7 @@ fn unchanged_scan_reuses_files_and_recomputes_freshness() {
 #[test]
 fn scan_if_changed_skips_warm_materialization_until_freshness_crosses() {
     let temp = TempDir::new().unwrap();
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let path = temp.path().join("sessions/rollout-conditional.jsonl");
     write_jsonl(
         &path,
@@ -1000,19 +1000,19 @@ fn scan_if_changed_skips_warm_materialization_until_freshness_crosses() {
     assert_eq!(initial.tasks[0].status, TaskStatus::Running);
     assert!(
         cache
-            .scan_if_changed(&scan_config, now + chrono::Duration::seconds(10))
+            .scan_if_changed(&scan_config, now + SignedDuration::seconds(10))
             .unwrap()
             .is_none()
     );
 
     let stale = cache
-        .scan_if_changed(&scan_config, now + chrono::Duration::seconds(31))
+        .scan_if_changed(&scan_config, now + SignedDuration::seconds(31))
         .unwrap()
         .unwrap();
     assert_eq!(stale.tasks[0].status, TaskStatus::Stale);
     assert!(
         cache
-            .scan_if_changed(&scan_config, now + chrono::Duration::seconds(32))
+            .scan_if_changed(&scan_config, now + SignedDuration::seconds(32))
             .unwrap()
             .is_none()
     );
@@ -1020,13 +1020,13 @@ fn scan_if_changed_skips_warm_materialization_until_freshness_crosses() {
     append_jsonl(
         &path,
         &[json!({
-            "timestamp": timestamp(now + chrono::Duration::seconds(33)),
+            "timestamp": timestamp(now + SignedDuration::seconds(33)),
             "type": "event_msg",
             "payload": {"type": "task_complete", "turn_id": "conditional-turn"}
         })],
     );
     let completed = cache
-        .scan_if_changed(&scan_config, now + chrono::Duration::seconds(33))
+        .scan_if_changed(&scan_config, now + SignedDuration::seconds(33))
         .unwrap()
         .unwrap();
     assert_eq!(completed.tasks[0].status, TaskStatus::Completed);
@@ -1037,7 +1037,7 @@ fn scan_if_changed_skips_warm_materialization_until_freshness_crosses() {
 #[test]
 fn tail_parse_falls_back_when_the_cached_prefix_was_rewritten() {
     let temp = TempDir::new().unwrap();
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let path = temp.path().join("sessions/rollout-rewritten.jsonl");
     write_jsonl(
         &path,
@@ -1059,7 +1059,7 @@ fn tail_parse_falls_back_when_the_cached_prefix_was_rewritten() {
         ],
     );
     let rewritten = cache
-        .scan(&scan_config, now + chrono::Duration::seconds(1))
+        .scan(&scan_config, now + SignedDuration::seconds(1))
         .unwrap();
 
     assert_eq!(cache.last_refresh().tail_parsed_files, 0);
@@ -1071,7 +1071,7 @@ fn tail_parse_falls_back_when_the_cached_prefix_was_rewritten() {
 fn reopened_persistent_cache_rejects_a_rewritten_prefix() {
     let temp = TempDir::new().unwrap();
     let cache_root = temp.path().join("cache");
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let path = temp
         .path()
         .join("sessions/rollout-persistent-rewritten.jsonl");
@@ -1103,7 +1103,7 @@ fn reopened_persistent_cache_rejects_a_rewritten_prefix() {
     assert!(fs::metadata(&path).unwrap().len() > cached_prefix_len);
     let mut reopened = RolloutCache::new();
     let rewritten = reopened
-        .scan(&scan_config, now + chrono::Duration::seconds(1))
+        .scan(&scan_config, now + SignedDuration::seconds(1))
         .unwrap();
 
     assert_eq!(reopened.last_refresh().disk_tail_reused_files, 0);
@@ -1117,7 +1117,7 @@ fn reopened_persistent_cache_rejects_a_rewritten_prefix() {
 fn reopened_persistent_cache_rejects_an_equal_length_replacement_with_restored_mtime() {
     let temp = TempDir::new().unwrap();
     let cache_root = temp.path().join("cache");
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let path = temp
         .path()
         .join("sessions/rollout-persistent-equal-rewrite.jsonl");
@@ -1163,7 +1163,7 @@ fn reopened_persistent_cache_rejects_an_equal_length_replacement_with_restored_m
 
     let mut reopened = RolloutCache::new();
     let rewritten = reopened
-        .scan(&scan_config, now + chrono::Duration::seconds(1))
+        .scan(&scan_config, now + SignedDuration::seconds(1))
         .unwrap();
 
     assert_eq!(reopened.last_refresh().disk_reused_files, 0);
@@ -1179,7 +1179,7 @@ fn reopened_persistent_cache_rejects_an_equal_length_in_place_rewrite_with_chang
 
     let temp = TempDir::new().unwrap();
     let cache_root = temp.path().join("cache");
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let path = temp
         .path()
         .join("sessions/rollout-persistent-in-place-rewrite.jsonl");
@@ -1236,7 +1236,7 @@ fn reopened_persistent_cache_rejects_an_equal_length_in_place_rewrite_with_chang
 
     let mut reopened = RolloutCache::new();
     let rewritten = reopened
-        .scan(&scan_config, now + chrono::Duration::seconds(1))
+        .scan(&scan_config, now + SignedDuration::seconds(1))
         .unwrap();
 
     assert_eq!(reopened.last_refresh().disk_reused_files, 0);
@@ -1248,7 +1248,7 @@ fn reopened_persistent_cache_rejects_an_equal_length_in_place_rewrite_with_chang
 #[test]
 fn cached_scan_refreshes_session_titles_without_reparsing_rollouts() {
     let temp = TempDir::new().unwrap();
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let path = temp.path().join("sessions/rollout-renamed.jsonl");
     write_jsonl(
         &path,
@@ -1283,7 +1283,7 @@ fn cached_scan_refreshes_session_titles_without_reparsing_rollouts() {
     assert!(!cache.last_refresh().session_index_reused);
 
     let unchanged = cache
-        .scan(&scan_config, now + chrono::Duration::seconds(1))
+        .scan(&scan_config, now + SignedDuration::seconds(1))
         .unwrap();
     assert_eq!(unchanged.tasks[0].title, "Initial session title");
     assert_eq!(cache.last_refresh().session_index_reads, 0);
@@ -1300,12 +1300,12 @@ fn cached_scan_refreshes_session_titles_without_reparsing_rollouts() {
             json!({
                 "id": "renamed-thread",
                 "thread_name": "Renamed while TUI is running",
-                "updated_at": timestamp(now + chrono::Duration::seconds(1))
+                "updated_at": timestamp(now + SignedDuration::seconds(1))
             }),
         ],
     );
     let second = cache
-        .scan(&scan_config, now + chrono::Duration::seconds(2))
+        .scan(&scan_config, now + SignedDuration::seconds(2))
         .unwrap();
 
     assert_eq!(second.tasks[0].title, "Renamed while TUI is running");
@@ -1319,7 +1319,7 @@ fn cached_scan_refreshes_session_titles_without_reparsing_rollouts() {
 #[test]
 fn cached_session_titles_follow_index_deletion_and_recreation() {
     let temp = TempDir::new().unwrap();
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let rollout_path = temp.path().join("sessions/rollout-index-lifecycle.jsonl");
     write_jsonl(
         &rollout_path,
@@ -1353,14 +1353,14 @@ fn cached_session_titles_follow_index_deletion_and_recreation() {
 
     fs::remove_file(&index_path).unwrap();
     let deleted = cache
-        .scan(&scan_config, now + chrono::Duration::seconds(1))
+        .scan(&scan_config, now + SignedDuration::seconds(1))
         .unwrap();
     assert_eq!(deleted.tasks[0].title, "Fallback lifecycle title");
     assert_eq!(cache.last_refresh().session_index_reads, 0);
     assert!(!cache.last_refresh().session_index_reused);
 
     cache
-        .scan(&scan_config, now + chrono::Duration::seconds(2))
+        .scan(&scan_config, now + SignedDuration::seconds(2))
         .unwrap();
     assert_eq!(cache.last_refresh().session_index_reads, 0);
     assert!(cache.last_refresh().session_index_reused);
@@ -1370,11 +1370,11 @@ fn cached_session_titles_follow_index_deletion_and_recreation() {
         &[json!({
             "id": "lifecycle-thread",
             "thread_name": "Recreated lifecycle title",
-            "updated_at": timestamp(now + chrono::Duration::seconds(3))
+            "updated_at": timestamp(now + SignedDuration::seconds(3))
         })],
     );
     let recreated = cache
-        .scan(&scan_config, now + chrono::Duration::seconds(3))
+        .scan(&scan_config, now + SignedDuration::seconds(3))
         .unwrap();
     assert_eq!(recreated.tasks[0].title, "Recreated lifecycle title");
     assert_eq!(cache.last_refresh().session_index_reads, 1);
@@ -1384,7 +1384,7 @@ fn cached_session_titles_follow_index_deletion_and_recreation() {
 fn session_title_cache_is_scoped_to_codex_home_and_redaction() {
     let first_home = TempDir::new().unwrap();
     let second_home = TempDir::new().unwrap();
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     for (home, title) in [
         (&first_home, "First home title"),
         (&second_home, "Second home title"),
@@ -1441,7 +1441,7 @@ fn session_title_cache_is_scoped_to_codex_home_and_redaction() {
 #[test]
 fn cached_session_titles_recover_when_a_partial_line_is_completed() {
     let temp = TempDir::new().unwrap();
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     write_jsonl(
         &temp.path().join("sessions/rollout-partial-title.jsonl"),
         &[json!({
@@ -1476,12 +1476,12 @@ fn cached_session_titles_recover_when_a_partial_line_is_completed() {
     writeln!(
         index,
         "\",\"updated_at\":\"{}\"}}",
-        timestamp(now + chrono::Duration::seconds(1))
+        timestamp(now + SignedDuration::seconds(1))
     )
     .unwrap();
     index.flush().unwrap();
     let recovered = cache
-        .scan(&scan_config, now + chrono::Duration::seconds(1))
+        .scan(&scan_config, now + SignedDuration::seconds(1))
         .unwrap();
     assert_eq!(recovered.tasks[0].title, "Recovered title");
     assert_eq!(cache.last_refresh().session_index_reads, 1);
@@ -1490,7 +1490,7 @@ fn cached_session_titles_recover_when_a_partial_line_is_completed() {
 #[test]
 fn session_index_read_errors_are_retried() {
     let temp = TempDir::new().unwrap();
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     write_jsonl(
         &temp.path().join("sessions/rollout-index-error.jsonl"),
         &[
@@ -1525,7 +1525,7 @@ fn session_index_read_errors_are_retried() {
     fs::remove_file(&index_path).unwrap();
     fs::create_dir(&index_path).unwrap();
     let first = cache
-        .scan(&scan_config, now + chrono::Duration::seconds(1))
+        .scan(&scan_config, now + SignedDuration::seconds(1))
         .unwrap();
     assert_eq!(first.tasks[0].title, "Fallback after index error");
     assert_eq!(cache.last_refresh().session_index_reads, 1);
@@ -1537,7 +1537,7 @@ fn session_index_read_errors_are_retried() {
     );
 
     let second = cache
-        .scan(&scan_config, now + chrono::Duration::seconds(2))
+        .scan(&scan_config, now + SignedDuration::seconds(2))
         .unwrap();
     assert_eq!(second.tasks[0].title, "Fallback after index error");
     assert_eq!(cache.last_refresh().session_index_reads, 1);
@@ -1549,11 +1549,11 @@ fn session_index_read_errors_are_retried() {
         &[json!({
             "id": "error-thread",
             "thread_name": "Recovered after read error",
-            "updated_at": timestamp(now + chrono::Duration::seconds(3))
+            "updated_at": timestamp(now + SignedDuration::seconds(3))
         })],
     );
     let recovered = cache
-        .scan(&scan_config, now + chrono::Duration::seconds(3))
+        .scan(&scan_config, now + SignedDuration::seconds(3))
         .unwrap();
     assert_eq!(recovered.tasks[0].title, "Recovered after read error");
     assert_eq!(cache.last_refresh().session_index_reads, 1);
@@ -1562,9 +1562,9 @@ fn session_index_read_errors_are_retried() {
 #[test]
 fn changing_one_file_reuses_others_and_matches_a_fresh_scan() {
     let temp = TempDir::new().unwrap();
-    let now = Utc::now();
-    let first_at = now - chrono::Duration::minutes(2);
-    let second_at = now - chrono::Duration::minutes(1);
+    let now = UtcTimestamp::now();
+    let first_at = now - SignedDuration::minutes(2);
+    let second_at = now - SignedDuration::minutes(1);
     let first_path = temp.path().join("sessions/rollout-a.jsonl");
     let changed_path = temp.path().join("sessions/rollout-b.jsonl");
     let unrelated_path = temp.path().join("sessions/rollout-c.jsonl");
@@ -1610,13 +1610,13 @@ fn changing_one_file_reuses_others_and_matches_a_fresh_scan() {
     append_jsonl(
         &changed_path,
         &[json!({
-            "timestamp": timestamp(now + chrono::Duration::seconds(1)),
+            "timestamp": timestamp(now + SignedDuration::seconds(1)),
             "type": "event_msg",
             "payload": {"type": "token_count", "info": {"total_token_usage": usage(20)}}
         })],
     );
     let cached = cache
-        .scan(&scan_config, now + chrono::Duration::seconds(2))
+        .scan(&scan_config, now + SignedDuration::seconds(2))
         .unwrap();
     assert_eq!(cache.last_refresh().reparsed_files, 1);
     assert_eq!(cache.last_refresh().reused_files, 2);
@@ -1626,7 +1626,7 @@ fn changing_one_file_reuses_others_and_matches_a_fresh_scan() {
     assert_eq!(cache.last_refresh().incrementally_reduced_threads, 1);
     assert!(!cache.last_refresh().full_rebuild);
 
-    let fresh = scan_rollouts(&scan_config, now + chrono::Duration::seconds(2)).unwrap();
+    let fresh = scan_rollouts(&scan_config, now + SignedDuration::seconds(2)).unwrap();
     assert_dataset_eq(&cached, &fresh);
     let shared = cached
         .tasks
@@ -1646,7 +1646,7 @@ fn changing_one_file_reuses_others_and_matches_a_fresh_scan() {
 #[test]
 fn cache_preserves_foreign_parent_counter_baseline() {
     let temp = TempDir::new().unwrap();
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let child_id = "019f52c6-60d1-72e3-8f3f-b348d83da52e";
     let child_turn = "019f52c6-60d1-7000-8000-000000000001";
     let path = temp.path().join("sessions/rollout-child.jsonl");
@@ -1685,7 +1685,7 @@ fn cache_preserves_foreign_parent_counter_baseline() {
     );
 
     let completed = cache
-        .scan(&scan_config, now + chrono::Duration::seconds(1))
+        .scan(&scan_config, now + SignedDuration::seconds(1))
         .unwrap();
     assert_eq!(cache.last_refresh().tail_parsed_files, 1);
     assert_eq!(completed.tasks[0].token_usage.total_tokens, 25);
@@ -1694,7 +1694,7 @@ fn cache_preserves_foreign_parent_counter_baseline() {
     assert_eq!(completed.calls[0].service_tier.as_deref(), Some("default"));
 
     let second = cache
-        .scan(&scan_config, now + chrono::Duration::seconds(1))
+        .scan(&scan_config, now + SignedDuration::seconds(1))
         .unwrap();
     assert_eq!(cache.last_refresh().reused_files, 1);
     assert_eq!(second.tasks[0].token_usage.total_tokens, 25);
@@ -1710,7 +1710,7 @@ fn cache_preserves_foreign_parent_counter_baseline() {
 #[test]
 fn cached_refresh_clears_replay_diagnostics_when_a_changed_file_loses_its_owner() {
     let temp = TempDir::new().unwrap();
-    let now = DateTime::from_timestamp_millis(Utc::now().timestamp_millis()).unwrap();
+    let now = UtcTimestamp::from_timestamp_millis(UtcTimestamp::now().timestamp_millis()).unwrap();
     // Match the native path spelling emitted by WalkDir in diagnostics.
     let path = temp
         .path()
@@ -1740,7 +1740,7 @@ fn cached_refresh_clears_replay_diagnostics_when_a_changed_file_loses_its_owner(
                 }
             }),
             json!({
-                "timestamp": timestamp(now + chrono::Duration::milliseconds(1)),
+                "timestamp": timestamp(now + SignedDuration::milliseconds(1)),
                 "type": "event_msg",
                 "payload": {
                     "type": "token_count",
@@ -1769,7 +1769,7 @@ fn cached_refresh_clears_replay_diagnostics_when_a_changed_file_loses_its_owner(
                 }
             }),
             json!({
-                "timestamp": timestamp(now + chrono::Duration::milliseconds(1)),
+                "timestamp": timestamp(now + SignedDuration::milliseconds(1)),
                 "type": "event_msg",
                 "payload": {
                     "type": "token_count",
@@ -1782,7 +1782,7 @@ fn cached_refresh_clears_replay_diagnostics_when_a_changed_file_loses_its_owner(
     let scan_config = config(temp.path());
     let mut cache = RolloutCache::new();
     let owned = cache
-        .scan(&scan_config, now + chrono::Duration::milliseconds(2))
+        .scan(&scan_config, now + SignedDuration::milliseconds(2))
         .unwrap();
     assert_eq!(owned.stats.ambiguous_token_resets, 2);
     for expected_path in [&path, &retained_path] {
@@ -1800,7 +1800,7 @@ fn cached_refresh_clears_replay_diagnostics_when_a_changed_file_loses_its_owner(
     write_jsonl(
         &path,
         &[json!({
-            "timestamp": timestamp(now + chrono::Duration::seconds(1)),
+            "timestamp": timestamp(now + SignedDuration::seconds(1)),
             "type": "event_msg",
             "payload": {
                 "type": "task_started",
@@ -1811,7 +1811,7 @@ fn cached_refresh_clears_replay_diagnostics_when_a_changed_file_loses_its_owner(
     );
 
     let ownerless = cache
-        .scan(&scan_config, now + chrono::Duration::seconds(2))
+        .scan(&scan_config, now + SignedDuration::seconds(2))
         .unwrap();
     assert_eq!(cache.last_refresh().reparsed_files, 1);
     assert_eq!(cache.last_refresh().reused_files, 1);
@@ -1844,14 +1844,14 @@ fn cached_refresh_clears_replay_diagnostics_when_a_changed_file_loses_its_owner(
     assert_eq!(ownerless.tasks[0].thread_id, "unchanged-owner");
     assert!(ownerless.turns.is_empty());
 
-    let fresh = scan_rollouts(&scan_config, now + chrono::Duration::seconds(2)).unwrap();
+    let fresh = scan_rollouts(&scan_config, now + SignedDuration::seconds(2)).unwrap();
     assert_dataset_eq(&ownerless, &fresh);
 }
 
 #[test]
 fn cached_refresh_preserves_truncated_file_stats() {
     let temp = TempDir::new().unwrap();
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     for index in 0..3 {
         write_jsonl(
             &temp.path().join(format!("sessions/rollout-{index}.jsonl")),
@@ -1877,7 +1877,7 @@ fn cached_refresh_preserves_truncated_file_stats() {
 #[test]
 fn warm_discovery_reuses_inventory_and_detects_new_files() {
     let temp = TempDir::new().unwrap();
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     write_jsonl(
         &temp.path().join("sessions/rollout-first.jsonl"),
         &[json!({
@@ -1906,13 +1906,13 @@ fn warm_discovery_reuses_inventory_and_detects_new_files() {
     write_jsonl(
         &temp.path().join("sessions/rollout-second.jsonl"),
         &[json!({
-            "timestamp": timestamp(now + chrono::Duration::seconds(1)),
+            "timestamp": timestamp(now + SignedDuration::seconds(1)),
             "type": "session_meta",
             "payload": {"id": "thread-second"}
         })],
     );
     let changed = cache
-        .scan(&scan_config, now + chrono::Duration::seconds(1))
+        .scan(&scan_config, now + SignedDuration::seconds(1))
         .unwrap();
 
     assert_eq!(changed.tasks.len(), 2);
@@ -1923,7 +1923,7 @@ fn warm_discovery_reuses_inventory_and_detects_new_files() {
 #[test]
 fn cached_discovery_detects_a_rollout_root_appearing() {
     let temp = TempDir::new().unwrap();
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let scan_config = config(temp.path());
     let mut cache = RolloutCache::new();
 
@@ -1934,13 +1934,13 @@ fn cached_discovery_detects_a_rollout_root_appearing() {
     write_jsonl(
         &temp.path().join("sessions/rollout-new-root.jsonl"),
         &[json!({
-            "timestamp": timestamp(now + chrono::Duration::seconds(1)),
+            "timestamp": timestamp(now + SignedDuration::seconds(1)),
             "type": "session_meta",
             "payload": {"id": "thread-new-root"}
         })],
     );
     let changed = cache
-        .scan(&scan_config, now + chrono::Duration::seconds(1))
+        .scan(&scan_config, now + SignedDuration::seconds(1))
         .unwrap();
 
     assert_eq!(changed.tasks.len(), 1);
@@ -1951,7 +1951,7 @@ fn cached_discovery_detects_a_rollout_root_appearing() {
 #[test]
 fn cold_scan_emits_aggregate_startup_stages_without_session_content() {
     let temp = TempDir::new().unwrap();
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let path = temp.path().join("sessions/rollout-profiled.jsonl");
     write_jsonl(
         &path,
@@ -2024,7 +2024,7 @@ fn unreadable_file_is_counted_and_retried() {
     use std::os::unix::fs::PermissionsExt;
 
     let temp = TempDir::new().unwrap();
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let path = temp.path().join("sessions/rollout-unreadable.jsonl");
     write_jsonl(
         &path,
@@ -2070,10 +2070,10 @@ fn benchmark_real_codex_cache() {
     let mut cache = RolloutCache::new();
 
     let cold_started = Instant::now();
-    let cold = cache.scan(&scan_config, Utc::now()).unwrap();
+    let cold = cache.scan(&scan_config, UtcTimestamp::now()).unwrap();
     let cold_elapsed = cold_started.elapsed();
     let warm_started = Instant::now();
-    let warm = cache.scan(&scan_config, Utc::now()).unwrap();
+    let warm = cache.scan(&scan_config, UtcTimestamp::now()).unwrap();
     let warm_elapsed = warm_started.elapsed();
     let refresh = cache.last_refresh();
     eprintln!(

@@ -270,17 +270,15 @@ mod tests {
     use super::*;
     use std::num::{NonZeroU32, NonZeroU64};
 
-    use chrono::{TimeZone, Utc};
+    use crate::time::UtcTimestamp;
     use tempfile::tempdir;
 
     use crate::remote_protocol::{ProtocolRevisions, SourceGeneration};
 
     const SOURCE: &str = "node-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
-    fn at(hour: u32) -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 8, 31, hour, 0, 0)
-            .single()
-            .unwrap()
+    fn at(hour: u32) -> UtcTimestamp {
+        UtcTimestamp::from_utc(2026, 8, 31, hour, 0, 0).unwrap()
     }
 
     fn store() -> (tempfile::TempDir, SourceHistoryStore, NodeId) {

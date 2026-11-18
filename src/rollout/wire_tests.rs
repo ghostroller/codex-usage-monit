@@ -110,7 +110,7 @@ fn old_event_fixture(contents: &str) -> Value {
 // for the amount of storage previously reserved by each cached event slot.
 #[allow(dead_code)]
 struct LegacyInlineTokenCount {
-    timestamp: DateTime<Utc>,
+    timestamp: UtcTimestamp,
     line_number: usize,
     total_usage: Option<TokenUsage>,
     last_usage: Option<TokenUsage>,
@@ -120,75 +120,75 @@ struct LegacyInlineTokenCount {
 #[allow(dead_code)]
 enum LegacyInlineParsedEvent {
     RequestUsage {
-        timestamp: DateTime<Utc>,
+        timestamp: UtcTimestamp,
         turn_id: String,
         response_id: String,
         usage: TokenUsage,
         turn_usage: Option<TokenUsage>,
     },
     SessionMeta {
-        timestamp: DateTime<Utc>,
+        timestamp: UtcTimestamp,
         payload: Map<String, Value>,
     },
     ForeignCounterBaseline {
-        timestamp: DateTime<Utc>,
+        timestamp: UtcTimestamp,
         total_usage: TokenUsage,
     },
     ForeignThreadSettingsBaseline {
-        timestamp: DateTime<Utc>,
+        timestamp: UtcTimestamp,
         model: Option<String>,
         service_tier: Option<String>,
     },
     UserMessage {
-        timestamp: DateTime<Utc>,
+        timestamp: UtcTimestamp,
         preview: String,
         turn_id: Option<String>,
         source: UserMessageSource,
     },
     AgentCall {
-        requested_at: Option<DateTime<Utc>>,
+        requested_at: Option<UtcTimestamp>,
         call_id: String,
         parent_turn_id: String,
         kind: AgentInteractionKind,
     },
     AgentActivity {
-        recorded_at: Option<DateTime<Utc>>,
-        occurred_at: Option<DateTime<Utc>>,
+        recorded_at: Option<UtcTimestamp>,
+        occurred_at: Option<UtcTimestamp>,
         call_id: String,
         child_thread_id: String,
         kind: AgentInteractionKind,
     },
     ThreadSettingsApplied {
-        timestamp: DateTime<Utc>,
+        timestamp: UtcTimestamp,
         service_tier: Option<String>,
     },
     Activity {
-        timestamp: DateTime<Utc>,
+        timestamp: UtcTimestamp,
     },
     TurnContext {
-        timestamp: DateTime<Utc>,
+        timestamp: UtcTimestamp,
         payload: Map<String, Value>,
     },
     TaskStarted {
-        timestamp: DateTime<Utc>,
+        timestamp: UtcTimestamp,
         turn_id: String,
-        started_at: Option<DateTime<Utc>>,
+        started_at: Option<UtcTimestamp>,
     },
     TaskComplete {
-        timestamp: DateTime<Utc>,
+        timestamp: UtcTimestamp,
         turn_id: String,
-        completed_at: Option<DateTime<Utc>>,
+        completed_at: Option<UtcTimestamp>,
         duration_ms: Option<u64>,
     },
     TurnAborted {
-        timestamp: DateTime<Utc>,
+        timestamp: UtcTimestamp,
         turn_id: String,
-        completed_at: Option<DateTime<Utc>>,
+        completed_at: Option<UtcTimestamp>,
         duration_ms: Option<u64>,
         failed: bool,
     },
     TokenCount {
-        timestamp: DateTime<Utc>,
+        timestamp: UtcTimestamp,
         line_number: usize,
         total_usage: Option<TokenUsage>,
         last_usage: Option<TokenUsage>,

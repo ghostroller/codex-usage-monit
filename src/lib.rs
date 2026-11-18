@@ -74,6 +74,7 @@ pub mod startup;
 mod startup_progress;
 pub mod summary;
 pub mod summary_report;
+pub mod time;
 pub mod trace;
 pub mod trends;
 pub mod tui;

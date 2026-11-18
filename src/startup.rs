@@ -7,9 +7,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::{Value, json};
+
+use crate::time::UtcTimestamp;
 
 const STARTUP_LOG_SCHEMA_VERSION: u32 = 1;
 
@@ -28,7 +29,7 @@ pub struct StartupEvent {
 #[serde(rename_all = "camelCase")]
 pub struct StartupReport {
     pub schema_version: u32,
-    pub started_at: DateTime<Utc>,
+    pub started_at: UtcTimestamp,
     pub total_duration_us: u64,
     pub events: Vec<StartupEvent>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -42,7 +43,7 @@ pub struct StartupTrace {
 
 struct TraceInner {
     origin: Instant,
-    started_at: DateTime<Utc>,
+    started_at: UtcTimestamp,
     active: AtomicBool,
     incremental_log: bool,
     state: Mutex<TraceState>,
@@ -68,8 +69,8 @@ impl StartupTrace {
     pub fn enabled(origin: Instant, log_path: Option<&Path>) -> Result<Self> {
         let started_at = SystemTime::now()
             .checked_sub(origin.elapsed())
-            .map(DateTime::<Utc>::from)
-            .unwrap_or_else(Utc::now);
+            .and_then(|time| UtcTimestamp::try_from(time).ok())
+            .unwrap_or_else(UtcTimestamp::now);
         let mut writer = match log_path {
             Some(path) => {
                 if let Some(parent) = path
@@ -256,7 +257,7 @@ impl StartupTrace {
         let Some(inner) = &self.inner else {
             return StartupReport {
                 schema_version: STARTUP_LOG_SCHEMA_VERSION,
-                started_at: Utc::now(),
+                started_at: UtcTimestamp::now(),
                 total_duration_us: 0,
                 events: Vec::new(),
                 log_error: None,

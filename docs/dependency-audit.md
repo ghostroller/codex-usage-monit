@@ -1,5 +1,24 @@
 # Dependency advisory disposition
 
+## 2026-11-18 time dependency migration
+
+The release candidate replaces `chrono 0.4.45` with `jiff 1.0.1` in response to
+[RUSTSEC-2026-0543](https://rustsec.org/advisories/RUSTSEC-2026-0543.html). The
+lockfile no longer contains `chrono`. Jiff uses the system time zone with IANA
+rules and includes a platform time-zone database on Windows. The application
+retains its established UTC serialization and digest inputs, including
+nanosecond precision and the extended UTC years supported by earlier releases.
+Absolute timestamps outside Jiff's native local-calendar range display in UTC.
+Local Summary and TUI coverage is verified across a real IANA spring gap and
+fall overlap. [Jiff time zones](https://docs.rs/jiff/1.0.1/jiff/tz/)
+
+The same lockfile retains the fixes for
+[RUSTSEC-2026-0459](https://rustsec.org/advisories/RUSTSEC-2026-0459.html) and
+[RUSTSEC-2026-0486](https://rustsec.org/advisories/RUSTSEC-2026-0486.html) via
+`libsqlite3-sys 0.39.1` and `rustix 1.1.6`. On November 18, `cargo-audit 0.22.2`
+with `audit --deny warnings` reported zero vulnerabilities and zero warnings
+against RustSec database commit `233155b4025b854c68a4b199c0e32d7fd53291a2`.
+
 ## 2026-10-05 test dependency update
 
 The second batch uses the same `codex/dependency-updates` worktree, based on

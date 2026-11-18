@@ -11,7 +11,6 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, TimeDelta, Utc};
 use serde::{Deserialize, Serialize};
 
 #[cfg(test)]
@@ -24,6 +23,7 @@ use crate::remote_sync::{RemoteSyncCompletion, RemoteSyncError, RemoteSyncReport
 use crate::remotes_config::{RemoteHostConfig, RemotesConfig};
 use crate::source_history::RedactionProfile;
 use crate::source_identity::NodeId;
+use crate::time::{Duration, UtcTimestamp};
 
 pub const REMOTE_SYNC_HEALTH_SCHEMA_VERSION: u32 = 3;
 pub const REMOTE_SYNC_HARD_PAUSE_PROBE_INTERVAL_SECONDS: i64 = 30 * 60;
@@ -107,7 +107,7 @@ pub enum RemoteSyncErrorCategory {
 struct RemoteFactResourceCooldown {
     redaction_profile: RedactionProfile,
     candidate: ReplicaFactCandidateKey,
-    retry_at: DateTime<Utc>,
+    retry_at: UtcTimestamp,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -218,14 +218,14 @@ pub struct RemoteSyncHostHealth {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     source: Option<SourceGeneration>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    last_attempt_at: Option<DateTime<Utc>>,
+    last_attempt_at: Option<UtcTimestamp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    last_success_at: Option<DateTime<Utc>>,
+    last_success_at: Option<UtcTimestamp>,
     /// Latest successful aggregate attempt that committed either historical
     /// changes or a full semantic live-state replacement. Idle successes and
     /// failures preserve this timestamp for scheduler restart hysteresis.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    last_activity_at: Option<DateTime<Utc>>,
+    last_activity_at: Option<UtcTimestamp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_result: Option<RemoteSyncAttemptResult>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -235,7 +235,7 @@ pub struct RemoteSyncHostHealth {
     response_bytes: u64,
     consecutive_failures: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    next_eligible_at: Option<DateTime<Utc>>,
+    next_eligible_at: Option<UtcTimestamp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     error_category: Option<RemoteSyncErrorCategory>,
     /// An automatic transport attempt could not prove that its complete SSH
@@ -244,7 +244,7 @@ pub struct RemoteSyncHostHealth {
     /// host row which authorized the attempt; unrelated config edits cannot
     /// unlock it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    process_containment_paused_at: Option<DateTime<Utc>>,
+    process_containment_paused_at: Option<UtcTimestamp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     process_containment_host_fingerprint: Option<String>,
     /// Latest bounded fact-follow-up outcome for this exact source pin.
@@ -252,7 +252,7 @@ pub struct RemoteSyncHostHealth {
     /// category is healthy, while a category is a sanitized partial/attention
     /// signal. Aggregate success fields remain independent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    last_fact_sync_at: Option<DateTime<Utc>>,
+    last_fact_sync_at: Option<UtcTimestamp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     fact_sync_error_category: Option<RemoteSyncErrorCategory>,
     /// Exact content-free candidates whose remote complete inventory exceeded
@@ -266,16 +266,16 @@ pub struct RemoteSyncHostHealth {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     fact_resource_resume_cursors: Vec<RemoteFactResourceResumeCursor>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    budget_paused_at: Option<DateTime<Utc>>,
+    budget_paused_at: Option<UtcTimestamp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    budget_resume_at: Option<DateTime<Utc>>,
+    budget_resume_at: Option<UtcTimestamp>,
     /// Durable claim deadline for the next fixed-size automatic hard-cap
     /// probe. `None` means either a soft pause or a legacy/new pause which has
     /// not yet been classified by the bandwidth policy observer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    budget_probe_due_at: Option<DateTime<Utc>>,
+    budget_probe_due_at: Option<UtcTimestamp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    budget_last_probe_at: Option<DateTime<Utc>>,
+    budget_last_probe_at: Option<UtcTimestamp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     budget_last_probe_succeeded: Option<bool>,
 }
@@ -329,15 +329,15 @@ impl RemoteSyncHostHealth {
         self.source.as_ref().map(|source| &source.node_id)
     }
 
-    pub fn last_attempt_at(&self) -> Option<DateTime<Utc>> {
+    pub fn last_attempt_at(&self) -> Option<UtcTimestamp> {
         self.last_attempt_at
     }
 
-    pub fn last_success_at(&self) -> Option<DateTime<Utc>> {
+    pub fn last_success_at(&self) -> Option<UtcTimestamp> {
         self.last_success_at
     }
 
-    pub fn last_activity_at(&self) -> Option<DateTime<Utc>> {
+    pub fn last_activity_at(&self) -> Option<UtcTimestamp> {
         self.last_activity_at
     }
 
@@ -365,7 +365,7 @@ impl RemoteSyncHostHealth {
         self.consecutive_failures
     }
 
-    pub fn next_eligible_at(&self) -> Option<DateTime<Utc>> {
+    pub fn next_eligible_at(&self) -> Option<UtcTimestamp> {
         self.next_eligible_at
     }
 
@@ -373,7 +373,7 @@ impl RemoteSyncHostHealth {
         self.error_category
     }
 
-    pub fn process_containment_paused_at(&self) -> Option<DateTime<Utc>> {
+    pub fn process_containment_paused_at(&self) -> Option<UtcTimestamp> {
         self.process_containment_paused_at
     }
 
@@ -391,7 +391,7 @@ impl RemoteSyncHostHealth {
                 == Some(host.automatic_sync_fingerprint().as_str())
     }
 
-    pub fn last_fact_sync_at(&self) -> Option<DateTime<Utc>> {
+    pub fn last_fact_sync_at(&self) -> Option<UtcTimestamp> {
         self.last_fact_sync_at
     }
 
@@ -405,14 +405,14 @@ impl RemoteSyncHostHealth {
 
     /// Time at which the latest independent bandwidth pause was observed.
     /// A pause is a local policy state, not a failed synchronization attempt.
-    pub fn budget_paused_at(&self) -> Option<DateTime<Utc>> {
+    pub fn budget_paused_at(&self) -> Option<UtcTimestamp> {
         self.budget_paused_at
     }
 
     /// Exact UTC instant at which the recorded budget pause may be retried.
     /// When [`Self::budget_paused`] is true, `None` means the recovery time is
     /// unknown rather than that the host is unpaused.
-    pub fn budget_resume_at(&self) -> Option<DateTime<Utc>> {
+    pub fn budget_resume_at(&self) -> Option<UtcTimestamp> {
         self.budget_resume_at
     }
 
@@ -420,11 +420,11 @@ impl RemoteSyncHostHealth {
         self.budget_paused_at.is_some()
     }
 
-    pub fn budget_probe_due_at(&self) -> Option<DateTime<Utc>> {
+    pub fn budget_probe_due_at(&self) -> Option<UtcTimestamp> {
         self.budget_probe_due_at
     }
 
-    pub fn budget_last_probe_at(&self) -> Option<DateTime<Utc>> {
+    pub fn budget_last_probe_at(&self) -> Option<UtcTimestamp> {
         self.budget_last_probe_at
     }
 
@@ -763,7 +763,7 @@ impl RemoteSyncHealthStore {
         &self,
         host_id: &str,
         source: &SourceGeneration,
-        completed_at: DateTime<Utc>,
+        completed_at: UtcTimestamp,
         error_category: Option<RemoteSyncErrorCategory>,
     ) -> io::Result<RemoteSyncHostHealth> {
         self.record_fact_sync_outcome_inner(host_id, source, completed_at, error_category, None)
@@ -775,7 +775,7 @@ impl RemoteSyncHealthStore {
         &self,
         host_id: &str,
         source: &SourceGeneration,
-        completed_at: DateTime<Utc>,
+        completed_at: UtcTimestamp,
         configured_host: &RemoteHostConfig,
     ) -> io::Result<RemoteSyncHostHealth> {
         if configured_host.id() != host_id || configured_host.expected_source() != Some(source) {
@@ -797,7 +797,7 @@ impl RemoteSyncHealthStore {
         &self,
         host_id: &str,
         source: &SourceGeneration,
-        completed_at: DateTime<Utc>,
+        completed_at: UtcTimestamp,
         error_category: Option<RemoteSyncErrorCategory>,
         process_containment_host_fingerprint: Option<String>,
     ) -> io::Result<RemoteSyncHostHealth> {
@@ -829,7 +829,7 @@ impl RemoteSyncHealthStore {
         host_id: &str,
         source: &SourceGeneration,
         redaction_profile: RedactionProfile,
-        now: DateTime<Utc>,
+        now: UtcTimestamp,
     ) -> io::Result<BTreeSet<ReplicaFactCandidateKey>> {
         validate_host_id(host_id)?;
         let Some(host) = self.get(host_id)? else {
@@ -904,14 +904,14 @@ impl RemoteSyncHealthStore {
         source: &SourceGeneration,
         redaction_profile: RedactionProfile,
         candidate: &ReplicaFactCandidateKey,
-        observed_at: DateTime<Utc>,
+        observed_at: UtcTimestamp,
         resource_limit: bool,
     ) -> io::Result<()> {
         validate_host_id(host_id)?;
         let retry_delay = if resource_limit {
-            TimeDelta::hours(FACT_RESOURCE_RETRY_DELAY_HOURS)
+            Duration::hours(FACT_RESOURCE_RETRY_DELAY_HOURS)
         } else {
-            TimeDelta::minutes(FACT_EVIDENCE_RETRY_DELAY_MINUTES)
+            Duration::minutes(FACT_EVIDENCE_RETRY_DELAY_MINUTES)
         };
         let retry_at = observed_at
             .checked_add_signed(retry_delay)
@@ -991,9 +991,9 @@ impl RemoteSyncHealthStore {
         &self,
         host_id: &str,
         source: Option<&SourceGeneration>,
-        completed_at: DateTime<Utc>,
+        completed_at: UtcTimestamp,
         report: &RemoteSyncReport,
-        next_eligible_at: Option<DateTime<Utc>>,
+        next_eligible_at: Option<UtcTimestamp>,
     ) -> io::Result<RemoteSyncHostHealth> {
         self.record_success_inner(
             host_id,
@@ -1011,7 +1011,7 @@ impl RemoteSyncHealthStore {
         &self,
         host_id: &str,
         source: &SourceGeneration,
-        completed_at: DateTime<Utc>,
+        completed_at: UtcTimestamp,
         report: &RemoteSyncReport,
         configured_host: &RemoteHostConfig,
     ) -> io::Result<RemoteSyncHostHealth> {
@@ -1035,9 +1035,9 @@ impl RemoteSyncHealthStore {
         &self,
         host_id: &str,
         source: Option<&SourceGeneration>,
-        completed_at: DateTime<Utc>,
+        completed_at: UtcTimestamp,
         report: &RemoteSyncReport,
-        next_eligible_at: Option<DateTime<Utc>>,
+        next_eligible_at: Option<UtcTimestamp>,
         process_containment_host_fingerprint: Option<String>,
     ) -> io::Result<RemoteSyncHostHealth> {
         validate_host_id(host_id)?;
@@ -1103,9 +1103,9 @@ impl RemoteSyncHealthStore {
         &self,
         host_id: &str,
         source: Option<&SourceGeneration>,
-        completed_at: DateTime<Utc>,
+        completed_at: UtcTimestamp,
         category: RemoteSyncErrorCategory,
-        next_eligible_at: Option<DateTime<Utc>>,
+        next_eligible_at: Option<UtcTimestamp>,
     ) -> io::Result<RemoteSyncHostHealth> {
         self.record_failure_inner(
             host_id,
@@ -1121,9 +1121,9 @@ impl RemoteSyncHealthStore {
         &self,
         host_id: &str,
         source: Option<&SourceGeneration>,
-        completed_at: DateTime<Utc>,
+        completed_at: UtcTimestamp,
         category: RemoteSyncErrorCategory,
-        next_eligible_at: Option<DateTime<Utc>>,
+        next_eligible_at: Option<UtcTimestamp>,
         process_containment_host_fingerprint: Option<String>,
     ) -> io::Result<RemoteSyncHostHealth> {
         validate_host_id(host_id)?;
@@ -1178,9 +1178,9 @@ impl RemoteSyncHealthStore {
         &self,
         host_id: &str,
         source: Option<&SourceGeneration>,
-        attempted_at: DateTime<Utc>,
+        attempted_at: UtcTimestamp,
         level: RemoteBandwidthBudgetLevel,
-        resume_at: Option<DateTime<Utc>>,
+        resume_at: Option<UtcTimestamp>,
     ) -> io::Result<RemoteSyncHostHealth> {
         self.record_pause_inner(host_id, source, attempted_at, level, resume_at, None)
     }
@@ -1191,9 +1191,9 @@ impl RemoteSyncHealthStore {
         &self,
         host_id: &str,
         source: &SourceGeneration,
-        attempted_at: DateTime<Utc>,
+        attempted_at: UtcTimestamp,
         level: RemoteBandwidthBudgetLevel,
-        resume_at: Option<DateTime<Utc>>,
+        resume_at: Option<UtcTimestamp>,
         configured_host: &RemoteHostConfig,
     ) -> io::Result<RemoteSyncHostHealth> {
         if configured_host.id() != host_id || configured_host.expected_source() != Some(source) {
@@ -1216,9 +1216,9 @@ impl RemoteSyncHealthStore {
         &self,
         host_id: &str,
         source: Option<&SourceGeneration>,
-        attempted_at: DateTime<Utc>,
+        attempted_at: UtcTimestamp,
         level: RemoteBandwidthBudgetLevel,
-        resume_at: Option<DateTime<Utc>>,
+        resume_at: Option<UtcTimestamp>,
         process_containment_host_fingerprint: Option<String>,
     ) -> io::Result<RemoteSyncHostHealth> {
         validate_host_id(host_id)?;
@@ -1277,7 +1277,7 @@ impl RemoteSyncHealthStore {
         &self,
         host_id: &str,
         source: &SourceGeneration,
-        now: DateTime<Utc>,
+        now: UtcTimestamp,
     ) -> io::Result<bool> {
         validate_host_id(host_id)?;
         self.mutate_if_changed(|hosts| {
@@ -1312,7 +1312,7 @@ impl RemoteSyncHealthStore {
         &self,
         host_id: &str,
         source: &SourceGeneration,
-        probed_at: DateTime<Utc>,
+        probed_at: UtcTimestamp,
         succeeded: bool,
     ) -> io::Result<RemoteSyncHostHealth> {
         validate_host_id(host_id)?;
@@ -1331,9 +1331,9 @@ impl RemoteSyncHealthStore {
         &self,
         host_id: &str,
         source: Option<&SourceGeneration>,
-        completed_at: DateTime<Utc>,
+        completed_at: UtcTimestamp,
         error: &RemoteSyncError,
-        next_eligible_at: Option<DateTime<Utc>>,
+        next_eligible_at: Option<UtcTimestamp>,
     ) -> io::Result<RemoteSyncHostHealth> {
         self.record_failure(
             host_id,
@@ -1352,9 +1352,9 @@ impl RemoteSyncHealthStore {
         &self,
         host_id: &str,
         source: Option<&SourceGeneration>,
-        completed_at: DateTime<Utc>,
+        completed_at: UtcTimestamp,
         error: &RemoteSyncError,
-        next_eligible_at: Option<DateTime<Utc>>,
+        next_eligible_at: Option<UtcTimestamp>,
         configured_host: &RemoteHostConfig,
     ) -> io::Result<RemoteSyncHostHealth> {
         let category = RemoteSyncErrorCategory::from_sync_error(error);
@@ -1376,7 +1376,7 @@ impl RemoteSyncHealthStore {
         &self,
         host_id: &str,
         source: &SourceGeneration,
-        observed_at: DateTime<Utc>,
+        observed_at: UtcTimestamp,
         configured_host: &RemoteHostConfig,
     ) -> io::Result<RemoteSyncHostHealth> {
         validate_host_id(host_id)?;
@@ -1409,7 +1409,7 @@ impl RemoteSyncHealthStore {
         &self,
         host_id: &str,
         source: Option<&SourceGeneration>,
-        succeeded_at: DateTime<Utc>,
+        succeeded_at: UtcTimestamp,
     ) -> io::Result<bool> {
         validate_host_id(host_id)?;
         self.mutate_if_changed(|hosts| {
@@ -1597,7 +1597,7 @@ fn reconcile_host_entry<'a>(
         .or_insert_with(|| RemoteSyncHostHealth::new(host_id.to_owned(), true, configured_source))
 }
 
-fn clear_budget_pause_through(host: &mut RemoteSyncHostHealth, completed_at: DateTime<Utc>) {
+fn clear_budget_pause_through(host: &mut RemoteSyncHostHealth, completed_at: UtcTimestamp) {
     if host
         .budget_paused_at
         .is_some_and(|paused_at| paused_at <= completed_at)
@@ -1612,7 +1612,7 @@ fn clear_budget_pause_through(host: &mut RemoteSyncHostHealth, completed_at: Dat
 
 fn clear_process_containment_pause_through(
     host: &mut RemoteSyncHostHealth,
-    completed_at: DateTime<Utc>,
+    completed_at: UtcTimestamp,
 ) {
     if host
         .process_containment_paused_at
@@ -1644,8 +1644,8 @@ fn evict_earliest_fact_resource_cooldown(hosts: &mut BTreeMap<String, RemoteSync
     }
 }
 
-fn next_budget_probe_deadline(from: DateTime<Utc>) -> io::Result<DateTime<Utc>> {
-    from.checked_add_signed(TimeDelta::seconds(
+fn next_budget_probe_deadline(from: UtcTimestamp) -> io::Result<UtcTimestamp> {
+    from.checked_add_signed(Duration::seconds(
         REMOTE_SYNC_HARD_PAUSE_PROBE_INTERVAL_SECONDS,
     ))
     .ok_or_else(|| invalid_data("remote sync budget probe deadline overflows"))
@@ -1679,8 +1679,8 @@ fn prune_detached_hosts(hosts: &mut BTreeMap<String, RemoteSyncHostHealth>) -> i
 }
 
 fn validate_next_eligible(
-    completed_at: DateTime<Utc>,
-    next_eligible_at: Option<DateTime<Utc>>,
+    completed_at: UtcTimestamp,
+    next_eligible_at: Option<UtcTimestamp>,
 ) -> io::Result<()> {
     if next_eligible_at.is_some_and(|next| next < completed_at) {
         return Err(io::Error::new(
@@ -1796,7 +1796,7 @@ mod tests {
     use std::sync::{Arc, Barrier};
     use std::thread;
 
-    use chrono::TimeDelta;
+    use crate::time::Duration;
     use serde_json::json;
     use tempfile::tempdir;
 
@@ -1821,11 +1821,11 @@ mod tests {
     fn fact_candidate(
         source_id: NodeId,
         thread_id: &str,
-        range_start: DateTime<Utc>,
+        range_start: UtcTimestamp,
         fingerprint: char,
     ) -> ReplicaFactCandidateKey {
         let revisions = crate::remote_agent::current_revisions();
-        let range_end = range_start + TimeDelta::days(1);
+        let range_end = range_start + Duration::days(1);
         let fingerprint = format!(
             "session-digest-sha256-v1-{}",
             fingerprint.to_string().repeat(64)
@@ -1895,7 +1895,7 @@ mod tests {
         let config = paired_config(&config_path, pinned_source.clone());
         let host = config.host("dev").unwrap().clone();
         let store = test_store(&directory);
-        let at = Utc::now();
+        let at = UtcTimestamp::now();
         let error = RemoteSyncError::Transport(RemoteTransportError::Cancelled {
             cleanup_error: Some(io::Error::other("escaped helper")),
         });
@@ -1957,7 +1957,7 @@ mod tests {
         );
         let host = config.host("dev").unwrap();
         let store = test_store(&directory);
-        let completed_at = Utc::now();
+        let completed_at = UtcTimestamp::now();
         let health = store
             .record_success_with_process_containment(
                 "dev",
@@ -1981,7 +1981,7 @@ mod tests {
                 .clear_process_containment_pause(
                     "dev",
                     Some(&pinned_source),
-                    completed_at + TimeDelta::seconds(1),
+                    completed_at + Duration::seconds(1),
                 )
                 .unwrap()
         );
@@ -2011,7 +2011,7 @@ mod tests {
             .record_sync_error_for_config(
                 "dev",
                 Some(&pinned_source),
-                Utc::now(),
+                UtcTimestamp::now(),
                 &error,
                 None,
                 host,
@@ -2047,9 +2047,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let store = test_store(&directory);
         let pinned = source(NODE_ID, 1);
-        let first = DateTime::parse_from_rfc3339("2026-08-31T01:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
+        let first = UtcTimestamp::parse_from_rfc3339("2026-08-31T01:00:00Z").unwrap();
         store
             .record_success(
                 "dev",
@@ -2059,7 +2057,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        let attention_at = first + TimeDelta::seconds(1);
+        let attention_at = first + Duration::seconds(1);
         let attention = store
             .record_fact_sync_outcome(
                 "dev",
@@ -2089,7 +2087,7 @@ mod tests {
             stale.fact_sync_error_category(),
             Some(RemoteSyncErrorCategory::ResourceLimit)
         );
-        let recovered_at = attention_at + TimeDelta::seconds(1);
+        let recovered_at = attention_at + Duration::seconds(1);
         let recovered = store
             .record_fact_sync_outcome("dev", &pinned, recovered_at, None)
             .unwrap();
@@ -2112,31 +2110,29 @@ mod tests {
         let directory = tempdir().unwrap();
         let store = test_store(&directory);
         let pinned = source(NODE_ID, 1);
-        let observed_at = DateTime::parse_from_rfc3339("2026-08-31T01:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
+        let observed_at = UtcTimestamp::parse_from_rfc3339("2026-08-31T01:00:00Z").unwrap();
         let first = fact_candidate(
             pinned.node_id.clone(),
             "thread-first",
-            observed_at - TimeDelta::days(1),
+            observed_at - Duration::days(1),
             'a',
         );
         let second = fact_candidate(
             pinned.node_id.clone(),
             "thread-second",
-            observed_at - TimeDelta::days(2),
+            observed_at - Duration::days(2),
             'b',
         );
         let local = fact_candidate(
             LOCAL_NODE_ID.parse().unwrap(),
             "thread-local",
-            observed_at - TimeDelta::days(3),
+            observed_at - Duration::days(3),
             'c',
         );
         let refreshed_first = fact_candidate(
             pinned.node_id.clone(),
             "thread-first",
-            observed_at - TimeDelta::days(1),
+            observed_at - Duration::days(1),
             'd',
         );
         store
@@ -2176,7 +2172,7 @@ mod tests {
                     "dev",
                     &pinned,
                     RedactionProfile::Redacted,
-                    observed_at + TimeDelta::minutes(14),
+                    observed_at + Duration::minutes(14),
                 )
                 .unwrap()
                 .contains(&second)
@@ -2188,7 +2184,7 @@ mod tests {
                 "dev",
                 &pinned,
                 RedactionProfile::Redacted,
-                observed_at + TimeDelta::hours(5),
+                observed_at + Duration::hours(5),
             )
             .unwrap();
         assert!(active.contains(&first));
@@ -2201,7 +2197,7 @@ mod tests {
                     "dev",
                     &pinned,
                     RedactionProfile::PreviewEnabled,
-                    observed_at + TimeDelta::hours(5),
+                    observed_at + Duration::hours(5),
                 )
                 .unwrap()
                 .is_empty()
@@ -2212,7 +2208,7 @@ mod tests {
                     "dev",
                     &pinned,
                     RedactionProfile::Redacted,
-                    observed_at + TimeDelta::hours(6),
+                    observed_at + Duration::hours(6),
                 )
                 .unwrap()
                 .is_empty()
@@ -2230,7 +2226,7 @@ mod tests {
                     "dev",
                     &rotated,
                     RedactionProfile::Redacted,
-                    observed_at + TimeDelta::hours(1),
+                    observed_at + Duration::hours(1),
                 )
                 .unwrap()
                 .is_empty()
@@ -2242,15 +2238,13 @@ mod tests {
         let directory = tempdir().unwrap();
         let store = test_store(&directory);
         let pinned = source(NODE_ID, 1);
-        let observed_at = DateTime::parse_from_rfc3339("2026-08-31T01:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
+        let observed_at = UtcTimestamp::parse_from_rfc3339("2026-08-31T01:00:00Z").unwrap();
         let candidates = (0..33)
             .map(|index| {
                 fact_candidate(
                     pinned.node_id.clone(),
                     &format!("thread-{index:02}"),
-                    observed_at - TimeDelta::days(1),
+                    observed_at - Duration::days(1),
                     char::from(b"0123456789abcdef"[index % 16]),
                 )
             })
@@ -2301,9 +2295,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let store = test_store(&directory);
         let source = source(NODE_ID, 1);
-        let first = DateTime::parse_from_rfc3339("2026-08-31T01:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
+        let first = UtcTimestamp::parse_from_rfc3339("2026-08-31T01:00:00Z").unwrap();
 
         let success = store
             .record_success(
@@ -2311,7 +2303,7 @@ mod tests {
                 Some(&source),
                 first,
                 &report(RemoteSyncCompletion::Complete),
-                Some(first + TimeDelta::minutes(5)),
+                Some(first + Duration::minutes(5)),
             )
             .unwrap();
         assert_eq!(
@@ -2327,14 +2319,14 @@ mod tests {
         assert_eq!(success.changes_committed(), 17);
         assert_eq!(success.response_bytes(), 4096);
 
-        let second = first + TimeDelta::minutes(5);
+        let second = first + Duration::minutes(5);
         let failure = store
             .record_failure(
                 "dev",
                 Some(&source),
                 second,
                 RemoteSyncErrorCategory::Transport,
-                Some(second + TimeDelta::minutes(1)),
+                Some(second + Duration::minutes(1)),
             )
             .unwrap();
         assert_eq!(failure.last_success_at(), Some(first));
@@ -2349,7 +2341,7 @@ mod tests {
         assert_eq!(failure.consecutive_failures(), 1);
         assert_eq!(failure.pages_committed(), 0);
 
-        let third = second + TimeDelta::minutes(1);
+        let third = second + Duration::minutes(1);
         assert_eq!(
             store
                 .record_failure(
@@ -2357,21 +2349,21 @@ mod tests {
                     Some(&source),
                     third,
                     RemoteSyncErrorCategory::Remote,
-                    Some(third + TimeDelta::minutes(2)),
+                    Some(third + Duration::minutes(2)),
                 )
                 .unwrap()
                 .consecutive_failures(),
             2
         );
 
-        let recovered_at = third + TimeDelta::minutes(2);
+        let recovered_at = third + Duration::minutes(2);
         let recovered = store
             .record_success(
                 "dev",
                 Some(&source),
                 recovered_at,
                 &report(RemoteSyncCompletion::Complete),
-                Some(recovered_at + TimeDelta::minutes(5)),
+                Some(recovered_at + Duration::minutes(5)),
             )
             .unwrap();
         assert_eq!(recovered.last_success_at(), Some(recovered_at));
@@ -2385,10 +2377,8 @@ mod tests {
         let directory = tempdir().unwrap();
         let store = test_store(&directory);
         let source = source(NODE_ID, 1);
-        let older = DateTime::parse_from_rfc3339("2026-08-31T01:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let newer = older + TimeDelta::seconds(1);
+        let older = UtcTimestamp::parse_from_rfc3339("2026-08-31T01:00:00Z").unwrap();
+        let newer = older + Duration::seconds(1);
 
         let latest = store
             .record_success(
@@ -2396,7 +2386,7 @@ mod tests {
                 Some(&source),
                 newer,
                 &report(RemoteSyncCompletion::Complete),
-                Some(newer + TimeDelta::minutes(5)),
+                Some(newer + Duration::minutes(5)),
             )
             .unwrap();
         let delayed = store
@@ -2405,7 +2395,7 @@ mod tests {
                 Some(&source),
                 older,
                 RemoteSyncErrorCategory::Transport,
-                Some(older + TimeDelta::minutes(1)),
+                Some(older + Duration::minutes(1)),
             )
             .unwrap();
 
@@ -2419,9 +2409,7 @@ mod tests {
         let store = test_store(&directory);
         let first_source = source(NODE_ID, 1);
         let rotated_source = source(NODE_ID, 2);
-        let attempted_at = DateTime::parse_from_rfc3339("2026-08-31T01:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
+        let attempted_at = UtcTimestamp::parse_from_rfc3339("2026-08-31T01:00:00Z").unwrap();
         store
             .record_failure(
                 "dev",
@@ -2451,9 +2439,7 @@ mod tests {
         let store = test_store(&directory);
         let old_source = source(NODE_ID, 1);
         let new_source = source(NODE_ID, 2);
-        let attempted_at = DateTime::parse_from_rfc3339("2026-08-31T01:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
+        let attempted_at = UtcTimestamp::parse_from_rfc3339("2026-08-31T01:00:00Z").unwrap();
         store
             .record_success(
                 "dev",
@@ -2474,7 +2460,7 @@ mod tests {
             .record_failure(
                 "dev",
                 Some(&old_source),
-                attempted_at + TimeDelta::hours(1),
+                attempted_at + Duration::hours(1),
                 RemoteSyncErrorCategory::Transport,
                 None,
             )
@@ -2488,7 +2474,7 @@ mod tests {
             .record_pause(
                 "dev",
                 None,
-                attempted_at + TimeDelta::hours(2),
+                attempted_at + Duration::hours(2),
                 RemoteBandwidthBudgetLevel::Hard,
                 None,
             )
@@ -2508,9 +2494,7 @@ mod tests {
         let store = test_store(&directory);
         let old_source = source(NODE_ID, 1);
         let new_source = source(NODE_ID, 2);
-        let attempted_at = DateTime::parse_from_rfc3339("2026-08-31T01:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
+        let attempted_at = UtcTimestamp::parse_from_rfc3339("2026-08-31T01:00:00Z").unwrap();
         store
             .record_failure(
                 "dev",
@@ -2530,7 +2514,7 @@ mod tests {
             .record_success(
                 "dev",
                 Some(&new_source),
-                attempted_at + TimeDelta::minutes(1),
+                attempted_at + Duration::minutes(1),
                 &report(RemoteSyncCompletion::Complete),
                 None,
             )
@@ -2550,9 +2534,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let store = test_store(&directory);
         let source = source(NODE_ID, 1);
-        let failed_at = DateTime::parse_from_rfc3339("2026-08-31T01:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
+        let failed_at = UtcTimestamp::parse_from_rfc3339("2026-08-31T01:00:00Z").unwrap();
         let failure = store
             .record_failure(
                 "dev",
@@ -2562,8 +2544,8 @@ mod tests {
                 None,
             )
             .unwrap();
-        let paused_at = failed_at + TimeDelta::minutes(1);
-        let resume_at = paused_at + TimeDelta::hours(23);
+        let paused_at = failed_at + Duration::minutes(1);
+        let resume_at = paused_at + Duration::hours(23);
 
         let paused = store
             .record_pause(
@@ -2580,7 +2562,7 @@ mod tests {
         assert_eq!(paused.budget_resume_at(), Some(resume_at));
         assert_eq!(
             paused.budget_probe_due_at(),
-            Some(paused_at + TimeDelta::minutes(30))
+            Some(paused_at + Duration::minutes(30))
         );
         assert_eq!(paused.last_attempt_at(), failure.last_attempt_at());
         assert_eq!(paused.last_result(), failure.last_result());
@@ -2607,9 +2589,7 @@ mod tests {
     fn hard_pause_probe_deadline_survives_restart_and_claims_without_unpausing() {
         let directory = tempdir().unwrap();
         let source = source(NODE_ID, 1);
-        let paused_at = DateTime::parse_from_rfc3339("2026-08-31T01:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
+        let paused_at = UtcTimestamp::parse_from_rfc3339("2026-08-31T01:00:00Z").unwrap();
         let store = test_store(&directory);
         store
             .record_failure(
@@ -2626,7 +2606,7 @@ mod tests {
                 Some(&source),
                 paused_at,
                 RemoteBandwidthBudgetLevel::Hard,
-                Some(paused_at + TimeDelta::hours(24)),
+                Some(paused_at + Duration::hours(24)),
             )
             .unwrap();
         assert_eq!(paused.consecutive_failures(), 1);
@@ -2634,17 +2614,17 @@ mod tests {
         let restarted = RemoteSyncHealthStore::new(store.state_root().to_path_buf());
         assert!(
             !restarted
-                .claim_due_budget_probe("dev", &source, paused_at + TimeDelta::minutes(29),)
+                .claim_due_budget_probe("dev", &source, paused_at + Duration::minutes(29),)
                 .unwrap()
         );
         assert!(
             restarted
-                .claim_due_budget_probe("dev", &source, paused_at + TimeDelta::minutes(30),)
+                .claim_due_budget_probe("dev", &source, paused_at + Duration::minutes(30),)
                 .unwrap()
         );
         assert!(
             !restarted
-                .claim_due_budget_probe("dev", &source, paused_at + TimeDelta::minutes(59),)
+                .claim_due_budget_probe("dev", &source, paused_at + Duration::minutes(59),)
                 .unwrap()
         );
         let claimed = restarted.get("dev").unwrap().unwrap();
@@ -2656,21 +2636,21 @@ mod tests {
         );
         assert_eq!(
             claimed.budget_probe_due_at(),
-            Some(paused_at + TimeDelta::minutes(60))
+            Some(paused_at + Duration::minutes(60))
         );
 
         let repeated_pause = restarted
             .record_pause(
                 "dev",
                 Some(&source),
-                paused_at + TimeDelta::minutes(31),
+                paused_at + Duration::minutes(31),
                 RemoteBandwidthBudgetLevel::Hard,
-                Some(paused_at + TimeDelta::hours(24)),
+                Some(paused_at + Duration::hours(24)),
             )
             .unwrap();
         assert_eq!(
             repeated_pause.budget_probe_due_at(),
-            Some(paused_at + TimeDelta::minutes(60))
+            Some(paused_at + Duration::minutes(60))
         );
         assert_eq!(repeated_pause.budget_paused_at(), Some(paused_at));
         assert_eq!(repeated_pause.consecutive_failures(), 1);
@@ -2681,7 +2661,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let store = Arc::new(test_store(&directory));
         let start = Arc::new(Barrier::new(17));
-        let attempted_at = Utc::now();
+        let attempted_at = UtcTimestamp::now();
         let mut workers = Vec::new();
         for index in 0..16 {
             let store = Arc::clone(&store);
@@ -2694,7 +2674,7 @@ mod tests {
                         None,
                         attempted_at,
                         RemoteSyncErrorCategory::Transport,
-                        Some(attempted_at + TimeDelta::minutes(1)),
+                        Some(attempted_at + Duration::minutes(1)),
                     )
                     .unwrap();
             }));
@@ -2720,7 +2700,7 @@ mod tests {
                         None,
                         attempted_at,
                         RemoteSyncErrorCategory::Transport,
-                        Some(attempted_at + TimeDelta::minutes(1)),
+                        Some(attempted_at + Duration::minutes(1)),
                     )
                     .unwrap();
             }));
@@ -2743,7 +2723,7 @@ mod tests {
             .record_failure(
                 "dev",
                 None,
-                Utc::now(),
+                UtcTimestamp::now(),
                 RemoteSyncErrorCategory::Transport,
                 None,
             )
@@ -2787,7 +2767,7 @@ mod tests {
             .record_failure(
                 "dev",
                 None,
-                Utc::now(),
+                UtcTimestamp::now(),
                 RemoteSyncErrorCategory::Transport,
                 None,
             )
@@ -2846,7 +2826,7 @@ mod tests {
         assert!(reconciled[0].configured());
         assert_eq!(reconciled[0].node_id().unwrap().as_str(), NODE_ID);
 
-        let attempted_at = Utc::now();
+        let attempted_at = UtcTimestamp::now();
         store
             .record_success(
                 "dev",
@@ -2899,7 +2879,7 @@ mod tests {
             "transport leaked {secret_alias} at {secret_path}"
         )));
         store
-            .record_sync_error("safe-id", None, Utc::now(), &raw, None)
+            .record_sync_error("safe-id", None, UtcTimestamp::now(), &raw, None)
             .unwrap();
         let serialized = fs::read_to_string(store.health_path()).unwrap();
         assert!(!serialized.contains(secret_alias));
@@ -2929,7 +2909,7 @@ mod tests {
             .record_failure(
                 "dev",
                 None,
-                Utc::now(),
+                UtcTimestamp::now(),
                 RemoteSyncErrorCategory::Transport,
                 None,
             )
@@ -2979,7 +2959,7 @@ mod tests {
             .record_failure(
                 "dev",
                 None,
-                Utc::now(),
+                UtcTimestamp::now(),
                 RemoteSyncErrorCategory::Transport,
                 None,
             )
@@ -3006,7 +2986,7 @@ mod tests {
             .record_failure(
                 "dev",
                 None,
-                Utc::now(),
+                UtcTimestamp::now(),
                 RemoteSyncErrorCategory::Transport,
                 None,
             )
@@ -3023,7 +3003,7 @@ mod tests {
             .record_failure(
                 "dev",
                 None,
-                Utc::now(),
+                UtcTimestamp::now(),
                 RemoteSyncErrorCategory::Transport,
                 None,
             )

@@ -5,7 +5,7 @@ fn projection_cache_shares_records_with_app_while_diagnostics_remain_independent
     let directory = tempfile::tempdir().unwrap();
     let codex_home = directory.path().join("codex-home");
     std::fs::create_dir(&codex_home).unwrap();
-    let now = Utc.with_ymd_and_hms(2026, 8, 30, 9, 20, 0).unwrap();
+    let now = UtcTimestamp::from_utc(2026, 8, 30, 9, 20, 0).unwrap();
     let mut runtime = HistoryRuntime::new(
         directory.path().join("state/history-v1"),
         &codex_home,
@@ -14,19 +14,19 @@ fn projection_cache_shares_records_with_app_while_diagnostics_remain_independent
     .unwrap();
     let lease = acquire_runtime_profile_lease(&runtime).unwrap();
     prepare_tui_history_runtime(&mut runtime, &lease, now);
-    let mut observation = tui_runtime_test_observation(now - ChronoDuration::minutes(20), 10);
+    let mut observation = tui_runtime_test_observation(now - SignedDuration::minutes(20), 10);
     observation.quota_points.push(QuotaPoint {
         observed_at: now,
         limit_id: "codex".to_owned(),
         duration_mins: 10_080,
-        resets_at: now + ChronoDuration::days(6),
+        resets_at: now + SignedDuration::days(6),
         used_percent: 20.0,
         remaining_percent: 80.0,
         provenance: Provenance::ServerSnapshot,
     });
     observation.weekly_local_points.push(WeeklyLocalPoint {
         observed_at: now,
-        resets_at: now + ChronoDuration::days(6),
+        resets_at: now + SignedDuration::days(6),
         token_usage: TokenUsage {
             total_tokens: 10,
             ..TokenUsage::default()
@@ -144,7 +144,7 @@ fn projection_cache_shares_records_with_app_while_diagnostics_remain_independent
 
 #[test]
 fn shared_history_preserves_non_reflexive_quota_equality() {
-    let now = Utc.with_ymd_and_hms(2026, 8, 30, 9, 20, 0).unwrap();
+    let now = UtcTimestamp::from_utc(2026, 8, 30, 9, 20, 0).unwrap();
     let mut history = trend_history_fixture(now);
     history.quota_points[0].used_percent = f64::NAN;
     let cloned = history.clone();

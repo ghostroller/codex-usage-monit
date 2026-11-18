@@ -352,7 +352,7 @@ pub(super) fn load_snapshot(
     store: &SourceHistoryStore,
     source: &NodeId,
     redaction: RedactionProfile,
-    since: DateTime<Utc>,
+    since: UtcTimestamp,
     include_digests: bool,
     budget: &mut SourceHistoryReadBudget,
 ) -> io::Result<LocalObservationSnapshot> {
@@ -371,7 +371,7 @@ pub(super) fn load_snapshot(
 pub(super) fn mark_backfill(
     writer: &SourceHistoryWriter<'_, '_, '_>,
     store: &SourceHistoryStore,
-    completed_at: DateTime<Utc>,
+    completed_at: UtcTimestamp,
     complete: bool,
 ) -> io::Result<V2SummaryBackfillAttempt> {
     let database = database(store)?;

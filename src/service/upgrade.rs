@@ -9,7 +9,6 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::recorder_coordination::{
@@ -38,6 +37,7 @@ use super::{
     windows_task_is_installed_with, windows_task_is_running_with, windows_task_name,
     windows_task_xml, windows_task_xml_bounded, write_private_atomically,
 };
+use crate::time::UtcTimestamp;
 
 const JOURNAL: &str = "recorder-upgrade.json";
 const JOURNAL_VERSION: u32 = 2;
@@ -56,7 +56,7 @@ struct UpgradeJournal {
     target: ServiceOptions,
     previous_fingerprint: String,
     enabled: bool,
-    prepared_at: DateTime<Utc>,
+    prepared_at: UtcTimestamp,
     phase: String,
     last_error: Option<String>,
 }
@@ -68,7 +68,7 @@ pub struct ServiceUpgradeReport {
     pub build_id: String,
     pub enabled: bool,
     pub pid: Option<u32>,
-    pub last_history_heartbeat: Option<DateTime<Utc>>,
+    pub last_history_heartbeat: Option<UtcTimestamp>,
     pub diagnostic: Option<String>,
 }
 
@@ -349,7 +349,7 @@ fn upgrade_registered_recorder_checked(allow_dev_build: bool) -> Result<ServiceU
                 target,
                 previous_fingerprint: existing.fingerprint,
                 enabled: existing.enabled,
-                prepared_at: Utc::now(),
+                prepared_at: UtcTimestamp::now(),
                 phase: "prepared".into(),
                 last_error: None,
             };
@@ -556,7 +556,7 @@ fn heartbeat_matches(
         && status
             .last_history_heartbeat
             .is_some_and(|at| at >= status.started_at)
-        && status.writer_may_be_active(Utc::now())
+        && status.writer_may_be_active(UtcTimestamp::now())
 }
 
 fn wait_ready(journal: &UpgradeJournal) -> Result<RecorderStatusFile> {
@@ -585,7 +585,7 @@ fn wait_ready_for_instance(
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct StopRequest {
     pid: u32,
-    started_at: DateTime<Utc>,
+    started_at: UtcTimestamp,
     build_id: String,
 }
 
@@ -908,7 +908,7 @@ pub(crate) fn trusted_registration_identity(expected_executable: &Path) -> Resul
 
 pub(super) fn wait_for_installed_recorder(
     options: &ServiceOptions,
-    prepared_at: DateTime<Utc>,
+    prepared_at: UtcTimestamp,
 ) -> Result<()> {
     let journal = UpgradeJournal {
         schema_version: JOURNAL_VERSION,
@@ -1162,7 +1162,7 @@ fn lifecycle_start(registration: &Registration, require_new: bool) -> Result<Ser
         target: registration.options.clone(),
         previous_fingerprint: registration.fingerprint.clone(),
         enabled: true,
-        prepared_at: Utc::now(),
+        prepared_at: UtcTimestamp::now(),
         phase: "awaiting_heartbeat".into(),
         last_error: None,
     };
@@ -1364,7 +1364,7 @@ mod tests {
             previous_fingerprint: "0".repeat(64),
             target: options,
             enabled: true,
-            prepared_at: Utc::now(),
+            prepared_at: UtcTimestamp::now(),
             phase: "prepared".into(),
             last_error: None,
         };
@@ -1372,10 +1372,10 @@ mod tests {
     }
 
     fn heartbeat(journal: &UpgradeJournal) -> RecorderStatusFile {
-        let mut status = RecorderStatusFile::started(Utc::now(), "history".into());
+        let mut status = RecorderStatusFile::started(UtcTimestamp::now(), "history".into());
         status.bind_source_aware_v2(2).unwrap();
         status.service_definition_id = Some(journal.target.service_definition_id());
-        status.record_success(Utc::now());
+        status.record_success(UtcTimestamp::now());
         status
     }
 
@@ -1439,10 +1439,10 @@ mod tests {
         bad.last_history_heartbeat = None;
         assert!(!heartbeat_matches(&bad, &journal, true));
         bad = good.clone();
-        bad.started_at = journal.prepared_at - chrono::Duration::hours(1);
+        bad.started_at = journal.prepared_at - crate::time::Duration::hours(1);
         assert!(!heartbeat_matches(&bad, &journal, true));
         bad = good;
-        bad.record_degraded(Utc::now(), "remote host offline");
+        bad.record_degraded(UtcTimestamp::now(), "remote host offline");
         assert!(
             heartbeat_matches(&bad, &journal, true),
             "SSH failure must not roll back healthy local collection"
@@ -1468,14 +1468,14 @@ mod tests {
         for missing in [false, true] {
             let (_temp, journal) = fixture();
             let mut recovered = heartbeat(&journal);
-            recovered.started_at = journal.prepared_at - chrono::Duration::minutes(3);
+            recovered.started_at = journal.prepared_at - crate::time::Duration::minutes(3);
             let mut initial = observed_recorder(recovered.clone());
             initial.heartbeat_recent = false;
             if missing {
                 initial.recorder = None;
             } else {
                 initial.recorder.as_mut().unwrap().last_history_heartbeat =
-                    Some(journal.prepared_at - chrono::Duration::hours(2));
+                    Some(journal.prepared_at - crate::time::Duration::hours(2));
             }
             // Task Scheduler's running/queued instance and launchd's running
             // job survive an idempotent start with their original started_at.
@@ -1523,7 +1523,7 @@ mod tests {
                 },
                 |require_new| {
                     let mut previous = heartbeat(&journal);
-                    previous.started_at = journal.prepared_at - chrono::Duration::minutes(3);
+                    previous.started_at = journal.prepared_at - crate::time::Duration::minutes(3);
                     assert!(
                         ready_status_from_observation(
                             &journal,
@@ -1574,7 +1574,7 @@ mod tests {
     fn restart_never_accepts_a_preexisting_instance_even_if_manager_is_active_again() {
         let (_temp, journal) = fixture();
         let mut previous = heartbeat(&journal);
-        previous.started_at = journal.prepared_at - chrono::Duration::minutes(3);
+        previous.started_at = journal.prepared_at - crate::time::Duration::minutes(3);
         let error = lifecycle_start_with(
             false,
             true,
@@ -1600,7 +1600,7 @@ mod tests {
     fn existing_instance_readiness_preserves_identity_and_live_heartbeat_checks() {
         let (_temp, journal) = fixture();
         let mut existing = heartbeat(&journal);
-        existing.started_at = journal.prepared_at - chrono::Duration::minutes(3);
+        existing.started_at = journal.prepared_at - crate::time::Duration::minutes(3);
         let good = observed_recorder(existing);
         assert!(ready_status_from_observation(&journal, false, good.clone()).is_some());
         for mismatch in 0..5 {
@@ -1838,7 +1838,7 @@ mod tests {
         )
         .unwrap();
         assert!(recorder_stop_requested(&path, &status).unwrap());
-        request.started_at -= chrono::Duration::seconds(1);
+        request.started_at -= crate::time::Duration::seconds(1);
         write_private_atomically(
             &path.with_extension("stop.json"),
             &serde_json::to_vec(&request).unwrap(),
@@ -1852,14 +1852,14 @@ mod tests {
         assert!(!recovery_intent_is_proven(temp.path(), &journal).unwrap());
         let mut blocker = RecorderCutoverBlocker {
             schema_version: RECORDER_CUTOVER_BLOCKER_SCHEMA_VERSION,
-            blocked_at: journal.prepared_at - chrono::Duration::seconds(1),
+            blocked_at: journal.prepared_at - crate::time::Duration::seconds(1),
             platform: format!("{:?}", current_platform()).to_ascii_lowercase(),
             reason: "service replacement is in progress".into(),
         };
         let path = temp.path().join(RECORDER_CUTOVER_BLOCKER_FILE);
         write_private_atomically(&path, &serde_json::to_vec(&blocker).unwrap()).unwrap();
         assert!(!recovery_intent_is_proven(temp.path(), &journal).unwrap());
-        blocker.blocked_at = journal.prepared_at + chrono::Duration::seconds(1);
+        blocker.blocked_at = journal.prepared_at + crate::time::Duration::seconds(1);
         write_private_atomically(&path, &serde_json::to_vec(&blocker).unwrap()).unwrap();
         assert!(recovery_intent_is_proven(temp.path(), &journal).unwrap());
         journal.phase = "complete".into();
@@ -2055,7 +2055,7 @@ mod tests {
             target: ServiceOptions,
             previous_fingerprint: String,
             enabled: bool,
-            prepared_at: DateTime<Utc>,
+            prepared_at: UtcTimestamp,
             phase: String,
             last_error: Option<String>,
         }

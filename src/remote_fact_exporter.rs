@@ -19,7 +19,6 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::{Duration as StdDuration, SystemTime};
 
-use chrono::{DateTime, Days, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
@@ -50,6 +49,7 @@ use crate::source_export::{
 use crate::source_history::{RedactionProfile, SourceSessionDigest, UsageEventId};
 use crate::source_identity::{SourceIdentity, SourceIdentityStore};
 use crate::source_model::{SessionReplicaKey, ThreadId, ThreadShardKey};
+use crate::time::UtcTimestamp;
 
 const FACT_INDEX_NAMESPACE: &str = "session-fact-index-v1";
 const FACT_BATCH_NAMESPACE: &str = "session-fact-batches-v1";
@@ -135,7 +135,7 @@ pub(crate) fn validate_complete_fact_inventory(
 pub(crate) fn materialize_complete_session_facts_from_normalized_observation(
     requested_thread: &ThreadId,
     retention_days: u16,
-    observed_at: DateTime<Utc>,
+    observed_at: UtcTimestamp,
     normalized_observation: &HistoryObservation,
     calls: &[UsageCall],
     collection_partial_reasons: &[String],
@@ -220,7 +220,7 @@ impl std::error::Error for RemoteFactPrepareError {
 
 #[derive(Clone, Debug)]
 pub struct PreparedRemoteFactPage {
-    observed_at: DateTime<Utc>,
+    observed_at: UtcTimestamp,
     header: FrozenBatchHeader,
     batch_cursor_generation: NonZeroU64,
     start_sequence: u64,
@@ -229,7 +229,7 @@ pub struct PreparedRemoteFactPage {
 }
 
 impl PreparedRemoteFactPage {
-    pub fn observed_at(&self) -> DateTime<Utc> {
+    pub fn observed_at(&self) -> UtcTimestamp {
         self.observed_at
     }
 
@@ -380,7 +380,7 @@ pub fn prepare_remote_fact_page(
     revisions: &ProtocolRevisions,
     redaction_profile: RedactionProfile,
     request: &SessionFactsRequest,
-    observed_at: DateTime<Utc>,
+    observed_at: UtcTimestamp,
 ) -> Result<PreparedRemoteFactPage, RemoteFactPrepareError> {
     let revision_root = revision_bound_state_root(identity_store, revisions)
         .map_err(RemoteFactPrepareError::Internal)?;
@@ -459,12 +459,12 @@ fn prepare_new_frozen_page(
     revisions: &ProtocolRevisions,
     redaction_profile: RedactionProfile,
     request: &SessionFactsRequest,
-    observed_at: DateTime<Utc>,
+    observed_at: UtcTimestamp,
 ) -> Result<PreparedRemoteFactPage, RemoteFactPrepareError> {
     let range = ExportRange {
         from: observed_at
-            .checked_sub_days(Days::new(u64::from(request.retention_days)))
-            .unwrap_or(DateTime::<Utc>::MIN_UTC),
+            .checked_sub_days(u64::from(request.retention_days))
+            .unwrap_or(UtcTimestamp::MIN),
         to: observed_at,
     };
     let collection = collect_remote_rollouts(config, &range, observed_at, redaction_profile)
@@ -654,7 +654,7 @@ fn prepare_new_frozen_page(
 
 fn preflight_fact_delta_reconcile(
     session: &RemoteExportSession<'_>,
-    observed_at: DateTime<Utc>,
+    observed_at: UtcTimestamp,
     desired: &[RemoteExportDesiredRecord],
     fact_cursor: FactCursor,
 ) -> Result<DeltaCursor, RemoteFactPrepareError> {
@@ -669,7 +669,7 @@ fn preflight_fact_delta_reconcile(
 
 fn preflight_fact_delta_reconcile_with_limits(
     session: &RemoteExportSession<'_>,
-    observed_at: DateTime<Utc>,
+    observed_at: UtcTimestamp,
     desired: &[RemoteExportDesiredRecord],
     fact_cursor: FactCursor,
     limits: CompleteFactBatchLimits,
@@ -747,7 +747,7 @@ fn load_frozen_page(
     revisions: &ProtocolRevisions,
     redaction_profile: RedactionProfile,
     request: &SessionFactsRequest,
-    observed_at: DateTime<Utc>,
+    observed_at: UtcTimestamp,
     expected_kind: FrozenBatchKind,
     batch_identity: &str,
     fact_generation: NonZeroU64,
@@ -805,7 +805,7 @@ fn load_frozen_page_from_header(
     source: &SourceGeneration,
     redaction_profile: RedactionProfile,
     request: &SessionFactsRequest,
-    observed_at: DateTime<Utc>,
+    observed_at: UtcTimestamp,
     header: FrozenBatchHeader,
     token: Option<BatchPageToken>,
 ) -> Result<PreparedRemoteFactPage, RemoteFactPrepareError> {
@@ -827,7 +827,7 @@ fn load_frozen_page_from_header(
 fn load_frozen_page_with_session(
     session: RemoteExportSession<'_>,
     request: &SessionFactsRequest,
-    observed_at: DateTime<Utc>,
+    observed_at: UtcTimestamp,
     header: FrozenBatchHeader,
     token: Option<BatchPageToken>,
 ) -> Result<PreparedRemoteFactPage, RemoteFactPrepareError> {
@@ -902,7 +902,7 @@ fn freeze_batch(
     redaction_profile: RedactionProfile,
     header: &FrozenBatchHeader,
     records: &[FrozenFactRecord],
-    observed_at: DateTime<Utc>,
+    observed_at: UtcTimestamp,
 ) -> Result<(), RemoteFactPrepareError> {
     let store = batch_store(
         identity_store,
@@ -1101,8 +1101,8 @@ fn desired_fact_records(
             );
             let expires_at = fact
                 .occurred_at
-                .checked_add_days(Days::new(u64::from(retention_days)))
-                .unwrap_or(DateTime::<Utc>::MAX_UTC);
+                .checked_add_days(u64::from(retention_days))
+                .unwrap_or(UtcTimestamp::MAX);
             RemoteExportDesiredRecord::new(
                 format!("fact:{logical_hash}"),
                 expires_at,
@@ -2156,7 +2156,7 @@ struct FrozenBatchHeader {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     original_cursor: Option<FactCursor>,
     record_count: u64,
-    created_at: DateTime<Utc>,
+    created_at: UtcTimestamp,
 }
 
 impl FrozenBatchHeader {
@@ -2173,7 +2173,7 @@ impl FrozenBatchHeader {
             || self.expected_digests.iter().any(|binding| {
                 binding.range_end <= binding.range_start
                     || binding.range_end.signed_duration_since(binding.range_start)
-                        > chrono::Duration::days(1)
+                        > crate::time::Duration::days(1)
                     || binding.covered_through < binding.range_start
                     || binding.covered_through > binding.range_end
                     || (binding.coverage_complete && binding.covered_through != binding.range_end)
@@ -2228,7 +2228,7 @@ enum StoredFactMutation {
     Upsert(Box<RemoteUsageEventFact>),
     Tombstone {
         event_id: UsageEventId,
-        occurred_at: DateTime<Utc>,
+        occurred_at: UtcTimestamp,
     },
 }
 
@@ -2237,7 +2237,7 @@ mod tests {
     use std::fs;
     use std::path::Path;
 
-    use chrono::{Duration, TimeZone};
+    use crate::time::Duration;
     use serde_json::json;
 
     use super::*;
@@ -2245,10 +2245,8 @@ mod tests {
 
     const THREAD: &str = "01a00000-0000-7000-8000-000000000001";
 
-    fn at(hour: u32, minute: u32) -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 8, 30, hour, minute, 0)
-            .single()
-            .unwrap()
+    fn at(hour: u32, minute: u32) -> UtcTimestamp {
+        UtcTimestamp::from_utc(2026, 8, 30, hour, minute, 0).unwrap()
     }
 
     fn fixture(
@@ -2258,7 +2256,7 @@ mod tests {
         CollectConfig,
         SourceIdentityStore,
         SourceIdentity,
-        DateTime<Utc>,
+        UtcTimestamp,
     ) {
         let directory = tempfile::tempdir().unwrap();
         let codex_home = directory.path().join("codex");
@@ -2277,7 +2275,7 @@ mod tests {
         (directory, config, store, identity, now)
     }
 
-    fn write_rollout(codex_home: &Path, project: &Path, now: DateTime<Utc>, event_count: usize) {
+    fn write_rollout(codex_home: &Path, project: &Path, now: UtcTimestamp, event_count: usize) {
         let sessions = codex_home.join("sessions/2026/08/30");
         fs::create_dir_all(&sessions).unwrap();
         let mut records = vec![
@@ -2338,7 +2336,7 @@ mod tests {
     fn expected_fact_digests(
         config: &CollectConfig,
         identity: &SourceIdentity,
-        now: DateTime<Utc>,
+        now: UtcTimestamp,
     ) -> Vec<SessionFactsDigestBinding> {
         let range = ExportRange {
             from: now - Duration::days(35),
@@ -2382,7 +2380,7 @@ mod tests {
     fn snapshot_request(
         config: &CollectConfig,
         identity: &SourceIdentity,
-        now: DateTime<Utc>,
+        now: UtcTimestamp,
     ) -> SessionFactsRequest {
         SessionFactsRequest {
             thread_id: ThreadId::from_str(THREAD).unwrap(),
@@ -2398,7 +2396,7 @@ mod tests {
         thread_id: &ThreadId,
         kind: FrozenBatchKind,
         batch_identity: &str,
-        observed_at: DateTime<Utc>,
+        observed_at: UtcTimestamp,
     ) -> PathBuf {
         let revisions = current_revisions();
         let source = source_generation(identity);
@@ -2435,7 +2433,7 @@ mod tests {
         identity: &SourceIdentity,
         thread_id: &ThreadId,
         profile: RedactionProfile,
-        observed_at: DateTime<Utc>,
+        observed_at: UtcTimestamp,
     ) -> PathBuf {
         let root = fact_index_root(
             identity_store,

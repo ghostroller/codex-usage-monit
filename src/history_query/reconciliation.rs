@@ -3,8 +3,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io;
 
-use chrono::{DateTime, Duration, TimeZone, Utc};
-
 use super::{
     DUPLICATE_SESSION_DEDUP_UNAVAILABLE_WARNING, DUPLICATE_SESSION_FACT_CONFLICT_WARNING,
     DUPLICATE_SESSION_MODEL_BREAKDOWN_PARTIAL, DUPLICATE_SESSION_PROJECT_BREAKDOWN_LOWER_BOUND,
@@ -24,6 +22,7 @@ use crate::source_history::{
 };
 use crate::source_identity::NodeId;
 use crate::source_model::ThreadId;
+use crate::time::{Duration, UtcTimestamp};
 
 pub(super) type LogicalThreadProjection = BTreeMap<(String, String), String>;
 
@@ -56,7 +55,7 @@ pub(super) struct BucketProjectResidual {
     call_count: u64,
 }
 
-pub(super) type SourceBucketIndex = HashMap<DateTime<Utc>, usize>;
+pub(super) type SourceBucketIndex = HashMap<UtcTimestamp, usize>;
 
 #[derive(Default)]
 pub(super) struct ReplicaBucketIndexWork {
@@ -64,7 +63,7 @@ pub(super) struct ReplicaBucketIndexWork {
     pub(super) fact_lookups: usize,
 }
 
-type ReplicaDigestKey = (ThreadId, DateTime<Utc>);
+type ReplicaDigestKey = (ThreadId, UtcTimestamp);
 type SourceReplicaDigestIndex = HashMap<ReplicaDigestKey, Vec<usize>>;
 type SourceThreadDigestIndex = HashMap<String, Vec<usize>>;
 
@@ -179,16 +178,12 @@ fn build_replica_evidence_index(
 #[derive(Default)]
 struct ObservedThreadSources {
     all: BTreeMap<String, BTreeSet<usize>>,
-    by_day: BTreeMap<(String, DateTime<Utc>), BTreeSet<usize>>,
-    opaque_by_day: BTreeMap<DateTime<Utc>, BTreeSet<usize>>,
+    by_day: BTreeMap<(String, UtcTimestamp), BTreeSet<usize>>,
+    opaque_by_day: BTreeMap<UtcTimestamp, BTreeSet<usize>>,
 }
 
-fn utc_day_start(timestamp: DateTime<Utc>) -> DateTime<Utc> {
-    timestamp
-        .date_naive()
-        .and_hms_opt(0, 0, 0)
-        .expect("midnight")
-        .and_utc()
+fn utc_day_start(timestamp: UtcTimestamp) -> UtcTimestamp {
+    timestamp.utc_day_start()
 }
 
 fn build_replica_thread_bucket_index(
@@ -735,8 +730,8 @@ fn thread_bucket_positions_in_range<'a>(
     source_index: usize,
     source: &SourceSlice,
     thread_id: &str,
-    range_start: DateTime<Utc>,
-    range_end: DateTime<Utc>,
+    range_start: UtcTimestamp,
+    range_end: UtcTimestamp,
 ) -> &'a [IndexedThreadBucket] {
     let Some(positions) = index.by_source[source_index].get(thread_id) else {
         return &[];
@@ -752,8 +747,8 @@ fn thread_bucket_positions_in_range<'a>(
 fn bucket_position_bounds_in_range(
     positions: &[usize],
     source: &SourceSlice,
-    range_start: DateTime<Utc>,
-    range_end: DateTime<Utc>,
+    range_start: UtcTimestamp,
+    range_end: UtcTimestamp,
 ) -> (usize, usize) {
     let start =
         positions.partition_point(|position| source.buckets[*position].starts_at < range_start);
@@ -793,7 +788,7 @@ pub(super) fn resolve_logical_replicas(
     slices: &mut [SourceSlice],
     evidence: &mut [SourceReplicaEvidence],
     project_mapping: &ProjectMappingProjection,
-    weekly_cycle_resets: &[DateTime<Utc>],
+    weekly_cycle_resets: &[UtcTimestamp],
     read_budget: &mut SourceHistoryReadBudget,
 ) -> io::Result<LogicalReplicaReport> {
     // Bucket project groups are an independent replica signal. In particular,
@@ -866,9 +861,8 @@ pub(super) fn resolve_logical_replicas(
     }
 
     let mut report = LogicalReplicaReport::default();
-    let mut touched = BTreeMap::<(usize, DateTime<Utc>), BucketProjectResidual>::new();
-    let mut handled_ranges =
-        BTreeMap::<(String, usize), Vec<(DateTime<Utc>, DateTime<Utc>)>>::new();
+    let mut touched = BTreeMap::<(usize, UtcTimestamp), BucketProjectResidual>::new();
+    let mut handled_ranges = BTreeMap::<(String, usize), Vec<(UtcTimestamp, UtcTimestamp)>>::new();
     for candidate in &candidates {
         let Some(resolution) =
             plan_replica_resolution(candidate, evidence, &evidence_index, project_mapping)?
@@ -1117,8 +1111,7 @@ pub(super) fn resolve_logical_replicas(
         let days = observed_thread_sources
             .by_day
             .range(
-                (thread_key.clone(), DateTime::<Utc>::MIN_UTC)
-                    ..=(thread_key.clone(), DateTime::<Utc>::MAX_UTC),
+                (thread_key.clone(), UtcTimestamp::MIN)..=(thread_key.clone(), UtcTimestamp::MAX),
             )
             .map(|((_, day), _)| *day)
             .chain(
@@ -1136,7 +1129,7 @@ pub(super) fn resolve_logical_replicas(
         for range_start in days {
             let range_end = range_start
                 .checked_add_signed(Duration::days(1))
-                .unwrap_or(DateTime::<Utc>::MAX_UTC);
+                .unwrap_or(UtcTimestamp::MAX);
             let mut source_indices = observed_thread_sources
                 .by_day
                 .get(&(thread_key.clone(), range_start))
@@ -1278,9 +1271,9 @@ fn ensure_authority_project_consistency(
     index: &mut ReplicaThreadBucketIndex,
     source_index: usize,
     source: &mut SourceSlice,
-    range_start: DateTime<Utc>,
-    range_end: DateTime<Utc>,
-    _touched: &mut BTreeMap<(usize, DateTime<Utc>), BucketProjectResidual>,
+    range_start: UtcTimestamp,
+    range_end: UtcTimestamp,
+    _touched: &mut BTreeMap<(usize, UtcTimestamp), BucketProjectResidual>,
 ) {
     let (start, end) = bucket_position_bounds_in_range(
         &index.opaque_positions[source_index],
@@ -1325,8 +1318,8 @@ fn source_has_thread_group_in_range(
     source_index: usize,
     source: &SourceSlice,
     thread_id: &ThreadId,
-    range_start: DateTime<Utc>,
-    range_end: DateTime<Utc>,
+    range_start: UtcTimestamp,
+    range_end: UtcTimestamp,
 ) -> bool {
     thread_bucket_positions_in_range(
         index,
@@ -1345,8 +1338,8 @@ fn choose_observed_thread_authority(
     source_indices: &BTreeSet<usize>,
     evidence: &[SourceReplicaEvidence],
     evidence_index: &ReplicaEvidenceIndex,
-    range_start: DateTime<Utc>,
-    range_end: DateTime<Utc>,
+    range_start: UtcTimestamp,
+    range_end: UtcTimestamp,
 ) -> usize {
     let mut digest_authority: Option<(usize, &SourceSessionDigest)> = None;
     for source_index in source_indices {
@@ -1386,15 +1379,12 @@ fn choose_observed_thread_authority(
     )
 }
 
-fn timestamp_in_ranges(
-    timestamp: DateTime<Utc>,
-    ranges: &[(DateTime<Utc>, DateTime<Utc>)],
-) -> bool {
+fn timestamp_in_ranges(timestamp: UtcTimestamp, ranges: &[(UtcTimestamp, UtcTimestamp)]) -> bool {
     let next = ranges.partition_point(|(range_start, _)| *range_start <= timestamp);
     next > 0 && timestamp < ranges[next - 1].1
 }
 
-fn normalize_time_ranges(ranges: &mut Vec<(DateTime<Utc>, DateTime<Utc>)>) {
+fn normalize_time_ranges(ranges: &mut Vec<(UtcTimestamp, UtcTimestamp)>) {
     ranges.sort_unstable_by_key(|(start, end)| (*start, *end));
     let mut output_len = 0_usize;
     for input in 0..ranges.len() {
@@ -1413,9 +1403,9 @@ fn source_has_unhandled_opaque_bucket(
     index: &ReplicaThreadBucketIndex,
     source_index: usize,
     source: &SourceSlice,
-    range_start: DateTime<Utc>,
-    range_end: DateTime<Utc>,
-    handled_ranges: &[(DateTime<Utc>, DateTime<Utc>)],
+    range_start: UtcTimestamp,
+    range_end: UtcTimestamp,
+    handled_ranges: &[(UtcTimestamp, UtcTimestamp)],
 ) -> bool {
     if index.active_opaque_counts[source_index] == 0 {
         return false;
@@ -1433,9 +1423,9 @@ fn source_has_unhandled_thread_group(
     source_index: usize,
     source: &SourceSlice,
     thread_id: &str,
-    range_start: DateTime<Utc>,
-    range_end: DateTime<Utc>,
-    handled_ranges: &[(DateTime<Utc>, DateTime<Utc>)],
+    range_start: UtcTimestamp,
+    range_end: UtcTimestamp,
+    handled_ranges: &[(UtcTimestamp, UtcTimestamp)],
 ) -> bool {
     thread_bucket_positions_in_range(
         index,
@@ -1460,9 +1450,9 @@ fn mark_unhandled_authority_lower_bound(
     source_index: usize,
     source: &mut SourceSlice,
     thread_id: &str,
-    range_start: DateTime<Utc>,
-    range_end: DateTime<Utc>,
-    handled_ranges: &[(DateTime<Utc>, DateTime<Utc>)],
+    range_start: UtcTimestamp,
+    range_end: UtcTimestamp,
+    handled_ranges: &[(UtcTimestamp, UtcTimestamp)],
 ) {
     let positions = thread_bucket_positions_in_range(
         index,
@@ -1488,7 +1478,7 @@ fn mark_unhandled_authority_lower_bound(
 
 pub(super) fn replace_weekly_baselines_with_cycle_markers(
     slices: &mut [SourceSlice],
-    canonical_resets: &[DateTime<Utc>],
+    canonical_resets: &[UtcTimestamp],
 ) {
     for source in slices.iter_mut() {
         source.weekly_local_points.clear();
@@ -1499,7 +1489,7 @@ pub(super) fn replace_weekly_baselines_with_cycle_markers(
     for &resets_at in canonical_resets {
         let observed_at = resets_at
             .checked_sub_signed(Duration::minutes(WEEKLY_WINDOW_MINUTES))
-            .unwrap_or(DateTime::<Utc>::MIN_UTC);
+            .unwrap_or(UtcTimestamp::MIN);
         marker_source.weekly_local_points.push(WeeklyLocalPoint {
             observed_at,
             resets_at,
@@ -1861,9 +1851,9 @@ fn remove_replica_groups(
     source_index: usize,
     source: &mut SourceSlice,
     thread_id: &ThreadId,
-    range_start: DateTime<Utc>,
-    range_end: DateTime<Utc>,
-    touched: &mut BTreeMap<(usize, DateTime<Utc>), BucketProjectResidual>,
+    range_start: UtcTimestamp,
+    range_end: UtcTimestamp,
+    touched: &mut BTreeMap<(usize, UtcTimestamp), BucketProjectResidual>,
 ) {
     let Some(positions) = index.by_source[source_index].get(thread_id.as_str()) else {
         return;
@@ -1907,9 +1897,9 @@ fn suppress_unbound_replica_range(
     source_index: usize,
     source: &mut SourceSlice,
     thread_id: &str,
-    range_start: DateTime<Utc>,
-    range_end: DateTime<Utc>,
-    touched: &mut BTreeMap<(usize, DateTime<Utc>), BucketProjectResidual>,
+    range_start: UtcTimestamp,
+    range_end: UtcTimestamp,
+    touched: &mut BTreeMap<(usize, UtcTimestamp), BucketProjectResidual>,
 ) {
     suppress_unbound_replica_buckets(
         index,
@@ -1930,10 +1920,10 @@ fn suppress_unbound_replica_outside_ranges(
     source_index: usize,
     source: &mut SourceSlice,
     thread_id: &str,
-    range_start: DateTime<Utc>,
-    range_end: DateTime<Utc>,
-    handled_ranges: &[(DateTime<Utc>, DateTime<Utc>)],
-    touched: &mut BTreeMap<(usize, DateTime<Utc>), BucketProjectResidual>,
+    range_start: UtcTimestamp,
+    range_end: UtcTimestamp,
+    handled_ranges: &[(UtcTimestamp, UtcTimestamp)],
+    touched: &mut BTreeMap<(usize, UtcTimestamp), BucketProjectResidual>,
 ) {
     suppress_unbound_replica_buckets(
         index,
@@ -1952,18 +1942,18 @@ fn suppress_unbound_replica_outside_ranges(
 #[derive(Clone, Copy)]
 enum ReplicaBucketSelection<'a> {
     Range {
-        start: DateTime<Utc>,
-        end: DateTime<Utc>,
+        start: UtcTimestamp,
+        end: UtcTimestamp,
     },
     Outside {
-        start: DateTime<Utc>,
-        end: DateTime<Utc>,
-        handled_ranges: &'a [(DateTime<Utc>, DateTime<Utc>)],
+        start: UtcTimestamp,
+        end: UtcTimestamp,
+        handled_ranges: &'a [(UtcTimestamp, UtcTimestamp)],
     },
 }
 
 impl ReplicaBucketSelection<'_> {
-    fn contains(self, timestamp: DateTime<Utc>) -> bool {
+    fn contains(self, timestamp: UtcTimestamp) -> bool {
         match self {
             Self::Range { start, end } => timestamp >= start && timestamp < end,
             Self::Outside {
@@ -2011,7 +2001,7 @@ fn suppress_unbound_replica_buckets(
     source: &mut SourceSlice,
     thread_id: &str,
     selection: ReplicaBucketSelection<'_>,
-    touched: &mut BTreeMap<(usize, DateTime<Utc>), BucketProjectResidual>,
+    touched: &mut BTreeMap<(usize, UtcTimestamp), BucketProjectResidual>,
 ) {
     if let Some(positions) = index.by_source[source_index].get(thread_id) {
         let (start, end) = selection.thread_bounds(positions, source);
@@ -2073,9 +2063,9 @@ fn preserve_unrelated_project_groups_in_replica_range(
     source_index: usize,
     source: &mut SourceSlice,
     thread_id: &ThreadId,
-    range_start: DateTime<Utc>,
-    range_end: DateTime<Utc>,
-    touched: &mut BTreeMap<(usize, DateTime<Utc>), BucketProjectResidual>,
+    range_start: UtcTimestamp,
+    range_end: UtcTimestamp,
+    touched: &mut BTreeMap<(usize, UtcTimestamp), BucketProjectResidual>,
 ) {
     suppress_unbound_replica_buckets(
         index,
@@ -2096,7 +2086,7 @@ fn preserve_unrelated_project_groups_in_bucket(
     source: &mut SourceSlice,
     bucket_position: usize,
     thread_id: &str,
-    touched: &mut BTreeMap<(usize, DateTime<Utc>), BucketProjectResidual>,
+    touched: &mut BTreeMap<(usize, UtcTimestamp), BucketProjectResidual>,
 ) {
     let residual = BucketProjectResidual {
         token_usage: TokenUsage::default(),
@@ -2124,7 +2114,7 @@ pub(super) fn add_fact_group(
     bucket_index: &mut SourceBucketIndex,
     fact: &UsageEventFact,
     metrics: &crate::source_history::SessionUsageMetrics,
-    touched: &mut BTreeMap<(usize, DateTime<Utc>), BucketProjectResidual>,
+    touched: &mut BTreeMap<(usize, UtcTimestamp), BucketProjectResidual>,
     work: &mut ReplicaBucketIndexWork,
 ) -> io::Result<usize> {
     let starts_at = quarter_hour_start(fact.occurred_at())?;
@@ -2211,9 +2201,9 @@ pub(super) fn add_fact_group(
     Ok(position)
 }
 
-fn quarter_hour_start(timestamp: DateTime<Utc>) -> io::Result<DateTime<Utc>> {
+fn quarter_hour_start(timestamp: UtcTimestamp) -> io::Result<UtcTimestamp> {
     let seconds = timestamp.timestamp().div_euclid(15 * 60) * 15 * 60;
-    Utc.timestamp_opt(seconds, 0).single().ok_or_else(|| {
+    UtcTimestamp::from_timestamp(seconds, 0).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             "session fact timestamp cannot be assigned to a history bucket",
@@ -2466,7 +2456,7 @@ mod budget_tests {
     use crate::source_history::SourceMetadata;
 
     fn indexed_bucket(
-        starts_at: DateTime<Utc>,
+        starts_at: UtcTimestamp,
         thread_id: &str,
         opaque: bool,
     ) -> LocalHalfHourBucket {
@@ -2528,7 +2518,7 @@ mod budget_tests {
 
     #[test]
     fn conservative_range_uses_only_target_and_opaque_bucket_indices() {
-        let base = Utc.with_ymd_and_hms(2026, 8, 1, 0, 0, 0).single().unwrap();
+        let base = UtcTimestamp::from_utc(2026, 8, 1, 0, 0, 0).unwrap();
         let target_position = 5_000_usize;
         let mut buckets = Vec::new();
         buckets.try_reserve(10_000).unwrap();
@@ -2619,7 +2609,7 @@ mod budget_tests {
     fn many_candidate_threads_in_one_bucket_compact_groups_once() {
         const GROUP_COUNT: usize = 4_096;
 
-        let starts_at = Utc.with_ymd_and_hms(2026, 8, 1, 0, 0, 0).single().unwrap();
+        let starts_at = UtcTimestamp::from_utc(2026, 8, 1, 0, 0, 0).unwrap();
         let mut bucket = indexed_bucket(starts_at, "thread-0", false);
         bucket.project_groups.clear();
         bucket.project_groups.try_reserve(GROUP_COUNT).unwrap();
@@ -2683,7 +2673,7 @@ mod budget_tests {
 
     #[test]
     fn handled_ranges_are_merged_for_binary_membership() {
-        let base = Utc.with_ymd_and_hms(2026, 8, 1, 0, 0, 0).single().unwrap();
+        let base = UtcTimestamp::from_utc(2026, 8, 1, 0, 0, 0).unwrap();
         let mut ranges = vec![
             (base + Duration::hours(2), base + Duration::hours(3)),
             (base, base + Duration::hours(2)),

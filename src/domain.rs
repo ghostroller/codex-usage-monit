@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+use crate::time::UtcTimestamp;
 
 mod u128_string {
     use super::{Deserialize, Deserializer, Serializer};
@@ -376,14 +377,14 @@ pub struct LimitWindow {
     pub used_percent: f64,
     pub remaining_percent: f64,
     pub window_duration_mins: Option<i64>,
-    pub resets_at: Option<DateTime<Utc>>,
+    pub resets_at: Option<UtcTimestamp>,
 }
 
 impl LimitWindow {
     pub fn new(
         used_percent: f64,
         window_duration_mins: Option<i64>,
-        resets_at: Option<DateTime<Utc>>,
+        resets_at: Option<UtcTimestamp>,
     ) -> Self {
         Self {
             used_percent,
@@ -419,7 +420,7 @@ pub struct RateLimitResetCreditsSnapshot {
     #[serde(default)]
     pub credits: Option<Vec<RateLimitResetCredit>>,
     pub provenance: Provenance,
-    pub as_of: DateTime<Utc>,
+    pub as_of: UtcTimestamp,
 }
 
 impl RateLimitResetCreditsSnapshot {
@@ -433,8 +434,8 @@ impl RateLimitResetCreditsSnapshot {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RateLimitResetCredit {
-    pub granted_at: DateTime<Utc>,
-    pub expires_at: Option<DateTime<Utc>>,
+    pub granted_at: UtcTimestamp,
+    pub expires_at: Option<UtcTimestamp>,
     /// Raw protocol value, preserved so future App Server variants remain visible.
     pub status: String,
     /// Raw protocol value, preserved so future App Server variants remain visible.
@@ -454,7 +455,7 @@ pub struct LimitBucket {
     pub credits: Option<CreditsSnapshot>,
     pub rate_limit_reached_type: Option<String>,
     pub provenance: Provenance,
-    pub as_of: DateTime<Utc>,
+    pub as_of: UtcTimestamp,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -487,8 +488,8 @@ pub struct TaskRecord {
     #[serde(default, with = "crate::exact_json::optional_pathbuf_lossy")]
     pub cwd: Option<PathBuf>,
     pub source: Option<String>,
-    pub created_at: Option<DateTime<Utc>>,
-    pub updated_at: Option<DateTime<Utc>>,
+    pub created_at: Option<UtcTimestamp>,
+    pub updated_at: Option<UtcTimestamp>,
     pub status: TaskStatus,
     pub status_provenance: Provenance,
     pub status_confidence: Confidence,
@@ -515,8 +516,8 @@ pub struct TurnRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<String>,
     pub message_preview: Option<String>,
-    pub started_at: Option<DateTime<Utc>>,
-    pub completed_at: Option<DateTime<Utc>>,
+    pub started_at: Option<UtcTimestamp>,
+    pub completed_at: Option<UtcTimestamp>,
     pub duration_ms: Option<u64>,
     pub status: TurnStatus,
     pub token_usage: TokenUsage,
@@ -553,9 +554,9 @@ pub struct AgentInteraction {
     pub child_thread_id: String,
     pub call_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub requested_at: Option<DateTime<Utc>>,
+    pub requested_at: Option<UtcTimestamp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub occurred_at: Option<DateTime<Utc>>,
+    pub occurred_at: Option<UtcTimestamp>,
     #[serde(default = "unknown_provenance")]
     pub provenance: Provenance,
 }
@@ -605,8 +606,8 @@ pub struct ModelUsage {
 pub struct WindowDescriptor {
     pub limit_id: String,
     pub label: String,
-    pub starts_at: DateTime<Utc>,
-    pub ends_at: DateTime<Utc>,
+    pub starts_at: UtcTimestamp,
+    pub ends_at: UtcTimestamp,
     pub used_percent: f64,
 }
 
@@ -701,7 +702,7 @@ pub struct WindowAnalysis {
 pub struct SourceStatus {
     pub source: String,
     pub status: String,
-    pub as_of: DateTime<Utc>,
+    pub as_of: UtcTimestamp,
     pub message: Option<String>,
 }
 
@@ -726,7 +727,7 @@ pub struct Snapshot {
     /// API-equivalent model-token total in the preferred current 5-hour window.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_equivalent_cost: Option<ApiEquivalentCost>,
-    pub as_of: DateTime<Utc>,
+    pub as_of: UtcTimestamp,
     pub partial: bool,
     #[serde(with = "crate::exact_json::pathbuf_lossy")]
     pub codex_home: PathBuf,
@@ -750,7 +751,7 @@ pub struct Snapshot {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct UsageCall {
-    pub timestamp: DateTime<Utc>,
+    pub timestamp: UtcTimestamp,
     pub thread_id: String,
     pub turn_id: Option<String>,
     /// Stable, source-path-independent identity of the underlying rollout
@@ -786,7 +787,7 @@ fn is_fast_service_tier(service_tier: Option<&str>) -> bool {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RateObservation {
-    pub timestamp: DateTime<Utc>,
+    pub timestamp: UtcTimestamp,
     pub thread_id: String,
     pub turn_id: Option<String>,
     pub limit_id: String,

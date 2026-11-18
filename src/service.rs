@@ -14,7 +14,6 @@ use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, anyhow, bail};
-use chrono::{DateTime, Utc};
 use quick_xml::Reader;
 use quick_xml::escape::unescape;
 use quick_xml::events::Event;
@@ -25,6 +24,7 @@ use crate::atomic_file::replace_file;
 use crate::history::HistoryStore;
 #[cfg(windows)]
 use crate::source_identity::validate_windows_private_file;
+use crate::time::UtcTimestamp;
 
 mod launchd_plist;
 mod recorder_coordination;
@@ -126,7 +126,7 @@ pub struct ServiceStatus {
     pub running: bool,
     #[serde(default, with = "crate::exact_json::optional_pathbuf_lossy")]
     pub registration_path: Option<PathBuf>,
-    pub last_history_heartbeat: Option<DateTime<Utc>>,
+    pub last_history_heartbeat: Option<UtcTimestamp>,
     /// Whether the latest recorder heartbeat is recent and belongs to the
     /// expected history namespace.
     #[serde(default)]
@@ -186,7 +186,7 @@ pub struct ServiceOptions {
 #[serde(rename_all = "camelCase")]
 struct RecorderCutoverBlocker {
     schema_version: u32,
-    blocked_at: DateTime<Utc>,
+    blocked_at: UtcTimestamp,
     platform: String,
     reason: String,
 }
@@ -483,7 +483,7 @@ fn persist_recorder_cutover_blocker(options: &ServiceOptions, reason: &str) -> R
     let path = coordination_root.join(RECORDER_CUTOVER_BLOCKER_FILE);
     let blocker = RecorderCutoverBlocker {
         schema_version: RECORDER_CUTOVER_BLOCKER_SCHEMA_VERSION,
-        blocked_at: Utc::now(),
+        blocked_at: UtcTimestamp::now(),
         platform: format!("{:?}", current_platform()).to_ascii_lowercase(),
         reason: reason.to_owned(),
     };
@@ -663,7 +663,7 @@ pub fn install(options: &ServiceOptions) -> Result<ServiceStatus> {
     let prepared = windows_host::prepare(options, true)?;
     let options = &prepared;
     validate_options(options)?;
-    let prepared_at = Utc::now();
+    let prepared_at = UtcTimestamp::now();
     let platform = current_platform();
     if platform == Platform::Unsupported {
         bail!(
@@ -936,7 +936,7 @@ fn prove_no_unmanaged_recorder(
     })?;
     if let Some(status) = previous_status.as_ref()
         && status.source_aware_v2_epoch().is_none()
-        && status.writer_may_be_active(Utc::now())
+        && status.writer_may_be_active(UtcTimestamp::now())
     {
         let last_activity = status.last_activity_at();
         bail!(
@@ -1017,7 +1017,7 @@ pub fn status(options: &ServiceOptions) -> Result<ServiceStatus> {
             .is_some_and(|status| !recorder_matches_service_definition(options, status));
     let heartbeat_recent = recorder
         .as_ref()
-        .is_some_and(|status| status.heartbeat_is_recent(Utc::now()))
+        .is_some_and(|status| status.heartbeat_is_recent(UtcTimestamp::now()))
         && namespace_mismatch.is_none()
         && !definition_mismatch;
     let mut service_status = match current_platform() {
@@ -2172,7 +2172,7 @@ fn launchd_print_reports_missing(detail: &str) -> bool {
 
 fn launchd_status(
     _options: &ServiceOptions,
-    heartbeat: Option<DateTime<Utc>>,
+    heartbeat: Option<UtcTimestamp>,
     heartbeat_running: bool,
 ) -> Result<ServiceStatus> {
     let path = launchd_registration_path()?;
@@ -2529,7 +2529,7 @@ fn cleanup_systemd_registration_at(
 
 fn systemd_status(
     _options: &ServiceOptions,
-    heartbeat: Option<DateTime<Utc>>,
+    heartbeat: Option<UtcTimestamp>,
     heartbeat_running: bool,
 ) -> Result<ServiceStatus> {
     let path = systemd_registration_path()?;
@@ -2718,7 +2718,7 @@ fn cleanup_windows_task_registration() -> Result<()> {
 
 fn windows_task_status(
     options: &ServiceOptions,
-    heartbeat: Option<DateTime<Utc>>,
+    heartbeat: Option<UtcTimestamp>,
     heartbeat_recent: bool,
 ) -> Result<ServiceStatus> {
     let user_sid = windows_current_user_sid()?;
@@ -2806,7 +2806,7 @@ $task=$service.GetFolder('\').GetTask($env:CODEX_USAGE_MONIT_TASK_NAME)
 
 fn windows_task_status_with(
     task_name: &str,
-    heartbeat: Option<DateTime<Utc>>,
+    heartbeat: Option<UtcTimestamp>,
     heartbeat_recent: bool,
     run: &mut impl FnMut(WindowsTaskOperation) -> Result<WindowsTaskOperationResult>,
 ) -> Result<ServiceStatus> {
@@ -3800,7 +3800,7 @@ fn service_status(
     installed: bool,
     running: bool,
     registration_path: Option<PathBuf>,
-    heartbeat: Option<DateTime<Utc>>,
+    heartbeat: Option<UtcTimestamp>,
     manager_reports_running: bool,
     heartbeat_recent: bool,
 ) -> ServiceStatus {
@@ -4012,7 +4012,7 @@ mod tests {
     use std::thread;
     use std::time::{Duration as StdDuration, Instant};
 
-    use chrono::{Duration, TimeZone};
+    use crate::time::Duration;
     use tempfile::tempdir;
 
     use super::*;
@@ -5006,7 +5006,7 @@ mod tests {
     #[test]
     fn windows_service_status_uses_scheduler_state_separately_from_heartbeat() {
         let task_name = r"\CodexUsageMonitRecorder-test";
-        let heartbeat = Utc.with_ymd_and_hms(2026, 8, 30, 12, 0, 0).unwrap();
+        let heartbeat = UtcTimestamp::from_utc(2026, 8, 30, 12, 0, 0).unwrap();
         let mut ready = |operation| {
             Ok(match operation {
                 WindowsTaskOperation::Disable { .. } => WindowsTaskOperationResult {
@@ -5406,7 +5406,7 @@ mod tests {
     fn windows_health_rejects_foreground_or_previous_registration_heartbeats() {
         let directory = tempdir().unwrap();
         let options = options(directory.path());
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         let mut heartbeat = RecorderStatusFile::started(now, expected_history_namespace(&options));
         heartbeat.record_success(now);
         heartbeat.bind_source_aware_v2(2).unwrap();
@@ -5434,7 +5434,7 @@ mod tests {
     fn status_file_round_trips_atomically_and_tracks_freshness() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("nested/recorder-status.json");
-        let now = Utc.with_ymd_and_hms(2026, 7, 28, 12, 0, 0).unwrap();
+        let now = UtcTimestamp::from_utc(2026, 7, 28, 12, 0, 0).unwrap();
         let mut status = RecorderStatusFile::started(now, "test-history".to_string());
         status.record_success(now + Duration::minutes(1));
         write_recorder_status(&path, &status).unwrap();
@@ -5474,7 +5474,7 @@ mod tests {
         let status_file = service_options.status_file.clone();
         write_recorder_status(
             &status_file,
-            &RecorderStatusFile::started(Utc::now(), "legacy-writer-fence".to_owned()),
+            &RecorderStatusFile::started(UtcTimestamp::now(), "legacy-writer-fence".to_owned()),
         )
         .unwrap();
         let install_called = std::cell::Cell::new(false);
@@ -5503,7 +5503,7 @@ mod tests {
         fs::write(&registration, b"old definition").unwrap();
         write_recorder_status(
             &service_options.status_file,
-            &RecorderStatusFile::started(Utc::now(), "legacy-writer-fence".to_owned()),
+            &RecorderStatusFile::started(UtcTimestamp::now(), "legacy-writer-fence".to_owned()),
         )
         .unwrap();
         let uninstall_completed = std::cell::Cell::new(false);
@@ -6220,7 +6220,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let service_options = options(directory.path());
         let status = RecorderStatusFile::started(
-            Utc::now() - Duration::minutes(13),
+            UtcTimestamp::now() - Duration::minutes(13),
             "legacy-recorder".to_owned(),
         );
         write_recorder_status(&service_options.status_file, &status).unwrap();
@@ -6245,7 +6245,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let service_options = options(directory.path());
         let mut status =
-            RecorderStatusFile::started(Utc::now(), "source-aware-recorder".to_owned());
+            RecorderStatusFile::started(UtcTimestamp::now(), "source-aware-recorder".to_owned());
         status.bind_source_aware_v2(2).unwrap();
         write_recorder_status(&service_options.status_file, &status).unwrap();
         let replacement_guard = std::cell::RefCell::new(None);
@@ -6289,7 +6289,8 @@ mod tests {
     fn missing_registration_preserves_a_recent_foreground_recorder_fence() {
         let directory = tempdir().unwrap();
         let service_options = options(directory.path());
-        let status = RecorderStatusFile::started(Utc::now(), "foreground-recorder".to_owned());
+        let status =
+            RecorderStatusFile::started(UtcTimestamp::now(), "foreground-recorder".to_owned());
         write_recorder_status(&service_options.status_file, &status).unwrap();
         let install_called = std::cell::Cell::new(false);
 
@@ -6314,7 +6315,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let service_options = options(directory.path());
         let mut status =
-            RecorderStatusFile::started(Utc::now(), "source-aware-recorder".to_owned());
+            RecorderStatusFile::started(UtcTimestamp::now(), "source-aware-recorder".to_owned());
         status.bind_source_aware_v2(2).unwrap();
         write_recorder_status(&service_options.status_file, &status).unwrap();
         let _foreground =
@@ -6345,7 +6346,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let service_options = options(directory.path());
         let mut status =
-            RecorderStatusFile::started(Utc::now(), "source-aware-recorder".to_owned());
+            RecorderStatusFile::started(UtcTimestamp::now(), "source-aware-recorder".to_owned());
         status.bind_source_aware_v2(2).unwrap();
         write_recorder_status(&service_options.status_file, &status).unwrap();
         let install_called = std::cell::Cell::new(false);
@@ -6370,7 +6371,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let service_options = options(directory.path());
         let mut status =
-            RecorderStatusFile::started(Utc::now(), "source-aware-recorder".to_owned());
+            RecorderStatusFile::started(UtcTimestamp::now(), "source-aware-recorder".to_owned());
         status.bind_source_aware_v2(2).unwrap();
         write_recorder_status(&service_options.status_file, &status).unwrap();
         let uninstall_completed = std::cell::Cell::new(false);
@@ -6394,7 +6395,7 @@ mod tests {
     fn status_file_v3_tracks_backend_quiescence_and_reads_v1_files() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("recorder-status.json");
-        let now = Utc.with_ymd_and_hms(2026, 7, 28, 12, 0, 0).unwrap();
+        let now = UtcTimestamp::from_utc(2026, 7, 28, 12, 0, 0).unwrap();
         let mut status =
             RecorderStatusFile::started_with_interval(now, "test-history".to_string(), 3_600);
         status.record_success(now);
@@ -6697,7 +6698,7 @@ mod tests {
 
     #[test]
     fn service_status_has_a_stable_round_trip_json_shape() {
-        let heartbeat = Utc.with_ymd_and_hms(2026, 8, 30, 12, 0, 0).unwrap();
+        let heartbeat = UtcTimestamp::from_utc(2026, 8, 30, 12, 0, 0).unwrap();
         let status = ServiceStatus {
             recorder: None,
             platform: "linux-systemd-user".to_string(),
@@ -6775,7 +6776,7 @@ mod tests {
 
     #[test]
     fn service_status_distinguishes_registration_and_heartbeat() {
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         let stopped = service_status("test", true, false, None, Some(now), false, true);
         assert_eq!(stopped.state, ServiceState::Stopped);
         assert!(stopped.detail.contains("manager is not active"));

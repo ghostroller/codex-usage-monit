@@ -6,14 +6,13 @@
 
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, Utc};
-
 use crate::domain::{ApiCostAmount, TokenUsage};
 use crate::source_history::{
     ActiveFactSet, SourceHistoryRemoteBinding, SourceSessionDigest, UsageEventFact,
 };
 use crate::source_identity::NodeId;
 use crate::source_model::ThreadId;
+use crate::time::UtcTimestamp;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ReplicaDigestObservation<'a> {
@@ -40,8 +39,8 @@ pub(crate) enum ExpectedReplicaFactBinding<'a> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ReplicaCandidate {
     thread_id: ThreadId,
-    range_start: DateTime<Utc>,
-    range_end: DateTime<Utc>,
+    range_start: UtcTimestamp,
+    range_end: UtcTimestamp,
     source_ids: Vec<NodeId>,
     kind: ReplicaCandidateKind,
 }
@@ -51,11 +50,11 @@ impl ReplicaCandidate {
         &self.thread_id
     }
 
-    pub fn range_start(&self) -> DateTime<Utc> {
+    pub fn range_start(&self) -> UtcTimestamp {
         self.range_start
     }
 
-    pub fn range_end(&self) -> DateTime<Utc> {
+    pub fn range_end(&self) -> UtcTimestamp {
         self.range_end
     }
 
@@ -77,7 +76,7 @@ pub(crate) fn detect_replica_candidates<'a>(
     observations: impl IntoIterator<Item = ReplicaDigestObservation<'a>>,
 ) -> Vec<ReplicaCandidate> {
     let mut by_key = BTreeMap::<
-        (ThreadId, DateTime<Utc>),
+        (ThreadId, UtcTimestamp),
         BTreeMap<String, (&NodeId, &SourceSessionDigest)>,
     >::new();
     for observation in observations {
@@ -249,7 +248,7 @@ mod tests {
     use std::num::NonZeroU64;
     use std::str::FromStr;
 
-    use chrono::{Duration, TimeZone};
+    use crate::time::Duration;
 
     use super::*;
     use crate::remote_protocol::SourceGeneration;
@@ -263,10 +262,8 @@ mod tests {
     const SOURCE_A: &str = "node-0123456789abcdef0123456789abcdef";
     const SOURCE_B: &str = "node-fedcba9876543210fedcba9876543210";
 
-    fn at(hour: u32) -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 8, 30, hour, 0, 0)
-            .single()
-            .unwrap()
+    fn at(hour: u32) -> UtcTimestamp {
+        UtcTimestamp::from_utc(2026, 8, 30, hour, 0, 0).unwrap()
     }
 
     fn digest(source: &NodeId, fingerprint: char) -> SourceSessionDigest {

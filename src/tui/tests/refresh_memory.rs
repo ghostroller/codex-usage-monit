@@ -9,7 +9,7 @@ fn local_rollout_fixture(directory: &Path) -> (CollectConfig, PathBuf) {
     let sessions = directory.join("sessions");
     fs::create_dir(&sessions).unwrap();
     let rollout = sessions.join("rollout-refresh-memory.jsonl");
-    let timestamp = (Utc::now() - ChronoDuration::minutes(2)).to_rfc3339();
+    let timestamp = (UtcTimestamp::now() - SignedDuration::minutes(2)).to_rfc3339();
     let records = [
         json!({"timestamp": timestamp, "type": "session_meta", "payload": {
             "id": RESUMABLE_THREAD_ID, "cwd": "/refresh-memory", "source": "cli"
@@ -88,7 +88,7 @@ fn account_refresh_copies_local_projection_once_and_does_not_rescan_rollouts() {
     let previous_metrics = cache.lock().unwrap().metrics();
     // A mistaken rollout scan would replace the cached task/turn projection.
     fs::write(rollout, "{}\n").unwrap();
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let account = AccountSnapshot {
         limits: vec![LimitBucket {
             limit_id: "codex".to_owned(),
@@ -97,7 +97,7 @@ fn account_refresh_copies_local_projection_once_and_does_not_rescan_rollouts() {
             primary: Some(LimitWindow::new(
                 25.0,
                 Some(300),
-                Some(now + ChronoDuration::hours(1)),
+                Some(now + SignedDuration::hours(1)),
             )),
             secondary: None,
             credits: None,

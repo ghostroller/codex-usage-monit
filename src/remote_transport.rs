@@ -2759,7 +2759,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     #[cfg(unix)]
-    use chrono::Utc;
+    use crate::time::UtcTimestamp;
 
     use super::*;
 
@@ -3196,7 +3196,7 @@ mod tests {
         let response_path = directory.path().join("response.frame");
         let script_path = fake_ssh_fixture(directory.path(), "fake-ssh");
         let descendant_pid_path = directory.path().join("normal-descendant.pid");
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         let response = RemoteProbeResponse {
             protocol_version: REMOTE_PROTOCOL_VERSION,
             server_version: env!("CARGO_PKG_VERSION").parse().unwrap(),
@@ -3338,7 +3338,7 @@ mod tests {
         let response_path = directory.path().join("response.frame");
         let ssh_path = bin.join("ssh");
         fake_ssh_fixture(&bin, "ssh-proxy-helper");
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         let response = RemoteProbeResponse {
             protocol_version: REMOTE_PROTOCOL_VERSION,
             server_version: env!("CARGO_PKG_VERSION").parse().unwrap(),
@@ -3389,7 +3389,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn generic_exchange_accepts_a_typed_delta_page() {
-        use chrono::Duration as ChronoDuration;
+        use crate::time::Duration as WallDuration;
 
         use crate::remote_agent::{current_accepted_revisions, current_revisions};
         use crate::remote_protocol::{
@@ -3400,13 +3400,13 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let response_path = directory.path().join("delta-response.frame");
         let script_path = fake_ssh_fixture(directory.path(), "fake-ssh-delta");
-        let observed_at = Utc::now();
+        let observed_at = UtcTimestamp::now();
         let source = SourceGeneration {
             node_id: "node-22222222222222222222222222222222".parse().unwrap(),
             generation: NonZeroU64::new(2).unwrap(),
         };
         let range = ExportRange {
-            from: observed_at - ChronoDuration::hours(1),
+            from: observed_at - WallDuration::hours(1),
             to: observed_at,
         };
         let request = RemoteExportRequest {

@@ -10,7 +10,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
-use chrono::{DateTime, TimeDelta, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::attribution::project_five_hour_analysis;
@@ -122,6 +121,7 @@ use crate::summary_report::{
     SummaryCoverageState, SummaryGrain, SummaryMetric, SummaryRange, SummaryReportQuery,
     build_summary_report, summary_history_backfill_needed,
 };
+use crate::time::{Duration as SignedDuration, UtcTimestamp};
 use crate::trace::{TraceFields, TraceLog, TraceOutcome};
 use crate::trends::{TrendsReport, build_trends_report};
 use crate::tui::Theme;
@@ -2119,7 +2119,7 @@ fn execute_remote_sync_at_state_root_with_transports(
     let health_store = RemoteSyncHealthStore::new(runtime.state_root().to_path_buf());
     let bandwidth_budget = RemoteBandwidthBudgetStore::new(runtime.state_root().to_path_buf());
     let health_ready = prepare_manual_remote_sync_health(&health_store, store);
-    let attempted_at = Utc::now();
+    let attempted_at = UtcTimestamp::now();
     let source = host.expected_source().cloned();
     let node_id = source.as_ref().map(|source| &source.node_id);
     let transfer_kind = if ignore_budget {
@@ -2137,7 +2137,7 @@ fn execute_remote_sync_at_state_root_with_transports(
                 .record_sync_error_for_config(
                     host.id(),
                     source.as_ref(),
-                    Utc::now(),
+                    UtcTimestamp::now(),
                     &error,
                     None,
                     selected.host(),
@@ -2157,7 +2157,7 @@ fn execute_remote_sync_at_state_root_with_transports(
     )? {
         RemoteBandwidthAdmission::Granted(reservation) => reservation,
         RemoteBandwidthAdmission::Paused(pause) => {
-            let completed_at = Utc::now();
+            let completed_at = UtcTimestamp::now();
             let health_write = if health_ready {
                 health_store
                     .record_pause(
@@ -2184,7 +2184,7 @@ fn execute_remote_sync_at_state_root_with_transports(
         .min(limits.max_response_bytes);
     let sync_result = prepared
         .admitted_attempt(transport, &bandwidth_budget, &reservation)
-        .execute(attempted_at, limits, Utc::now, || Ok(()));
+        .execute(attempted_at, limits, UtcTimestamp::now, || Ok(()));
     let report = match sync_result {
         Ok(report) => report,
         Err(RemoteAggregateAttemptError::Sync(error)) => {
@@ -2193,7 +2193,7 @@ fn execute_remote_sync_at_state_root_with_transports(
                     .record_sync_error_for_config(
                         host.id(),
                         source.as_ref(),
-                        Utc::now(),
+                        UtcTimestamp::now(),
                         &error,
                         None,
                         selected.host(),
@@ -2211,7 +2211,7 @@ fn execute_remote_sync_at_state_root_with_transports(
                     .record_failure(
                         host.id(),
                         source.as_ref(),
-                        Utc::now(),
+                        UtcTimestamp::now(),
                         RemoteSyncErrorCategory::LocalState,
                         None,
                     )
@@ -2232,7 +2232,7 @@ fn execute_remote_sync_at_state_root_with_transports(
     // Replica facts are a best-effort refinement after the aggregate page is
     // committed and charged. They receive a second admission so they cannot
     // consume bytes that the rolling host budget did not explicitly grant.
-    let fact_started_at = Utc::now();
+    let fact_started_at = UtcTimestamp::now();
     let (mut fact_followup, fact_reservation) =
         match prepare_replica_fact_followup(&selected, &runtime, &health_store, fact_started_at) {
             Err(attention) => (attention, None),
@@ -2286,7 +2286,7 @@ fn execute_remote_sync_at_state_root_with_transports(
                 }
             },
         };
-    let fact_completed_at = Utc::now();
+    let fact_completed_at = UtcTimestamp::now();
     let fact_process_containment =
         fact_followup.error_category() == Some(RemoteSyncErrorCategory::ProcessContainment);
     if fact_process_containment
@@ -2336,7 +2336,7 @@ fn execute_remote_sync_at_state_root_with_transports(
                 .record_failure(
                     host.id(),
                     source.as_ref(),
-                    Utc::now(),
+                    UtcTimestamp::now(),
                     RemoteSyncErrorCategory::LocalState,
                     None,
                 )
@@ -2352,7 +2352,7 @@ fn execute_remote_sync_at_state_root_with_transports(
             RemoteSyncAttemptFinalizeError::Metadata(error) => Err(anyhow::Error::new(error)),
         };
     }
-    let completed_at = Utc::now();
+    let completed_at = UtcTimestamp::now();
     let health_write = if health_ready {
         if fact_process_containment {
             source.as_ref().map_or_else(
@@ -2515,7 +2515,7 @@ fn reject_incompatible_recorder_before_cutover(
     let incompatible = incompatible_recorder_for_cutover(
         &status_path,
         runtime.namespace(),
-        Utc::now(),
+        UtcTimestamp::now(),
     )
     .map_err(|error| {
         anyhow::anyhow!(
@@ -3198,7 +3198,7 @@ fn run_remote_test(
                     history_dir,
                     &host,
                     source,
-                    Utc::now(),
+                    UtcTimestamp::now(),
                 );
                 if recorded.is_err() {
                     warn_remote_sync_health_persistence_failed();
@@ -3238,8 +3238,11 @@ fn run_remote_test(
         && probe.rollout_readable
         && missing_remote_sync_capabilities(&current_host, probe).is_empty();
     if ready {
-        let cleared =
-            clear_manual_remote_test_containment_pause(history_dir, &current_host, Utc::now());
+        let cleared = clear_manual_remote_test_containment_pause(
+            history_dir,
+            &current_host,
+            UtcTimestamp::now(),
+        );
         if cleared.is_err() {
             warn_remote_sync_health_persistence_failed();
         }
@@ -3251,7 +3254,7 @@ fn record_manual_remote_test_containment_pause(
     history_dir: Option<&Path>,
     host: &crate::remotes_config::RemoteHostConfig,
     source: &crate::remote_protocol::SourceGeneration,
-    observed_at: chrono::DateTime<Utc>,
+    observed_at: crate::time::UtcTimestamp,
 ) -> Result<()> {
     let state_root = remote_state_root(history_dir)?;
     RemoteSyncHealthStore::new(state_root)
@@ -3263,7 +3266,7 @@ fn record_manual_remote_test_containment_pause(
 fn clear_manual_remote_test_containment_pause(
     history_dir: Option<&Path>,
     host: &crate::remotes_config::RemoteHostConfig,
-    succeeded_at: chrono::DateTime<Utc>,
+    succeeded_at: crate::time::UtcTimestamp,
 ) -> Result<bool> {
     let state_root = remote_state_root(history_dir)?;
     RemoteSyncHealthStore::new(state_root)
@@ -3591,7 +3594,7 @@ fn apply_api_long_context_projection(snapshot: &mut crate::domain::Snapshot) {
 
 fn run_summary(config: &CollectConfig, args: SummaryArgs) -> Result<i32> {
     let result = collect_snapshot(config, None, true);
-    let mut query_now = Utc::now().max(result.snapshot.as_of);
+    let mut query_now = UtcTimestamp::now().max(result.snapshot.as_of);
     let mut request = prepare_report_history(config, &result, args.history_dir.map(absolute_path));
     let mut history = request.query(config, &args.source);
     let mut history_store = request.store;
@@ -3636,7 +3639,7 @@ fn run_summary(config: &CollectConfig, args: SummaryArgs) -> Result<i32> {
 
 fn run_trends(config: &CollectConfig, args: TrendsArgs) -> Result<i32> {
     let result = collect_snapshot(config, None, true);
-    let query_now = Utc::now().max(result.snapshot.as_of);
+    let query_now = UtcTimestamp::now().max(result.snapshot.as_of);
     let mut request = prepare_report_history(config, &result, args.history_dir.map(absolute_path));
     let history = request.query(config, &args.source);
     let report = build_trends_report(
@@ -3666,7 +3669,7 @@ fn run_health(
     trace_log: Option<&Path>,
 ) -> Result<i32> {
     let result = collect_snapshot(config, None, true);
-    let now = Utc::now().max(result.snapshot.as_of);
+    let now = UtcTimestamp::now().max(result.snapshot.as_of);
     let mut request = prepare_report_history(config, &result, args.history_dir.map(absolute_path));
     let history = request.query(config, &HistorySourceSelector::AllIncluded);
     let history_store = request.store;
@@ -4267,8 +4270,8 @@ fn persist_automatic_remote_sync_health(
                 host.sync_enabled() && host.expected_source() == Some(attempted_source)
             })
         }) {
-        let attempted_at = Utc::now();
-        let next_eligible_at = TimeDelta::from_std(*next_eligible_in)
+        let attempted_at = UtcTimestamp::now();
+        let next_eligible_at = SignedDuration::from_std(*next_eligible_in)
             .ok()
             .and_then(|delay| attempted_at.checked_add_signed(delay));
         let configured_host = before
@@ -4589,7 +4592,7 @@ impl RecorderLocalState {
     fn update_status(
         &self,
         status: &mut RecorderStatusFile,
-        attempt_at: DateTime<Utc>,
+        attempt_at: UtcTimestamp,
         remote_issue: Option<&str>,
     ) {
         match combine_recorder_diagnostics(self.issue.as_deref(), remote_issue) {
@@ -4716,7 +4719,7 @@ fn run_recorder(
             .min(args.account_interval_seconds)
     };
     let mut recorder_status = RecorderStatusFile::started_with_interval(
-        Utc::now(),
+        UtcTimestamp::now(),
         history_runtime.namespace().to_string(),
         heartbeat_interval_seconds,
     );
@@ -4750,7 +4753,7 @@ fn run_recorder(
         let account_due = !config.offline && now >= next_account;
         if local_due || account_due {
             if let Err(error) = history_profile_lease.validate() {
-                let failed_at = Utc::now();
+                let failed_at = UtcTimestamp::now();
                 recorder_status.record_error(
                     failed_at,
                     format!("history profile lease validation failed: {error}"),
@@ -4760,10 +4763,10 @@ fn run_recorder(
             }
             let history_attempted =
                 local_state.poll(&config, &history_runtime, &mut rollout_cache, account_due);
-            let attempt_at = Utc::now();
+            let attempt_at = UtcTimestamp::now();
             if history_attempted && let Err(error) = history_profile_lease.validate() {
                 recorder_status.record_error(
-                    Utc::now(),
+                    UtcTimestamp::now(),
                     format!("history profile lease changed during persistence: {error}"),
                 );
                 let _ = write_recorder_status(&status_file, &recorder_status);
@@ -4899,7 +4902,7 @@ fn reject_incompatible_recorder_before_recorder_cutover(
     status_paths: &[PathBuf],
     runtime: &HistoryRuntime,
 ) -> Result<()> {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     for status_path in status_paths {
         if let Some(status) = read_recorder_status(status_path).map_err(|error| {
             anyhow::anyhow!(
@@ -5565,7 +5568,7 @@ mod tests {
             let directory = tempfile::tempdir().unwrap();
             let (store, config) = paired_disabled_remote_config(directory.path());
             let host = config.host("dev").unwrap();
-            let now = Utc::now();
+            let now = UtcTimestamp::now();
             let mut source = host.expected_source().unwrap().clone();
             if failure == "identity" {
                 source.generation = std::num::NonZeroU64::new(99).unwrap();
@@ -5949,7 +5952,7 @@ mod tests {
         assert_eq!(health.changes_committed(), 4);
         assert_eq!(
             health.next_eligible_at().unwrap() - health.last_attempt_at().unwrap(),
-            TimeDelta::seconds(30)
+            SignedDuration::seconds(30)
         );
         assert_eq!(automatic_remote_sync_diagnostic(&diagnostic), None);
     }
@@ -6143,7 +6146,7 @@ mod tests {
             .unwrap();
         let state_root = directory.path().join("state");
         let budget = RemoteBandwidthBudgetStore::new(state_root.clone());
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         let RemoteBandwidthAdmission::Granted(reservation) = budget
             .begin_attempt(
                 "dev",
@@ -6228,7 +6231,7 @@ mod tests {
             .unwrap();
         let host = config.host("dev").unwrap();
         let source = host.expected_source().unwrap();
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         let health_store = RemoteSyncHealthStore::new(directory.path().join("state"));
         health_store
             .record_pause(
@@ -6454,7 +6457,7 @@ mod tests {
         let codex_home = temp.path().join("codex");
         let rollout_path = codex_home.join("sessions/rollout-recorder-retry.jsonl");
         fs::create_dir_all(rollout_path.parent().unwrap()).unwrap();
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         let session = serde_json::json!({
             "timestamp": now.to_rfc3339(),
             "type": "session_meta",
@@ -6509,7 +6512,7 @@ mod tests {
         fs::write(&layout, b"temporarily unavailable").unwrap();
         for seconds in [1, 2] {
             assert!(local.poll(&config, &runtime, &mut cache, false));
-            let attempt_at = now + TimeDelta::seconds(seconds);
+            let attempt_at = now + SignedDuration::seconds(seconds);
             local.update_status(&mut status, attempt_at, Some("remote failure"));
             assert!(local.history_pending);
             assert_eq!(status.last_attempt_at, attempt_at);
@@ -6531,13 +6534,13 @@ mod tests {
         fs::remove_file(&layout).unwrap();
         fs::rename(saved_layout, &layout).unwrap();
         assert!(local.poll(&config, &runtime, &mut cache, false));
-        let recovered_at = now + TimeDelta::seconds(3);
+        let recovered_at = now + SignedDuration::seconds(3);
         local.update_status(&mut status, recovered_at, None);
         assert!(!local.history_pending);
         assert_eq!(status.last_history_heartbeat, Some(recovered_at));
         assert!(status.last_error.is_none());
         let history = runtime
-            .load_unified_history_since(now - TimeDelta::hours(1))
+            .load_unified_history_since(now - SignedDuration::hours(1))
             .unwrap();
         assert_eq!(
             history
@@ -8126,7 +8129,7 @@ mod tests {
         let source = host.expected_source().unwrap();
         let state_root = directory.path().join("custom-state");
         let history_root = state_root.join("history-v1");
-        let observed_at = Utc::now();
+        let observed_at = UtcTimestamp::now();
 
         record_manual_remote_test_containment_pause(Some(&history_root), host, source, observed_at)
             .unwrap();
@@ -8143,7 +8146,7 @@ mod tests {
             clear_manual_remote_test_containment_pause(
                 Some(&history_root),
                 host,
-                observed_at + TimeDelta::seconds(1),
+                observed_at + SignedDuration::seconds(1),
             )
             .unwrap()
         );
@@ -8392,7 +8395,7 @@ mod tests {
         .unwrap();
         let source = paired.host("dev").unwrap().expected_source().unwrap();
         let budget = RemoteBandwidthBudgetStore::new(runtime.state_root().to_path_buf());
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         let reservation = match budget
             .begin_attempt(
                 "dev",
@@ -8666,7 +8669,7 @@ mod tests {
         let status_path = default_status_file(runtime.history_root());
         write_recorder_status(
             &status_path,
-            &RecorderStatusFile::started(Utc::now(), runtime.namespace().to_owned()),
+            &RecorderStatusFile::started(UtcTimestamp::now(), runtime.namespace().to_owned()),
         )
         .unwrap();
         assert!(matches!(
@@ -9428,12 +9431,12 @@ mod tests {
     fn expired_quota_series_counts_as_a_trends_observation() {
         use crate::trends::{TrendPoint, TrendReadoutValue};
 
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         let point = TrendPoint {
-            at: now - chrono::Duration::hours(1),
+            at: now - crate::time::Duration::hours(1),
             value: 50.0,
             readout_value: TrendReadoutValue::Percent(50.0),
-            sampled_at: Some(now - chrono::Duration::hours(1)),
+            sampled_at: Some(now - crate::time::Duration::hours(1)),
             interval: None,
             partial: false,
         };
@@ -9451,7 +9454,7 @@ mod tests {
             weekly_remaining_readout: None,
             weekly_tokens_readout: None,
             weekly_estimated_readout: None,
-            half_hour_bounds: [now - chrono::Duration::days(1), now],
+            half_hour_bounds: [now - crate::time::Duration::days(1), now],
             weekly_history_present: false,
             half_hour_history_present: false,
             history_warning_count: 0,
@@ -9680,9 +9683,7 @@ mod tests {
     }
 
     fn report_history_collection_result(account_provenance: Provenance) -> CollectionResult {
-        let now = DateTime::parse_from_rfc3339("2026-08-30T12:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
+        let now = UtcTimestamp::parse_from_rfc3339("2026-08-30T12:00:00Z").unwrap();
         let account_limit = LimitBucket {
             limit_id: "codex".to_string(),
             limit_name: Some("Codex".to_string()),
@@ -9700,13 +9701,13 @@ mod tests {
                 observed_at: now,
                 limit_id: "codex".to_string(),
                 duration_mins: 300,
-                resets_at: now + chrono::Duration::hours(5),
+                resets_at: now + crate::time::Duration::hours(5),
                 used_percent: 25.0,
                 remaining_percent: 75.0,
                 provenance: account_provenance,
             }],
             half_hour_buckets: vec![LocalHalfHourBucket {
-                starts_at: now - chrono::Duration::minutes(15),
+                starts_at: now - crate::time::Duration::minutes(15),
                 ends_at: now,
                 sampled_at: now,
                 token_usage: TokenUsage {
@@ -9726,7 +9727,7 @@ mod tests {
             }],
             weekly_local_points: vec![WeeklyLocalPoint {
                 observed_at: now,
-                resets_at: now + chrono::Duration::days(7),
+                resets_at: now + crate::time::Duration::days(7),
                 token_usage: TokenUsage {
                     total_tokens: 42,
                     ..TokenUsage::default()
@@ -10062,7 +10063,7 @@ mod tests {
             .to_owned();
         let hidden_v1_shard = history_root
             .join(namespace)
-            .join(format!("{}.json", result.snapshot.as_of.date_naive()));
+            .join(format!("{}.json", result.snapshot.as_of.utc_date()));
 
         let (_, history) = collect_and_load_report_history(&config, &result, Some(history_root));
 
@@ -10085,7 +10086,7 @@ mod tests {
         let active = runtime.ensure_v2_active().unwrap();
         let status_path = default_status_file(&history_root);
         let mut previous = RecorderStatusFile::started_with_interval(
-            Utc::now(),
+            UtcTimestamp::now(),
             runtime.namespace().to_owned(),
             600,
         );
@@ -10109,7 +10110,7 @@ mod tests {
         let active = runtime.ensure_v2_active().unwrap();
         let status_path = default_status_file(&history_root);
         let mut previous = RecorderStatusFile::started_with_interval(
-            Utc::now(),
+            UtcTimestamp::now(),
             format!("{}-redacted", runtime.profile_id().as_str()),
             600,
         );
@@ -10139,11 +10140,11 @@ mod tests {
         let default_path = default_status_file(&history_root);
         let custom_path = temp.path().join("custom-recorder-status.json");
         let mut legacy = RecorderStatusFile::started_with_interval(
-            Utc::now(),
+            UtcTimestamp::now(),
             runtime.namespace().to_owned(),
             600,
         );
-        legacy.record_success(Utc::now());
+        legacy.record_success(UtcTimestamp::now());
         write_recorder_status(&default_path, &legacy).unwrap();
 
         let error = reject_incompatible_recorder_before_recorder_cutover(
@@ -10176,7 +10177,7 @@ mod tests {
         let probe = HistoryStore::memory_only(&config.codex_home, false);
         let namespace_dir = history_root.join(probe.namespace());
         std::fs::create_dir_all(&namespace_dir).unwrap();
-        let shard_path = namespace_dir.join(format!("{}.json", result.snapshot.as_of.date_naive()));
+        let shard_path = namespace_dir.join(format!("{}.json", result.snapshot.as_of.utc_date()));
         let future = serde_json::to_vec(&serde_json::json!({
             "formatVersion": HISTORY_FORMAT_VERSION + 1,
             "namespace": probe.namespace(),
@@ -10224,9 +10225,9 @@ mod tests {
             let result = report_history_collection_result(Provenance::ServerSnapshot);
             let mut previous = result.history_observation.clone();
             let bucket = &mut previous.half_hour_buckets[0];
-            bucket.starts_at -= chrono::Duration::hours(1);
-            bucket.ends_at -= chrono::Duration::hours(1);
-            bucket.sampled_at -= chrono::Duration::hours(1);
+            bucket.starts_at -= crate::time::Duration::hours(1);
+            bucket.ends_at -= crate::time::Duration::hours(1);
+            bucket.sampled_at -= crate::time::Duration::hours(1);
             bucket.token_usage.total_tokens = 999;
             previous.quota_points.clear();
             previous.weekly_local_points.clear();
@@ -10238,7 +10239,7 @@ mod tests {
                 .to_owned();
             let shard = history_root.join(namespace).join(format!(
                 "{}.json",
-                previous.half_hour_buckets[0].starts_at.date_naive()
+                previous.half_hour_buckets[0].starts_at.utc_date()
             ));
             fs::create_dir_all(shard.parent().unwrap()).unwrap();
             fs::write(&shard, b"inert old history backup").unwrap();
@@ -10294,7 +10295,7 @@ mod tests {
             .to_owned();
         let hidden_v1_shard = history_root
             .join(namespace)
-            .join(format!("{}.json", result.snapshot.as_of.date_naive()));
+            .join(format!("{}.json", result.snapshot.as_of.utc_date()));
 
         let (store, history) =
             collect_and_load_report_history(&config, &result, Some(history_root));
@@ -10369,8 +10370,8 @@ mod tests {
                 window: Some(WindowDescriptor {
                     limit_id: "codex".to_string(),
                     label: "5h".to_string(),
-                    starts_at: now - chrono::Duration::hours(1),
-                    ends_at: now + chrono::Duration::hours(4),
+                    starts_at: now - crate::time::Duration::hours(1),
+                    ends_at: now + crate::time::Duration::hours(4),
                     used_percent: 25.0,
                 }),
                 proxy_projected_percent: estimated_quota_percent,

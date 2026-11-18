@@ -4,7 +4,6 @@ use std::thread;
 use std::time::Instant;
 
 use anyhow::{Result, anyhow};
-use chrono::{DateTime, Duration, Utc};
 
 use crate::api_cost::pricing_metadata;
 use crate::app_server::{app_server_failure_kind, fetch_account_snapshot_as_of};
@@ -19,6 +18,7 @@ use crate::history::HistoryObservation;
 use crate::perf::{RefreshMetrics, RefreshStageMetrics};
 use crate::rollout::{RolloutCache, RolloutCacheMetrics, RolloutCacheRefresh, scan_rollouts};
 use crate::source_export::{LocalSessionDigestEvidence, materialize_local_session_digest_evidence};
+use crate::time::{Duration, UtcTimestamp};
 use crate::trace::{TraceFields, TraceOutcome};
 
 const RESET_CREDIT_DETAILS_CACHE_TTL_MINUTES: i64 = 5;
@@ -41,7 +41,7 @@ struct LocalCollection {
     source: Option<SourceStatus>,
     error: Option<String>,
     unchanged: bool,
-    local_coverage_starts_at: Option<DateTime<Utc>>,
+    local_coverage_starts_at: Option<UtcTimestamp>,
     rollout_refresh: Option<RolloutCacheRefresh>,
     rollout_metrics: Option<RolloutCacheMetrics>,
 }
@@ -101,8 +101,8 @@ impl SnapshotCollectionPolicy<'_> {
 
 fn next_account_evidence_boundary(
     account: Option<&AccountSnapshot>,
-    now: DateTime<Utc>,
-) -> Option<DateTime<Utc>> {
+    now: UtcTimestamp,
+) -> Option<UtcTimestamp> {
     let account = account?;
     account
         .limits
@@ -143,9 +143,9 @@ where
 
 fn collect_local_source(
     config: &CollectConfig,
-    now: DateTime<Utc>,
+    now: UtcTimestamp,
     policy: &mut SnapshotCollectionPolicy<'_>,
-    next_external_boundary: Option<DateTime<Utc>>,
+    next_external_boundary: Option<UtcTimestamp>,
 ) -> LocalCollection {
     let span = config.startup_trace.span("snapshot.local_scan");
     let scan_result = match policy {
@@ -286,7 +286,7 @@ fn collect_local_source(
     collection
 }
 
-fn fetch_account_source(config: &CollectConfig, as_of: DateTime<Utc>) -> AccountCollection {
+fn fetch_account_source(config: &CollectConfig, as_of: UtcTimestamp) -> AccountCollection {
     let perf_started = config.perf_log.is_enabled().then(Instant::now);
     let span = config.startup_trace.span("snapshot.account_fetch");
     let result = fetch_account_snapshot_as_of(config, as_of);
@@ -709,7 +709,7 @@ fn collect_snapshot_with_local(
     let scan_local = policy.scans_local();
     let total_started = config.startup_trace.is_active().then(Instant::now);
     let perf_started = config.perf_log.is_enabled().then(Instant::now);
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let next_external_boundary = next_account_evidence_boundary(cached_account.as_ref(), now);
     let mut sources = Vec::new();
     let mut warnings = Vec::new();
@@ -1279,12 +1279,12 @@ fn saturating_u64(value: usize) -> u64 {
 fn mark_incomplete_window_coverage(
     warnings: &mut Vec<String>,
     analyses: &mut [WindowAnalysis],
-    now: DateTime<Utc>,
+    now: UtcTimestamp,
     lookback_days: i64,
 ) {
     let cutoff = Duration::try_days(lookback_days.max(0))
         .and_then(|lookback| now.checked_sub_signed(lookback))
-        .unwrap_or(DateTime::<Utc>::MIN_UTC);
+        .unwrap_or(UtcTimestamp::MIN);
     let mut incomplete = Vec::new();
     for analysis in analyses {
         let Some(window) = analysis.attribution.window.as_ref() else {
@@ -1317,7 +1317,7 @@ fn mark_analysis_partial(analysis: &mut WindowAnalysis, reason: &str) {
 fn preserve_cached_account_data(
     fresh: &mut AccountSnapshot,
     cached: &AccountSnapshot,
-    now: DateTime<Utc>,
+    now: UtcTimestamp,
 ) {
     let limits_refresh_failed = fresh.limits.is_empty() && !fresh.errors.is_empty();
     let reset_credits_refresh_failed =
@@ -1340,7 +1340,7 @@ fn preserve_cached_account_data(
 fn preserve_omitted_reset_credits(
     fresh: &mut AccountSnapshot,
     cached: &AccountSnapshot,
-    as_of: DateTime<Utc>,
+    as_of: UtcTimestamp,
 ) {
     let Some(cached_reset_credits) = &cached.rate_limit_reset_credits else {
         return;
@@ -1351,7 +1351,7 @@ fn preserve_omitted_reset_credits(
 
 fn reset_credits_for_failed_refresh(
     cached: &RateLimitResetCreditsSnapshot,
-    as_of: DateTime<Utc>,
+    as_of: UtcTimestamp,
 ) -> Option<RateLimitResetCreditsSnapshot> {
     if cached.as_of > as_of {
         let mut preserved = cached.clone();
@@ -1367,7 +1367,7 @@ fn reset_credits_for_failed_refresh(
 
 fn unexpired_cached_reset_credit_details(
     cached: &RateLimitResetCreditsSnapshot,
-    as_of: DateTime<Utc>,
+    as_of: UtcTimestamp,
 ) -> Option<Vec<RateLimitResetCredit>> {
     if cached.available_count == 0 {
         return None;
@@ -1399,7 +1399,7 @@ fn mark_limits_stale(limits: &mut [LimitBucket]) {
     }
 }
 
-fn mark_account_data_stale(account: &mut AccountSnapshot, now: DateTime<Utc>) {
+fn mark_account_data_stale(account: &mut AccountSnapshot, now: UtcTimestamp) {
     mark_limits_stale(&mut account.limits);
     let reset_credits = account
         .rate_limit_reset_credits
@@ -1412,7 +1412,7 @@ fn mark_account_data_stale(account: &mut AccountSnapshot, now: DateTime<Utc>) {
 fn quota_sources_disagree(
     observations: &[RateObservation],
     limits: &[LimitBucket],
-    now: DateTime<Utc>,
+    now: UtcTimestamp,
 ) -> bool {
     limits
         .iter()
@@ -1459,7 +1459,7 @@ fn same_quota_window(left: &LimitWindow, right: &LimitWindow) -> bool {
 fn merge_account_observations(
     account: &mut AccountSnapshot,
     mut previous: Vec<RateObservation>,
-    now: DateTime<Utc>,
+    now: UtcTimestamp,
 ) {
     previous.extend(account.limits.iter().map(|bucket| RateObservation {
         timestamp: bucket.as_of,
@@ -1485,7 +1485,7 @@ fn merge_account_observations(
     account.rate_observations = previous;
 }
 
-fn fallback_limits(dataset: &RolloutDataset, now: DateTime<Utc>) -> Vec<LimitBucket> {
+fn fallback_limits(dataset: &RolloutDataset, now: UtcTimestamp) -> Vec<LimitBucket> {
     let mut latest_by_bucket: BTreeMap<String, &RateObservation> = BTreeMap::new();
     for observation in dataset
         .rate_observations
@@ -1564,7 +1564,9 @@ mod tests {
         let sessions = temp.path().join("sessions");
         std::fs::create_dir_all(&sessions).unwrap();
         // Freeze the scan clock away from coverage and freshness boundaries.
-        let now = DateTime::from_timestamp(Utc::now().timestamp().div_euclid(60) * 60, 0).unwrap();
+        let now =
+            UtcTimestamp::from_timestamp(UtcTimestamp::now().timestamp().div_euclid(60) * 60, 0)
+                .unwrap();
         let path = sessions.join("rollout-policy.jsonl");
         let initial = format!(
             "{}\n",
@@ -1709,7 +1711,7 @@ mod tests {
         let mut local = collect_snapshot_cached(&config, None, false, &mut cache).snapshot;
         local.stats.parsed_lines = 42;
         local.warnings.push("local rollout warning".to_string());
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         let account = AccountSnapshot {
             limits: vec![weekly_limit(
                 now - Duration::seconds(1),
@@ -1747,7 +1749,7 @@ mod tests {
 
     #[test]
     fn account_only_refresh_rescales_cached_window_without_losing_local_usage() {
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         let reset = now + Duration::days(2);
         let old_limit = weekly_limit(now, reset, "codex", 20.0);
         let calls = vec![usage_call(
@@ -1789,7 +1791,7 @@ mod tests {
             offline: true,
             ..CollectConfig::default()
         };
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         let reset = now + Duration::hours(2);
         let mut calls = vec![
             usage_call(
@@ -1899,7 +1901,7 @@ mod tests {
             offline: true,
             ..CollectConfig::default()
         };
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         let old_reset = now + Duration::days(2);
         let old_limit = weekly_limit(now, old_reset, "codex", 20.0);
         let calls = vec![usage_call(
@@ -1941,7 +1943,7 @@ mod tests {
             offline: true,
             ..CollectConfig::default()
         };
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         let reset = now + Duration::hours(2);
         let calls = vec![usage_call(
             now - Duration::minutes(1),
@@ -1953,7 +1955,7 @@ mod tests {
         let mut cache = RolloutCache::new();
         let empty = collect_snapshot_cached(&config, None, false, &mut cache).snapshot;
 
-        for (duration_mins, invalid_reset) in [(300, DateTime::<Utc>::MIN_UTC), (i64::MAX, reset)] {
+        for (duration_mins, invalid_reset) in [(300, UtcTimestamp::MIN), (i64::MAX, reset)] {
             let mut local = empty.clone();
             local.limits = vec![weekly_limit(now, reset, "codex", 20.0)];
             local.window_analyses = analyze_windows(&[], &[], &calls, &[], &local.limits, now);
@@ -2016,8 +2018,8 @@ mod tests {
     }
 
     fn weekly_limit(
-        now: DateTime<Utc>,
-        reset: DateTime<Utc>,
+        now: UtcTimestamp,
+        reset: UtcTimestamp,
         limit_id: &str,
         used_percent: f64,
     ) -> LimitBucket {
@@ -2035,7 +2037,7 @@ mod tests {
     }
 
     fn usage_call(
-        timestamp: DateTime<Utc>,
+        timestamp: UtcTimestamp,
         thread_id: &str,
         turn_id: &str,
         model: &str,
@@ -2059,8 +2061,8 @@ mod tests {
     }
 
     fn reset_credit(
-        granted_at: DateTime<Utc>,
-        expires_at: Option<DateTime<Utc>>,
+        granted_at: UtcTimestamp,
+        expires_at: Option<UtcTimestamp>,
     ) -> RateLimitResetCredit {
         RateLimitResetCredit {
             granted_at,
@@ -2081,7 +2083,7 @@ mod tests {
 
     #[test]
     fn failed_fresh_fields_preserve_cached_data_as_stale() {
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         let cached_credit = reset_credit(now - Duration::hours(1), Some(now + Duration::days(30)));
         let cached = AccountSnapshot {
             limits: vec![LimitBucket {
@@ -2204,7 +2206,7 @@ mod tests {
 
     #[test]
     fn fresh_count_only_reset_credits_do_not_reuse_cached_details() {
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         let cached = AccountSnapshot {
             rate_limit_reset_credits: Some(RateLimitResetCreditsSnapshot {
                 available_count: 1,
@@ -2238,7 +2240,7 @@ mod tests {
 
     #[test]
     fn repeated_count_only_refreshes_keep_each_fresh_server_timestamp() {
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         let cached = AccountSnapshot {
             rate_limit_reset_credits: Some(RateLimitResetCreditsSnapshot {
                 available_count: 1,
@@ -2300,7 +2302,7 @@ mod tests {
 
     #[test]
     fn cached_reset_credit_details_expire_after_the_short_ttl() {
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         let cached = AccountSnapshot {
             rate_limit_reset_credits: Some(RateLimitResetCreditsSnapshot {
                 available_count: 1,
@@ -2361,7 +2363,7 @@ mod tests {
 
     #[test]
     fn cached_reset_credit_details_are_not_preserved_when_fresh_count_changes_or_is_zero() {
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         let cached = AccountSnapshot {
             rate_limit_reset_credits: Some(RateLimitResetCreditsSnapshot {
                 available_count: 2,
@@ -2395,7 +2397,7 @@ mod tests {
 
     #[test]
     fn expired_cached_reset_credit_details_are_not_preserved() {
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         let cached = AccountSnapshot {
             rate_limit_reset_credits: Some(RateLimitResetCreditsSnapshot {
                 available_count: 1,
@@ -2423,7 +2425,7 @@ mod tests {
 
     #[test]
     fn repeated_account_fetch_timeouts_drop_reset_details_past_the_ttl() {
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         let cached_credit = reset_credit(now - Duration::days(1), Some(now + Duration::days(1)));
         let mut account = AccountSnapshot {
             rate_limit_reset_credits: Some(RateLimitResetCreditsSnapshot {
@@ -2454,7 +2456,7 @@ mod tests {
 
     #[test]
     fn future_reset_credits_survive_failed_refresh_for_clock_recovery() {
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         let observed_at = now + Duration::hours(1);
         let cached_credit = reset_credit(observed_at, Some(observed_at + Duration::days(1)));
         let cached = AccountSnapshot {
@@ -2496,7 +2498,7 @@ mod tests {
 
     #[test]
     fn failed_limits_refresh_does_not_preserve_expired_reset_details() {
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         let cached = AccountSnapshot {
             limits: vec![weekly_limit(
                 now - Duration::minutes(1),
@@ -2527,7 +2529,7 @@ mod tests {
 
     #[test]
     fn cached_reset_credits_flow_into_the_final_snapshot() {
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         let cached_credit = reset_credit(now - Duration::hours(1), None);
         let cached = AccountSnapshot {
             rate_limit_reset_credits: Some(RateLimitResetCreditsSnapshot {
@@ -2553,7 +2555,7 @@ mod tests {
 
     #[test]
     fn cached_reset_credits_without_limits_are_still_a_cached_account_source() {
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         let cached = AccountSnapshot {
             rate_limit_reset_credits: Some(RateLimitResetCreditsSnapshot {
                 available_count: 1,
@@ -2579,7 +2581,7 @@ mod tests {
 
     #[test]
     fn rollout_fallback_keeps_the_latest_observation_for_each_bucket() {
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         let observation = |limit_id: &str, minutes_ago: i64, used_percent: f64| RateObservation {
             timestamp: now - Duration::minutes(minutes_ago),
             thread_id: "thread".to_string(),
@@ -2624,9 +2626,9 @@ mod tests {
 
     #[test]
     fn rollout_fallback_ignores_observations_after_as_of() {
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         let observation =
-            |limit_id: &str, timestamp: DateTime<Utc>, used_percent: f64| RateObservation {
+            |limit_id: &str, timestamp: UtcTimestamp, used_percent: f64| RateObservation {
                 timestamp,
                 thread_id: "thread".to_string(),
                 turn_id: None,
@@ -2658,7 +2660,7 @@ mod tests {
 
     #[test]
     fn cached_account_limits_after_as_of_stay_cached_but_not_visible() {
-        let observed_at = Utc::now();
+        let observed_at = UtcTimestamp::now();
         let current = weekly_limit(
             observed_at - Duration::minutes(1),
             observed_at + Duration::days(2),
@@ -2741,7 +2743,7 @@ mod tests {
 
     #[test]
     fn account_evidence_boundary_tracks_the_earliest_future_sample() {
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         let reset_boundary = now + Duration::minutes(1);
         let limit_boundary = now + Duration::minutes(2);
         let account = AccountSnapshot {
@@ -2783,7 +2785,7 @@ mod tests {
             let mut source = SourceStatus {
                 source: "app_server".to_string(),
                 status: account_status.to_string(),
-                as_of: Utc::now(),
+                as_of: UtcTimestamp::now(),
                 message: None,
             };
 
@@ -2801,7 +2803,7 @@ mod tests {
 
     #[test]
     fn quota_disagreement_ignores_future_observations_at_clock_rollback_boundary() {
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         let reset = now + Duration::hours(2);
         let limits = vec![LimitBucket {
             limit_id: "codex".to_string(),
@@ -2814,7 +2816,7 @@ mod tests {
             provenance: Provenance::ServerSnapshot,
             as_of: now,
         }];
-        let observation = |timestamp: DateTime<Utc>, used_percent: f64| RateObservation {
+        let observation = |timestamp: UtcTimestamp, used_percent: f64| RateObservation {
             timestamp,
             thread_id: "thread".to_string(),
             turn_id: None,
@@ -2841,7 +2843,7 @@ mod tests {
 
     #[test]
     fn codex_gauge_estimate_is_immediate_and_survives_partial_markers() {
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         let reset = now + Duration::days(2);
         let limits = vec![weekly_limit(now, reset, "codex", 40.0)];
         let calls = vec![
@@ -2897,7 +2899,7 @@ mod tests {
 
     #[test]
     fn spark_calls_and_bengalfox_bucket_do_not_enter_codex_estimates() {
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         let reset = now + Duration::days(2);
         let limits = vec![
             weekly_limit(now, reset, "codex", 34.0),
@@ -2959,7 +2961,7 @@ mod tests {
     }
     #[test]
     fn short_rollout_lookback_marks_weekly_cycle_coverage_incomplete() {
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         let limits = vec![LimitBucket {
             limit_id: "codex".to_string(),
             limit_name: None,

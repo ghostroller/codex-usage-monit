@@ -7,8 +7,6 @@
 
 use std::io;
 
-use chrono::{DateTime, Utc};
-
 use crate::history_profile_lease::HistoryProfileLeaseGuard;
 use crate::history_runtime::HistoryRuntime;
 use crate::remote_bandwidth_budget::{
@@ -23,6 +21,7 @@ use crate::remote_sync::{
     build_remote_delta_ingest_binding, preflight_remote_delta_position, sync_remote_delta_bounded,
 };
 use crate::remotes_config::RemotesConfigStore;
+use crate::time::UtcTimestamp;
 
 /// Binds local recovery and bandwidth admission to one selected host/runtime.
 /// Callers first establish their own profile/cutover/host leases and metadata.
@@ -59,7 +58,7 @@ impl<'a> PreparedRemoteAggregateLocal<'a> {
     /// sync choose its existing bulk/incremental admission policy.
     pub(crate) fn preflight(
         &mut self,
-        observed_at: DateTime<Utc>,
+        observed_at: UtcTimestamp,
     ) -> Result<RemoteDeltaNextRequestPosition, RemoteSyncError> {
         preflight_remote_delta_position(
             self.config_store,
@@ -75,7 +74,7 @@ impl<'a> PreparedRemoteAggregateLocal<'a> {
     pub(crate) fn begin_budget_attempt(
         &self,
         budget: &RemoteBandwidthBudgetStore,
-        attempted_at: DateTime<Utc>,
+        attempted_at: UtcTimestamp,
         kind: RemoteBandwidthTransferKind,
         limits: RemoteSyncLimits,
     ) -> io::Result<RemoteBandwidthAdmission> {
@@ -140,9 +139,9 @@ where
     /// additional automatic-eligibility check.
     pub(crate) fn execute(
         self,
-        attempted_at: DateTime<Utc>,
+        attempted_at: UtcTimestamp,
         limits: RemoteSyncLimits,
-        completed_at: impl FnOnce() -> DateTime<Utc>,
+        completed_at: impl FnOnce() -> UtcTimestamp,
         after_settlement: impl FnOnce() -> Result<(), RemoteSyncError>,
     ) -> Result<RemoteSyncReport, RemoteAggregateAttemptError> {
         let report = match sync_remote_delta_bounded(
@@ -159,7 +158,7 @@ where
                 if remote_sync_error_proves_transport_not_started(&error) {
                     let _ = self.bandwidth_budget.cancel_attempt(
                         self.reservation,
-                        Utc::now().max(self.reservation.started_at()),
+                        UtcTimestamp::now().max(self.reservation.started_at()),
                     );
                 }
                 return Err(RemoteAggregateAttemptError::Sync(error));
@@ -181,7 +180,7 @@ pub(crate) fn settle_successful_remote_aggregate(
     bandwidth_budget: &RemoteBandwidthBudgetStore,
     reservation: &RemoteBandwidthReservation,
     report: &RemoteSyncReport,
-    completed_at: DateTime<Utc>,
+    completed_at: UtcTimestamp,
     after_settlement: impl FnOnce() -> Result<(), RemoteSyncError>,
 ) -> Result<(), RemoteAggregateAttemptError> {
     bandwidth_budget

@@ -14,7 +14,6 @@ use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::time::{Duration as StdDuration, SystemTime};
 
-use chrono::{DateTime, Duration, Utc};
 use walkdir::WalkDir;
 
 use crate::config::CollectConfig;
@@ -41,6 +40,7 @@ use crate::source_export::{
 };
 use crate::source_history::RedactionProfile;
 use crate::source_identity::{SourceIdentity, SourceIdentityStore};
+use crate::time::{Duration, UtcTimestamp};
 
 const MAX_DURABLE_PAGE_ENTRIES: usize = 4_096;
 const MAX_DURABLE_PAGE_BYTES: u64 = 8 * 1024 * 1024;
@@ -70,7 +70,7 @@ pub struct PreparedRemoteDeltaPage {
 }
 
 impl PreparedRemoteDeltaPage {
-    pub fn observed_at(&self) -> DateTime<Utc> {
+    pub fn observed_at(&self) -> UtcTimestamp {
         self.inputs.observed_at
     }
 
@@ -168,7 +168,7 @@ pub fn prepare_remote_delta_page(
     revisions: &ProtocolRevisions,
     redaction_profile: RedactionProfile,
     request: &DeltaRequest,
-    observed_at: DateTime<Utc>,
+    observed_at: UtcTimestamp,
 ) -> Result<PreparedRemoteDeltaPage, RemoteDeltaPrepareError> {
     let source = source_generation(identity);
     let state_root = revision_bound_state_root(identity_store, revisions)
@@ -400,13 +400,13 @@ pub fn prepare_remote_delta_page(
 /// counts are carried as explicit live quality evidence.
 fn window_live_snapshot(
     mut materialized: MaterializedLiveSnapshot,
-    observed_at: DateTime<Utc>,
+    observed_at: UtcTimestamp,
 ) -> (MaterializedLiveSnapshot, usize, usize) {
     let original_tasks = materialized.snapshot.tasks.len();
     let original_turns = materialized.snapshot.turns.len();
     let cutoff = observed_at
         .checked_sub_signed(Duration::hours(LIVE_SNAPSHOT_LOOKBACK_HOURS))
-        .unwrap_or(DateTime::<Utc>::MIN_UTC);
+        .unwrap_or(UtcTimestamp::MIN);
 
     materialized.snapshot.tasks.retain(|task| {
         matches!(
@@ -458,7 +458,7 @@ fn pending_journal_page_inputs(
     revisions: &ProtocolRevisions,
     redaction_profile: RedactionProfile,
     request: &DeltaRequest,
-    observed_at: DateTime<Utc>,
+    observed_at: UtcTimestamp,
     live: Option<RemoteExportLivePage>,
 ) -> RemoteDeltaJournalPageInputs {
     let (live_state, live_project_descriptors, mut partial_reasons, warnings) = live
@@ -1173,7 +1173,7 @@ mod tests {
     use std::num::{NonZeroU32, NonZeroU64};
     use std::time::Duration as StdDuration;
 
-    use chrono::{Duration, TimeZone};
+    use crate::time::Duration;
     use serde_json::json;
 
     use super::*;
@@ -1182,13 +1182,11 @@ mod tests {
         ExportRange, RemoteLiveSnapshot, RemoteLiveTask, RemoteLiveTurn, RemoteTokenUsage,
     };
 
-    fn at(hour: u32, minute: u32) -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 8, 30, hour, minute, 0)
-            .single()
-            .unwrap()
+    fn at(hour: u32, minute: u32) -> UtcTimestamp {
+        UtcTimestamp::from_utc(2026, 8, 30, hour, minute, 0).unwrap()
     }
 
-    fn request(now: DateTime<Utc>) -> DeltaRequest {
+    fn request(now: UtcTimestamp) -> DeltaRequest {
         DeltaRequest {
             delta_cursor: None,
             range: ExportRange {
@@ -1201,7 +1199,7 @@ mod tests {
         }
     }
 
-    fn write_rollout(root: &Path, now: DateTime<Utc>) {
+    fn write_rollout(root: &Path, now: UtcTimestamp) {
         let sessions = root.join("sessions/2026/08/30");
         fs::create_dir_all(&sessions).unwrap();
         let records = [
@@ -1250,7 +1248,7 @@ mod tests {
         CollectConfig,
         SourceIdentityStore,
         SourceIdentity,
-        DateTime<Utc>,
+        UtcTimestamp,
     ) {
         let directory = tempfile::tempdir().unwrap();
         let now = at(12, 0);
@@ -1278,7 +1276,7 @@ mod tests {
         store: &SourceIdentityStore,
         identity: &SourceIdentity,
         revisions: &ProtocolRevisions,
-        observed_at: DateTime<Utc>,
+        observed_at: UtcTimestamp,
     ) -> PathBuf {
         let root = revision_bound_state_root(store, revisions).unwrap();
         drop(try_acquire_revision_fence(&root, RemoteRevisionFenceMode::Shared).unwrap());

@@ -9,7 +9,6 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
-use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -23,6 +22,7 @@ use crate::domain::{
 use crate::file_lock::FileLock;
 use crate::history::{default_history_root, history_namespace};
 use crate::private_state_store::{LockFilePolicy, LockMode, PrivateStoreLayout};
+use crate::time::UtcTimestamp;
 
 const APPLICATION_ID: i64 = 0x4355_4d44;
 const SCHEMA_VERSION: i64 = 1;
@@ -75,7 +75,7 @@ pub(crate) struct PendingDeletionReceipt {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct DeletedUsageCall {
-    pub timestamp: DateTime<Utc>,
+    pub timestamp: UtcTimestamp,
     pub thread_id: String,
     pub turn_id: Option<String>,
     pub usage_event_id: Option<String>,
@@ -136,8 +136,8 @@ pub(crate) struct DeletedTurn {
     pub turn_id: String,
     pub model: Option<String>,
     pub service_tier: Option<String>,
-    pub started_at: Option<DateTime<Utc>>,
-    pub completed_at: Option<DateTime<Utc>>,
+    pub started_at: Option<UtcTimestamp>,
+    pub completed_at: Option<UtcTimestamp>,
     pub duration_ms: Option<u64>,
     pub status: TurnStatus,
 }
@@ -153,10 +153,10 @@ pub(crate) struct DeletedSessionRecord {
     #[serde(default, with = "crate::exact_json::optional_pathbuf_lossy")]
     pub cwd: Option<PathBuf>,
     pub source: Option<String>,
-    pub created_at: Option<DateTime<Utc>>,
-    pub updated_at: Option<DateTime<Utc>>,
-    pub captured_at: DateTime<Utc>,
-    pub deleted_at: Option<DateTime<Utc>>,
+    pub created_at: Option<UtcTimestamp>,
+    pub updated_at: Option<UtcTimestamp>,
+    pub captured_at: UtcTimestamp,
+    pub deleted_at: Option<UtcTimestamp>,
     pub status: DeletionStatus,
     pub calls: Vec<DeletedUsageCall>,
     pub turns: Vec<DeletedTurn>,
@@ -167,7 +167,7 @@ impl DeletedSessionRecord {
     pub(crate) fn from_dataset(
         thread_id: &str,
         title: &str,
-        captured_at: DateTime<Utc>,
+        captured_at: UtcTimestamp,
         dataset: &RolloutDataset,
     ) -> Result<Self> {
         let task = dataset
@@ -635,7 +635,7 @@ fn prepare_delete_with_budget(
         );
         transaction.execute(
             "INSERT INTO operations(id,prepared_at) VALUES (?1,?2)",
-            params![operation_id, Utc::now().to_rfc3339()],
+            params![operation_id, UtcTimestamp::now().to_rfc3339()],
         )?;
         for mut record in payloads {
             let previous: Option<Vec<u8>> = transaction
@@ -672,7 +672,7 @@ pub(crate) fn set_deletion_outcome(
     operation_id: &str,
     thread_id: &str,
     status: DeletionStatus,
-    at: DateTime<Utc>,
+    at: UtcTimestamp,
 ) -> Result<()> {
     set_deletion_outcome_with_budget(
         config,
@@ -689,7 +689,7 @@ fn set_deletion_outcome_with_budget(
     operation_id: &str,
     thread_id: &str,
     status: DeletionStatus,
-    at: DateTime<Utc>,
+    at: UtcTimestamp,
     budget: LedgerReadBudget,
 ) -> Result<()> {
     with_database(config, true, |connection| {
@@ -942,7 +942,7 @@ pub(crate) fn ledger_fingerprint(config: &CollectConfig) -> Result<Option<String
 pub(crate) fn overlay_deleted_sessions(
     dataset: &mut RolloutDataset,
     records: &[DeletedSessionRecord],
-    as_of: DateTime<Utc>,
+    as_of: UtcTimestamp,
 ) -> Result<()> {
     let mut calls = HashMap::new();
     for (index, call) in dataset.calls.iter().enumerate() {
@@ -1068,13 +1068,13 @@ pub(crate) fn overlay_deleted_sessions(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{Duration as ChronoDuration, TimeZone};
+    use crate::time::Duration as SignedDuration;
 
     mod pending_capacity_tests;
     mod side_file_tests;
 
-    fn at() -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 10, 20, 12, 0, 0).unwrap()
+    fn at() -> UtcTimestamp {
+        UtcTimestamp::from_utc(2026, 10, 20, 12, 0, 0).unwrap()
     }
 
     fn config(directory: &tempfile::TempDir, home: &str) -> CollectConfig {
@@ -1095,13 +1095,13 @@ mod tests {
             parent_thread_id: None,
             cwd: None,
             source: Some("cli".into()),
-            created_at: Some(at() - ChronoDuration::days(2)),
-            updated_at: Some(at() - ChronoDuration::seconds(1)),
+            created_at: Some(at() - SignedDuration::days(2)),
+            updated_at: Some(at() - SignedDuration::seconds(1)),
             captured_at: at(),
             deleted_at: None,
             status: DeletionStatus::Pending,
             calls: vec![DeletedUsageCall {
-                timestamp: at() - ChronoDuration::hours(6),
+                timestamp: at() - SignedDuration::hours(6),
                 thread_id: id.into(),
                 turn_id: Some("turn".into()),
                 usage_event_id: Some(event.into()),
@@ -1119,8 +1119,8 @@ mod tests {
                 turn_id: "turn".into(),
                 model: Some("gpt-5.6-sol".into()),
                 service_tier: None,
-                started_at: Some(at() - ChronoDuration::hours(6)),
-                completed_at: Some(at() - ChronoDuration::hours(5)),
+                started_at: Some(at() - SignedDuration::hours(6)),
+                completed_at: Some(at() - SignedDuration::hours(5)),
                 duration_ms: Some(3_600_000),
                 status: TurnStatus::Completed,
             }],
@@ -1405,13 +1405,13 @@ mod tests {
             dataset
                 .calls
                 .iter()
-                .all(|call| call.timestamp == at() - ChronoDuration::hours(6))
+                .all(|call| call.timestamp == at() - SignedDuration::hours(6))
         );
         assert!(
             dataset
                 .calls
                 .iter()
-                .all(|call| call.timestamp < at() - ChronoDuration::hours(5)),
+                .all(|call| call.timestamp < at() - SignedDuration::hours(5)),
             "deleting now cannot move six-hour-old events into the current five-hour window"
         );
         assert!(

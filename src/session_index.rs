@@ -4,10 +4,10 @@ use std::io::{BufRead, BufReader, ErrorKind};
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
 use crate::bounded_io::{BoundedLine, read_bounded_line};
+use crate::time::UtcTimestamp;
 
 const SESSION_INDEX_MAX_LINE_BYTES: usize = 1024 * 1024;
 const SESSION_INDEX_MAX_ENTRIES: usize = 50_000;
@@ -26,19 +26,19 @@ struct SessionIndexEntry {
 #[derive(Debug)]
 struct IndexedTitle {
     title: String,
-    updated_at: Option<DateTime<Utc>>,
+    updated_at: Option<UtcTimestamp>,
     line_number: usize,
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct LoadedThreadTitles {
     pub(crate) titles: HashMap<String, String>,
-    pub(crate) next_update_at: Option<DateTime<Utc>>,
+    pub(crate) next_update_at: Option<UtcTimestamp>,
 }
 
 pub(crate) fn load_thread_titles(
     codex_home: &Path,
-    as_of: DateTime<Utc>,
+    as_of: UtcTimestamp,
 ) -> Result<LoadedThreadTitles> {
     let path = codex_home.join("session_index.jsonl");
     let file = match File::open(&path) {
@@ -57,7 +57,7 @@ pub(crate) fn load_thread_titles(
 fn load_thread_titles_reader(
     mut reader: impl BufRead,
     path: &Path,
-    as_of: DateTime<Utc>,
+    as_of: UtcTimestamp,
 ) -> Result<LoadedThreadTitles> {
     load_thread_titles_reader_with_limits(
         &mut reader,
@@ -72,7 +72,7 @@ fn load_thread_titles_reader(
 fn load_thread_titles_reader_with_limits(
     reader: &mut impl BufRead,
     path: &Path,
-    as_of: DateTime<Utc>,
+    as_of: UtcTimestamp,
     max_line_bytes: usize,
     max_entries: usize,
     max_title_bytes: usize,
@@ -116,8 +116,7 @@ fn load_thread_titles_reader_with_limits(
         let updated_at = entry
             .updated_at
             .as_deref()
-            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
-            .map(|value| value.with_timezone(&Utc));
+            .and_then(|value| UtcTimestamp::parse_from_rfc3339(value).ok());
         if let Some(updated_at) = updated_at
             && updated_at > as_of
         {
@@ -182,7 +181,7 @@ mod tests {
     use std::io::{BufReader, Cursor};
     use std::path::Path;
 
-    use chrono::{TimeZone, Utc};
+    use crate::time::UtcTimestamp;
 
     use super::load_thread_titles_reader_with_limits;
 
@@ -197,7 +196,7 @@ mod tests {
         let titles = load_thread_titles_reader_with_limits(
             &mut reader,
             Path::new("session_index.jsonl"),
-            chrono::DateTime::<Utc>::MAX_UTC,
+            crate::time::UtcTimestamp::MAX,
             64,
             10,
             32,
@@ -224,7 +223,7 @@ mod tests {
         let titles = load_thread_titles_reader_with_limits(
             &mut reader,
             Path::new("session_index.jsonl"),
-            chrono::DateTime::<Utc>::MAX_UTC,
+            crate::time::UtcTimestamp::MAX,
             256,
             2,
             5,
@@ -242,11 +241,11 @@ mod tests {
 
     #[test]
     fn future_titles_wait_for_their_updated_at_boundary() {
-        let current = Utc.with_ymd_and_hms(2026, 8, 30, 0, 0, 0).unwrap();
-        let future = current + chrono::Duration::hours(1);
+        let current = UtcTimestamp::from_utc(2026, 8, 30, 0, 0, 0).unwrap();
+        let future = current + crate::time::Duration::hours(1);
         let input = format!(
             "{{\"id\":\"thread\",\"thread_name\":\"Current\",\"updated_at\":\"{}\"}}\n{{\"id\":\"thread\",\"thread_name\":\"Future\",\"updated_at\":\"{}\"}}\n",
-            (current - chrono::Duration::hours(1)).to_rfc3339(),
+            (current - crate::time::Duration::hours(1)).to_rfc3339(),
             future.to_rfc3339(),
         );
 

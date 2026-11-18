@@ -111,7 +111,7 @@ pub fn render_summary_text(report: &SummaryReport) -> String {
         let _ = writeln!(
             output,
             "  {}  value {}",
-            bucket.starts_at.format("%Y-%m-%d %H:%M:%S"),
+            bucket.starts_at.strftime("%Y-%m-%d %H:%M:%S"),
             format_summary_value(report.metric, bucket.value)
         );
         let _ = writeln!(
@@ -156,7 +156,7 @@ pub fn render_summary_text(report: &SummaryReport) -> String {
             let _ = writeln!(
                 output,
                 "      {}  value {}  totals {}",
-                bucket.starts_at.format("%Y-%m-%d %H:%M:%S"),
+                bucket.starts_at.strftime("%Y-%m-%d %H:%M:%S"),
                 format_summary_value(report.metric, bucket.value),
                 format_summary_metrics(bucket.metrics)
             );
@@ -744,8 +744,6 @@ fn format_exact_digits(digits: &str) -> String {
 mod tests {
     use std::path::PathBuf;
 
-    use chrono::{TimeZone, Utc};
-
     use super::*;
     use crate::domain::{ApiCostAmount, CollectionStats, SourceStatus};
     use crate::health_report::{HistoryHealth, RecorderHealth, SnapshotHealth};
@@ -755,10 +753,11 @@ mod tests {
         SummaryProjectReport, SummaryRange, SummaryReportWindow, SummarySessionReport,
         SummaryTurnReport,
     };
+    use crate::time::UtcTimestamp;
     use crate::trends::{TrendInterval, TrendPoint};
 
-    fn timestamp(hour: u32, minute: u32) -> chrono::DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 8, 30, hour, minute, 0).unwrap()
+    fn timestamp(hour: u32, minute: u32) -> UtcTimestamp {
+        UtcTimestamp::from_utc(2026, 8, 30, hour, minute, 0).unwrap()
     }
 
     fn metrics(tokens: u64) -> SummaryReportMetrics {
@@ -963,6 +962,7 @@ mod tests {
         assert!(text.contains("selected value 1,000 tokens  [LOWER BOUND]"));
         assert!(text.contains("coverage partial 50.00% | buckets 1/2"));
         assert!(text.contains("Chart buckets (1, local wall clock)"));
+        assert!(text.contains("2026-08-30 10:00:00  value 1,000 tokens"));
         assert!(text.contains("project Example project | key=project-1"));
         assert!(text.contains("session thread-1"));
         assert!(text.contains("turn exact:turn-1"));
@@ -1087,6 +1087,16 @@ mod tests {
         assert!(!summary_compact.contains('\n'));
         assert!(trends_pretty.contains('\n'));
         assert!(!health_compact.contains('\n'));
+        let summary_json: serde_json::Value = serde_json::from_str(&summary_compact).unwrap();
+        assert_eq!(summary_json["window"]["startsAt"], "2026-08-30T10:00:00Z");
+        assert_eq!(
+            summary_json["buckets"][0]["startsAt"],
+            "2026-08-30T10:00:00"
+        );
+        assert_eq!(
+            summary_json["projects"][0]["buckets"][0]["startsAt"],
+            "2026-08-30T10:00:00"
+        );
         assert_eq!(
             serde_json::from_str::<SummaryReport>(&summary_compact).unwrap(),
             summary

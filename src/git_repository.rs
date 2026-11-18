@@ -20,7 +20,6 @@ use std::str::FromStr;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 #[cfg(windows)]
@@ -33,6 +32,7 @@ use crate::process_tree::{
     configure_process_tree as configure_git_process_tree,
 };
 use crate::remote_protocol::GitRepositoryFingerprint;
+use crate::time::{Duration as SignedDuration, UtcTimestamp};
 use crate::trace::{TraceFields, TraceOutcome, process_trace_log};
 
 const FINGERPRINT_DOMAIN: &[u8] = b"codex-usage-monit/git-remote/v1\0";
@@ -81,7 +81,7 @@ impl Default for PersistentGitEvidenceCache {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct PersistentGitEvidenceEntry {
-    checked_at: DateTime<Utc>,
+    checked_at: UtcTimestamp,
     evidence: PersistentGitEvidence,
 }
 
@@ -143,7 +143,7 @@ pub(crate) struct GitProjectEvidenceResolver {
     command_timeout: Duration,
     runner: GitCommandRunner,
     persistent: Option<PersistentGitEvidenceState>,
-    wall_clock: fn() -> DateTime<Utc>,
+    wall_clock: fn() -> UtcTimestamp,
     collection_started: Instant,
     command_attempts: u64,
     cache_hits: u64,
@@ -161,7 +161,7 @@ impl Default for GitProjectEvidenceResolver {
             command_timeout: GIT_COMMAND_TIMEOUT,
             runner: bounded_git_output,
             persistent: None,
-            wall_clock: Utc::now,
+            wall_clock: UtcTimestamp::now,
             collection_started: Instant::now(),
             command_attempts: 0,
             cache_hits: 0,
@@ -283,8 +283,8 @@ impl GitProjectEvidenceResolver {
         let persistent = self.persistent.as_ref()?;
         let entry = persistent.cache.entries.get(key)?;
         let age = (self.wall_clock)().signed_duration_since(entry.checked_at);
-        let ttl = ChronoDuration::from_std(GIT_EVIDENCE_CACHE_TTL).ok()?;
-        if age < ChronoDuration::zero() || age >= ttl {
+        let ttl = SignedDuration::from_std(GIT_EVIDENCE_CACHE_TTL).ok()?;
+        if age < SignedDuration::zero() || age >= ttl {
             return None;
         }
         let remaining = (ttl - age).to_std().ok()?;
@@ -1806,7 +1806,7 @@ mod tests {
         }
         let mut cache = read_persistent_git_cache(&cache_path).unwrap();
         let entry = cache.entries.values_mut().next().unwrap();
-        entry.checked_at = Utc::now() - ChronoDuration::minutes(6);
+        entry.checked_at = UtcTimestamp::now() - SignedDuration::minutes(6);
         crate::cache::write_private_atomically(&cache_path, &serde_json::to_vec(&cache).unwrap())
             .unwrap();
         let before = std::fs::read(&cache_path).unwrap();
@@ -1836,7 +1836,7 @@ mod tests {
             std::fs::create_dir(&path).unwrap();
             paths.push(std::fs::canonicalize(path).unwrap());
         }
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         let evidence = PersistentGitEvidence::ConfirmedNonRepository;
         let cache = PersistentGitEvidenceCache {
             format_version: PERSISTENT_CACHE_FORMAT_VERSION,
@@ -1851,14 +1851,14 @@ mod tests {
                 (
                     persistent_workspace_cache_key(&paths[1]),
                     PersistentGitEvidenceEntry {
-                        checked_at: now - ChronoDuration::minutes(6),
+                        checked_at: now - SignedDuration::minutes(6),
                         evidence: evidence.clone(),
                     },
                 ),
                 (
                     persistent_workspace_cache_key(&paths[2]),
                     PersistentGitEvidenceEntry {
-                        checked_at: now + ChronoDuration::hours(1),
+                        checked_at: now + SignedDuration::hours(1),
                         evidence,
                     },
                 ),
@@ -1902,11 +1902,17 @@ mod tests {
         let mut cache = PersistentGitEvidenceCache {
             format_version: PERSISTENT_CACHE_FORMAT_VERSION,
             entries: BTreeMap::from([
-                (oldest.clone(), entry(Utc::now() - ChronoDuration::hours(2))),
-                (middle.clone(), entry(Utc::now() - ChronoDuration::hours(1))),
+                (
+                    oldest.clone(),
+                    entry(UtcTimestamp::now() - SignedDuration::hours(2)),
+                ),
+                (
+                    middle.clone(),
+                    entry(UtcTimestamp::now() - SignedDuration::hours(1)),
+                ),
                 (
                     newly_checked_after_clock_rollback.clone(),
-                    entry(Utc::now() - ChronoDuration::hours(3)),
+                    entry(UtcTimestamp::now() - SignedDuration::hours(3)),
                 ),
             ]),
         };

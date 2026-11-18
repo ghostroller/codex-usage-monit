@@ -22,7 +22,6 @@ use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::atomic_file::replace_file;
@@ -32,6 +31,7 @@ use crate::remote_protocol::{
     validate_remote_partial_reasons_for_storage,
 };
 use crate::source_history::RedactionProfile;
+use crate::time::{Duration, UtcTimestamp};
 
 const EXPORT_LAYOUT_DIRECTORY: &str = "remote-export-v1";
 const DELTA_STATE_FILE: &str = "delta-state.json";
@@ -146,7 +146,7 @@ impl RemoteExportChange {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RemoteExportDesiredRecord {
     logical_key: String,
-    expires_at: DateTime<Utc>,
+    expires_at: UtcTimestamp,
     upsert: RemoteExportChange,
     tombstone: RemoteExportChange,
 }
@@ -154,7 +154,7 @@ pub struct RemoteExportDesiredRecord {
 impl RemoteExportDesiredRecord {
     pub fn new(
         logical_key: impl Into<String>,
-        expires_at: DateTime<Utc>,
+        expires_at: UtcTimestamp,
         upsert: RemoteExportChange,
         tombstone: RemoteExportChange,
     ) -> io::Result<Self> {
@@ -179,7 +179,7 @@ impl RemoteExportDesiredRecord {
     /// Stable end of this aggregate's publication lifetime. Reconciliation
     /// persists this value with the current set; omission from a partial scan
     /// never changes it or acts as deletion evidence.
-    pub fn expires_at(&self) -> DateTime<Utc> {
+    pub fn expires_at(&self) -> UtcTimestamp {
         self.expires_at
     }
 
@@ -216,7 +216,7 @@ pub enum RemoteExportReconcileMode {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RemoteExportJournalEntry {
     sequence: u64,
-    committed_at: DateTime<Utc>,
+    committed_at: UtcTimestamp,
     change: RemoteExportChange,
 }
 
@@ -225,7 +225,7 @@ impl RemoteExportJournalEntry {
         self.sequence
     }
 
-    pub fn committed_at(&self) -> DateTime<Utc> {
+    pub fn committed_at(&self) -> UtcTimestamp {
         self.committed_at
     }
 
@@ -309,7 +309,7 @@ pub struct RemoteExportLivePage {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RemoteExportMaterializedUpsert {
     logical_key: String,
-    expires_at: DateTime<Utc>,
+    expires_at: UtcTimestamp,
     revision: u64,
     change: RemoteExportChange,
 }
@@ -319,7 +319,7 @@ impl RemoteExportMaterializedUpsert {
         &self.logical_key
     }
 
-    pub fn expires_at(&self) -> DateTime<Utc> {
+    pub fn expires_at(&self) -> UtcTimestamp {
         self.expires_at
     }
 
@@ -545,7 +545,7 @@ impl RemoteExportStateStore {
 
     /// Attempts to become the only exporter for this source generation.
     /// Contention is returned immediately as `WouldBlock`.
-    pub fn try_begin(&self, observed_at: DateTime<Utc>) -> io::Result<RemoteExportSession<'_>> {
+    pub fn try_begin(&self, observed_at: UtcTimestamp) -> io::Result<RemoteExportSession<'_>> {
         self.prepare_source_directory()?;
         let lock = try_open_source_lock(self, &self.source_directory())?;
         self.prepare_profile_directory()?;
@@ -606,7 +606,7 @@ impl RemoteExportStateStore {
         self.namespace_directory().join(DELTA_ANCHOR_FILE)
     }
 
-    fn load_or_create_state(&self, observed_at: DateTime<Utc>) -> io::Result<StoredExportState> {
+    fn load_or_create_state(&self, observed_at: UtcTimestamp) -> io::Result<StoredExportState> {
         self.validate_namespace()?;
         match self.read_state() {
             Ok(state) => {
@@ -760,7 +760,7 @@ impl RemoteExportSession<'_> {
     /// published atomically with the exporter journal state.
     pub fn reconcile_live_snapshot(
         &mut self,
-        observed_at: DateTime<Utc>,
+        observed_at: UtcTimestamp,
         snapshot: RemoteLiveSnapshot,
         project_descriptors: Vec<RemoteProjectDescriptor>,
         partial_reasons: Vec<String>,
@@ -890,7 +890,7 @@ impl RemoteExportSession<'_> {
 
     pub fn append_changes(
         &mut self,
-        observed_at: DateTime<Utc>,
+        observed_at: UtcTimestamp,
         changes: &[RemoteExportChange],
     ) -> io::Result<RemoteExportAppendReport> {
         self.validate_fence()?;
@@ -930,7 +930,7 @@ impl RemoteExportSession<'_> {
     /// atomic state-file replacement.
     pub fn reconcile_materialized_records(
         &mut self,
-        observed_at: DateTime<Utc>,
+        observed_at: UtcTimestamp,
         desired: &[RemoteExportDesiredRecord],
         mode: RemoteExportReconcileMode,
     ) -> io::Result<RemoteExportReconcileReport> {
@@ -986,7 +986,7 @@ impl RemoteExportSession<'_> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn preflight_reconciled_delta<F>(
         &self,
-        observed_at: DateTime<Utc>,
+        observed_at: UtcTimestamp,
         desired: &[RemoteExportDesiredRecord],
         mode: RemoteExportReconcileMode,
         cursor: DeltaCursor,
@@ -1290,7 +1290,7 @@ fn materialized_set_matches(
 
 fn reconcile_maintenance_due(
     state: &StoredExportState,
-    observed_at: DateTime<Utc>,
+    observed_at: UtcTimestamp,
     store: &RemoteExportStateStore,
 ) -> bool {
     if store.limits.retention_days <= 0 {
@@ -1306,7 +1306,7 @@ fn reconcile_maintenance_due(
         .checked_add_signed(Duration::hours(
             RETENTION_CLOCK_MAX_UNCONFIRMED_FORWARD_HOURS,
         ))
-        .unwrap_or(DateTime::<Utc>::MAX_UTC);
+        .unwrap_or(UtcTimestamp::MAX);
     if observed_at <= trusted_forward_limit
         && state
             .materialized_records
@@ -1381,7 +1381,7 @@ impl StoredExportState {
     fn new(
         source: SourceGeneration,
         redaction_profile: RedactionProfile,
-        observed_at: DateTime<Utc>,
+        observed_at: UtcTimestamp,
     ) -> io::Result<Self> {
         Ok(Self {
             format_version: STATE_FORMAT_VERSION,
@@ -1455,7 +1455,7 @@ impl StoredExportState {
             ));
         }
         let mut previous_sequence = self.retention_floor;
-        let mut previous_committed_at = DateTime::<Utc>::MIN_UTC;
+        let mut previous_committed_at = UtcTimestamp::MIN;
         let mut ids = HashMap::with_capacity(self.entries.len());
         for entry in &self.entries {
             entry.change.validate()?;
@@ -1558,7 +1558,7 @@ impl StoredExportState {
 
 fn validate_live_parts(
     redaction_profile: RedactionProfile,
-    observed_at: DateTime<Utc>,
+    observed_at: UtcTimestamp,
     snapshot: &RemoteLiveSnapshot,
     project_descriptors: &[RemoteProjectDescriptor],
 ) -> io::Result<()> {
@@ -1636,7 +1636,7 @@ fn validate_live_quality(
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct StoredMaterializedRecord {
     logical_key: String,
-    expires_at: DateTime<Utc>,
+    expires_at: UtcTimestamp,
     current_change_id: String,
     last_upsert_sequence: NonZeroU64,
     tombstone: RemoteExportChange,
@@ -1677,17 +1677,17 @@ impl StoredExportAnchor {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RetentionClock {
-    trusted_at: DateTime<Utc>,
+    trusted_at: UtcTimestamp,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pending_started_at: Option<DateTime<Utc>>,
+    pending_started_at: Option<UtcTimestamp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pending_last_at: Option<DateTime<Utc>>,
+    pending_last_at: Option<UtcTimestamp>,
     #[serde(default)]
     pending_confirmations: u32,
 }
 
 impl RetentionClock {
-    fn current(trusted_at: DateTime<Utc>) -> Self {
+    fn current(trusted_at: UtcTimestamp) -> Self {
         Self {
             trusted_at,
             pending_started_at: None,
@@ -1696,7 +1696,7 @@ impl RetentionClock {
         }
     }
 
-    fn pending(trusted_at: DateTime<Utc>, observed_at: DateTime<Utc>) -> Self {
+    fn pending(trusted_at: UtcTimestamp, observed_at: UtcTimestamp) -> Self {
         Self {
             trusted_at,
             pending_started_at: Some(observed_at),
@@ -1722,7 +1722,7 @@ impl RetentionClock {
 
 fn next_retention_clock(
     mut clock: RetentionClock,
-    observed_at: DateTime<Utc>,
+    observed_at: UtcTimestamp,
 ) -> (RetentionClock, bool) {
     if observed_at <= clock.trusted_at {
         return (RetentionClock::current(clock.trusted_at), false);
@@ -1732,7 +1732,7 @@ fn next_retention_clock(
         .checked_add_signed(Duration::hours(
             RETENTION_CLOCK_MAX_UNCONFIRMED_FORWARD_HOURS,
         ))
-        .unwrap_or(DateTime::<Utc>::MAX_UTC);
+        .unwrap_or(UtcTimestamp::MAX);
     if observed_at <= maximum {
         return (RetentionClock::current(observed_at), false);
     }
@@ -1749,7 +1749,7 @@ fn next_retention_clock(
         .and_then(|started_at| {
             started_at.checked_add_signed(Duration::hours(RETENTION_CLOCK_CONFIRMATION_HOURS))
         })
-        .unwrap_or(DateTime::<Utc>::MAX_UTC);
+        .unwrap_or(UtcTimestamp::MAX);
     if observed_at >= stable_since
         && clock.pending_confirmations >= RETENTION_CLOCK_MIN_CONFIRMATIONS
     {
@@ -1761,7 +1761,7 @@ fn next_retention_clock(
 
 fn append_and_compact(
     state: &mut StoredExportState,
-    observed_at: DateTime<Utc>,
+    observed_at: UtcTimestamp,
     changes: &[RemoteExportChange],
     store: &RemoteExportStateStore,
 ) -> io::Result<RemoteExportAppendReport> {
@@ -1803,7 +1803,7 @@ fn append_and_compact(
 
 fn reconcile_and_compact(
     state: &mut StoredExportState,
-    observed_at: DateTime<Utc>,
+    observed_at: UtcTimestamp,
     desired: &[RemoteExportDesiredRecord],
     mode: RemoteExportReconcileMode,
     store: &RemoteExportStateStore,
@@ -2062,7 +2062,7 @@ struct AppendBatchResult {
 
 fn append_change_batch(
     state: &mut StoredExportState,
-    observed_at: DateTime<Utc>,
+    observed_at: UtcTimestamp,
     changes: &[RemoteExportChange],
     retained_duplicate_policy: RetainedDuplicatePolicy,
 ) -> io::Result<AppendBatchResult> {
@@ -2147,7 +2147,7 @@ fn append_change_batch(
 
 fn advance_retention_and_prune_age(
     state: &mut StoredExportState,
-    observed_at: DateTime<Utc>,
+    observed_at: UtcTimestamp,
     retention_days: i64,
 ) -> io::Result<(usize, bool)> {
     let (clock, retention_deferred) = next_retention_clock(state.retention_clock, observed_at);
@@ -2156,7 +2156,7 @@ fn advance_retention_and_prune_age(
         .retention_clock
         .trusted_at
         .checked_sub_signed(Duration::days(retention_days))
-        .unwrap_or(DateTime::<Utc>::MIN_UTC);
+        .unwrap_or(UtcTimestamp::MIN);
     let age_count = state
         .entries
         .partition_point(|entry| entry.committed_at < cutoff);
@@ -2166,8 +2166,8 @@ fn advance_retention_and_prune_age(
 
 fn expire_materialized_records(
     state: &mut StoredExportState,
-    observed_at: DateTime<Utc>,
-    trusted_at: DateTime<Utc>,
+    observed_at: UtcTimestamp,
+    trusted_at: UtcTimestamp,
     current_upserts: &mut BTreeMap<String, RemoteExportChange>,
 ) -> io::Result<usize> {
     let expired = state
@@ -2244,7 +2244,7 @@ fn materialized_bootstrap_is_complete(state: &StoredExportState) -> bool {
 
 fn refresh_materialized_bootstrap_if_needed(
     state: &mut StoredExportState,
-    observed_at: DateTime<Utc>,
+    observed_at: UtcTimestamp,
     upserts: &BTreeMap<String, RemoteExportChange>,
     store: &RemoteExportStateStore,
     pruned_by_capacity: &mut usize,
@@ -3115,7 +3115,6 @@ mod tests {
     use super::*;
     use std::num::NonZeroU64;
 
-    use chrono::TimeZone;
     use tempfile::tempdir;
 
     use crate::domain::TaskStatus;
@@ -3123,10 +3122,8 @@ mod tests {
 
     const NODE_ONE: &str = "node-0123456789abcdef0123456789abcdef";
 
-    fn at(day: u32, hour: u32) -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 8, day, hour, 0, 0)
-            .single()
-            .unwrap()
+    fn at(day: u32, hour: u32) -> UtcTimestamp {
+        UtcTimestamp::from_utc(2026, 8, day, hour, 0, 0).unwrap()
     }
 
     fn source(generation: u64) -> SourceGeneration {
@@ -3147,7 +3144,7 @@ mod tests {
     fn desired_until(
         key: &str,
         version: u8,
-        expires_at: DateTime<Utc>,
+        expires_at: UtcTimestamp,
     ) -> RemoteExportDesiredRecord {
         RemoteExportDesiredRecord::new(
             key,
@@ -3541,7 +3538,7 @@ mod tests {
             source(1),
             RedactionProfile::Redacted,
         );
-        let start = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).single().unwrap();
+        let start = UtcTimestamp::from_utc(2026, 1, 1, 0, 0, 0).unwrap();
         let mut export = store.try_begin(start).unwrap();
         let initial = export.status().unwrap().cursor;
         export.append_changes(start, &[change("day-0", 0)]).unwrap();
@@ -4115,7 +4112,7 @@ mod tests {
             source(1),
             RedactionProfile::Redacted,
         );
-        let jan_1 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).single().unwrap();
+        let jan_1 = UtcTimestamp::from_utc(2026, 1, 1, 0, 0, 0).unwrap();
         let expires = jan_1 + Duration::days(2);
         let record = desired_until("bucket-a", 1, expires);
         let mut export = store.try_begin(jan_1).unwrap();
@@ -4150,7 +4147,7 @@ mod tests {
             source(1),
             RedactionProfile::Redacted,
         );
-        let jan_1 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).single().unwrap();
+        let jan_1 = UtcTimestamp::from_utc(2026, 1, 1, 0, 0, 0).unwrap();
         let record = desired_until("bucket-a", 1, jan_1 + Duration::days(100));
         let mut export = store.try_begin(jan_1).unwrap();
         export

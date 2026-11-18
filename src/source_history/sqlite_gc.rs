@@ -11,8 +11,8 @@ const MAX_GC_UNIT_BYTES: u64 = MAX_SHARD_FILE_BYTES;
 struct Progress {
     profile: HistoryProfileId,
     redactions: Vec<RedactionProfile>,
-    cutoff: DateTime<Utc>,
-    trusted_at: DateTime<Utc>,
+    cutoff: UtcTimestamp,
+    trusted_at: UtcTimestamp,
     pruning_deferred: bool,
     core_done: bool,
     cursor: Option<RowCursor>,
@@ -28,7 +28,7 @@ struct Progress {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Anchor {
     namespace: String,
-    earliest: Option<DateTime<Utc>>,
+    earliest: Option<UtcTimestamp>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -296,7 +296,7 @@ pub(super) fn publication_changed(
 
 pub(super) fn collect_unit(
     store: &SourceHistoryStore,
-    observed_at: DateTime<Utc>,
+    observed_at: UtcTimestamp,
     redactions: &[RedactionProfile],
     fence: impl Fn() -> io::Result<()>,
 ) -> io::Result<SourceHistoryGcReport> {
@@ -305,7 +305,7 @@ pub(super) fn collect_unit(
 
 pub(super) fn collect_unit_with_budget(
     store: &SourceHistoryStore,
-    observed_at: DateTime<Utc>,
+    observed_at: UtcTimestamp,
     redactions: &[RedactionProfile],
     mut budget: Budget,
     fence: impl Fn() -> io::Result<()>,
@@ -360,7 +360,7 @@ pub(super) fn collect_unit_with_budget(
 fn collect_prepared_unit(
     store: &SourceHistoryStore,
     database: &database::HistoryDatabase,
-    observed_at: DateTime<Utc>,
+    observed_at: UtcTimestamp,
     redactions: &[RedactionProfile],
     key: &str,
     budget: &mut Budget,
@@ -394,11 +394,8 @@ fn collect_prepared_unit(
         let expected_cutoff = progress
             .trusted_at
             .checked_sub_signed(Duration::days(SOURCE_HISTORY_RETENTION_DAYS))
-            .unwrap_or(DateTime::<Utc>::MIN_UTC)
-            .date_naive()
-            .and_hms_opt(0, 0, 0)
-            .expect("midnight")
-            .and_utc();
+            .unwrap_or(UtcTimestamp::MIN)
+            .utc_day_start();
         if progress.profile != store.profile_id
             || progress.redactions != redactions
             || progress.cutoff != expected_cutoff
@@ -440,11 +437,8 @@ fn collect_prepared_unit(
             cutoff: clock
                 .trusted_at
                 .checked_sub_signed(Duration::days(SOURCE_HISTORY_RETENTION_DAYS))
-                .unwrap_or(DateTime::<Utc>::MIN_UTC)
-                .date_naive()
-                .and_hms_opt(0, 0, 0)
-                .expect("midnight")
-                .and_utc(),
+                .unwrap_or(UtcTimestamp::MIN)
+                .utc_day_start(),
             trusted_at: clock.trusted_at,
             pruning_deferred,
             core_done: false,
@@ -475,7 +469,7 @@ fn collect_prepared_unit(
                 if namespace.len() > 8192 { return Err(invalid_data("GC namespace exceeds its size limit")); }
                 if !budget.take(namespace.len() + 8)? { return Ok(false); }
                 let timestamp: i64 = connection.query_row("SELECT min(sort_time) FROM history_records WHERE namespace=?1", [&namespace], |row| row.get(0)).map_err(database::sql_error)?;
-                let timestamp = DateTime::<Utc>::from_timestamp_millis(timestamp).ok_or_else(|| invalid_data("invalid persisted history timestamp"))?.date_naive().and_hms_opt(0,0,0).expect("midnight").and_utc();
+                let timestamp = UtcTimestamp::from_timestamp_millis(timestamp).ok_or_else(|| invalid_data("invalid persisted history timestamp"))?.utc_day_start();
                 anchor.earliest = Some(anchor.earliest.map_or(timestamp, |at| at.min(timestamp)));
                 anchor.namespace = namespace;
             }
@@ -492,11 +486,8 @@ fn collect_prepared_unit(
             progress.cutoff = clock
                 .trusted_at
                 .checked_sub_signed(Duration::days(SOURCE_HISTORY_RETENTION_DAYS))
-                .unwrap_or(DateTime::<Utc>::MIN_UTC)
-                .date_naive()
-                .and_hms_opt(0, 0, 0)
-                .expect("midnight")
-                .and_utc();
+                .unwrap_or(UtcTimestamp::MIN)
+                .utc_day_start();
             progress.pruning_deferred = deferred;
             progress.anchor = None;
         }
@@ -561,7 +552,7 @@ fn collect_prepared_unit(
                     "history database ordering timestamp does not match its record",
                 ));
             }
-            pruned_days.insert((row.cursor.namespace.clone(), actual.date_naive()));
+            pruned_days.insert((row.cursor.namespace.clone(), actual.utc_date()));
         }
         progress.core_done = complete;
         deletion = rows;
@@ -628,7 +619,7 @@ fn collect_prepared_unit(
         let mut pruned = 0;
         let mut statistics_partial = false;
         for (namespace, day) in &pruned_days {
-            let start = day.and_hms_opt(0,0,0).expect("midnight").and_utc().timestamp_millis();
+            let start = day.start().timestamp_millis();
             let retained: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM history_records WHERE namespace=?1 AND sort_time>=?2 AND sort_time<?3)", rusqlite::params![namespace, start, start.saturating_add(86_400_000)], |row| row.get(0)).map_err(database::sql_error)?;
             if !retained { pruned += 1; }
         }
@@ -659,7 +650,7 @@ fn collect_prepared_unit(
 
 #[cfg(test)]
 mod tests {
-    use chrono::{Duration, TimeZone, Utc};
+    use crate::time::{Duration, UtcTimestamp};
 
     use super::collect_unit;
     use crate::domain::Provenance;
@@ -683,7 +674,7 @@ mod tests {
                 .unwrap(),
             )
             .unwrap();
-        let observed_at = Utc.with_ymd_and_hms(2026, 10, 2, 0, 0, 0).unwrap();
+        let observed_at = UtcTimestamp::from_utc(2026, 10, 2, 0, 0, 0).unwrap();
         let point = QuotaPoint {
             observed_at,
             limit_id: "codex".to_owned(),

@@ -2,7 +2,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::PathBuf;
 
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::*;
@@ -11,6 +10,7 @@ use crate::history::{
     weekly_local_point_payload_eq,
 };
 use crate::source_identity::SourceIdentity;
+use crate::time::UtcTimestamp;
 
 #[path = "sqlite_local.rs"]
 mod sqlite_local;
@@ -51,8 +51,8 @@ fn fail_after_local_observation_stage(stage: &'static str) -> io::Result<()> {
 pub enum LocalObservationMode {
     Incremental,
     Reconcile {
-        from: DateTime<Utc>,
-        to: DateTime<Utc>,
+        from: UtcTimestamp,
+        to: UtcTimestamp,
     },
 }
 
@@ -102,13 +102,13 @@ pub struct LocalObservationGarbageCollectionReport {
     pub duration_us: u64,
     pub shards_pruned: usize,
     pub pruning_deferred: bool,
-    pub trusted_at: Option<DateTime<Utc>>,
+    pub trusted_at: Option<UtcTimestamp>,
     pub warning: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct V2SummaryBackfillAttempt {
-    pub completed_at: DateTime<Utc>,
+    pub completed_at: UtcTimestamp,
     pub complete: bool,
 }
 
@@ -130,7 +130,7 @@ struct BackfillMarker {
     profile_id: HistoryProfileId,
     redaction_profile: RedactionProfile,
     ownership_epoch: u64,
-    completed_at: DateTime<Utc>,
+    completed_at: UtcTimestamp,
     complete: bool,
 }
 
@@ -218,7 +218,7 @@ impl SourceHistoryWriter<'_, '_, '_> {
 
     pub fn mark_v2_summary_backfill_attempt(
         &self,
-        completed_at: DateTime<Utc>,
+        completed_at: UtcTimestamp,
         complete: bool,
     ) -> io::Result<V2SummaryBackfillAttempt> {
         self.fenced(|store| sqlite_local::mark_backfill(self, store, completed_at, complete))
@@ -268,7 +268,7 @@ impl SourceHistoryStore {
         &self,
         source_id: &NodeId,
         redaction_profile: RedactionProfile,
-        since: DateTime<Utc>,
+        since: UtcTimestamp,
         include_session_digests: bool,
     ) -> io::Result<LocalObservationSnapshot> {
         let mut budget = SourceHistoryReadBudget::for_query();
@@ -285,7 +285,7 @@ impl SourceHistoryStore {
         &self,
         source_id: &NodeId,
         redaction_profile: RedactionProfile,
-        since: DateTime<Utc>,
+        since: UtcTimestamp,
         include_session_digests: bool,
         budget: &mut SourceHistoryReadBudget,
     ) -> io::Result<LocalObservationSnapshot> {
@@ -303,7 +303,7 @@ impl SourceHistoryStore {
         &self,
         source_id: &NodeId,
         redaction_profile: RedactionProfile,
-        since: DateTime<Utc>,
+        since: UtcTimestamp,
         include_session_digests: bool,
         budget: &mut SourceHistoryReadBudget,
     ) -> io::Result<LocalObservationSnapshot> {
@@ -485,7 +485,8 @@ fn build_records(
                 // each rolling zero-usage reset estimate becomes a new live
                 // tail record merely because its timestamp moved one minute.
                 .map(|point| {
-                    point.observed_at - chrono::Duration::minutes(WEEKLY_LIVE_TAIL_LOOKBACK_MINUTES)
+                    point.observed_at
+                        - crate::time::Duration::minutes(WEEKLY_LIVE_TAIL_LOOKBACK_MINUTES)
                 }),
         )
         .chain(match mode {
@@ -657,7 +658,7 @@ fn weekly_point_has_no_usage(point: &WeeklyLocalPoint) -> bool {
     point.token_usage.is_zero() && point.estimated_cost_units == 0 && point.call_count == 0
 }
 
-fn is_exact_weekly_boundary(timestamp: DateTime<Utc>) -> bool {
+fn is_exact_weekly_boundary(timestamp: UtcTimestamp) -> bool {
     const WEEKLY_SAMPLE_SECONDS: i64 = 30 * 60;
     timestamp.timestamp().rem_euclid(WEEKLY_SAMPLE_SECONDS) == 0
         && timestamp.timestamp_subsec_nanos() == 0
@@ -850,7 +851,7 @@ mod tests {
     use std::thread;
     use std::time::Duration as StdDuration;
 
-    use chrono::{Duration, TimeZone};
+    use crate::time::Duration;
     use tempfile::tempdir;
 
     use super::*;
@@ -867,13 +868,11 @@ mod tests {
     const SOURCE: &str = "node-0123456789abcdef0123456789abcdef";
     const SECRET: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
-    fn at(day: u32, hour: u32, minute: u32) -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 8, day, hour, minute, 0)
-            .single()
-            .unwrap()
+    fn at(day: u32, hour: u32, minute: u32) -> UtcTimestamp {
+        UtcTimestamp::from_utc(2026, 8, day, hour, minute, 0).unwrap()
     }
 
-    fn bucket(starts_at: DateTime<Utc>, total: u64) -> LocalHalfHourBucket {
+    fn bucket(starts_at: UtcTimestamp, total: u64) -> LocalHalfHourBucket {
         LocalHalfHourBucket {
             starts_at,
             ends_at: starts_at + Duration::minutes(15),
@@ -896,7 +895,7 @@ mod tests {
         }
     }
 
-    fn weekly(observed_at: DateTime<Utc>, total: u64) -> WeeklyLocalPoint {
+    fn weekly(observed_at: UtcTimestamp, total: u64) -> WeeklyLocalPoint {
         WeeklyLocalPoint {
             observed_at,
             resets_at: observed_at + Duration::days(7),
@@ -1247,7 +1246,7 @@ mod tests {
     fn session_digest(
         identity: &SourceIdentity,
         thread_id: &str,
-        range_start: DateTime<Utc>,
+        range_start: UtcTimestamp,
         fingerprint_hex: char,
         total_tokens: u64,
     ) -> SourceSessionDigest {

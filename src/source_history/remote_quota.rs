@@ -70,7 +70,7 @@ impl SourceHistoryStore {
         &self,
         source: &NodeId,
         redaction: RedactionProfile,
-        since: DateTime<Utc>,
+        since: UtcTimestamp,
         budget: &mut SourceHistoryReadBudget,
     ) -> io::Result<Vec<QuotaPoint>> {
         budget.charge_source()?;
@@ -115,7 +115,7 @@ impl SourceHistoryStore {
         &self,
         source: &NodeId,
         redaction: RedactionProfile,
-        since: DateTime<Utc>,
+        since: UtcTimestamp,
     ) -> io::Result<Vec<QuotaPoint>> {
         self.load_remote_quota_since_with_budget(
             source,
@@ -134,7 +134,7 @@ struct RemoteQuotaHistory {
     source_id: NodeId,
     redaction_profile: RedactionProfile,
     last_sequence: u64,
-    days: BTreeMap<NaiveDate, RemoteQuotaDay>,
+    days: BTreeMap<UtcDay, RemoteQuotaDay>,
 }
 
 impl RemoteQuotaHistory {
@@ -169,7 +169,7 @@ pub(super) fn read_remote_quota(
     source: &NodeId,
     redaction: RedactionProfile,
     directory: &Path,
-    since: DateTime<Utc>,
+    since: UtcTimestamp,
     budget: &mut SourceHistoryReadBudget,
 ) -> io::Result<Vec<crate::remote_quota::RemoteQuotaPoint>> {
     let path = directory.join(REMOTE_QUOTA_FILE);
@@ -184,12 +184,7 @@ pub(super) fn read_remote_quota(
         let days: Vec<RemoteQuotaDay> = database::records(
             connection,
             &namespace,
-            since
-                .date_naive()
-                .and_hms_opt(0, 0, 0)
-                .expect("UTC midnight exists")
-                .and_utc()
-                .timestamp_millis(),
+            since.utc_day_start().timestamp_millis(),
             budget,
         )?;
         if days.len() > MAX_REMOTE_QUOTA_DAYS {
@@ -325,16 +320,12 @@ fn put_sqlite_quota_day(
     quota: &RemoteQuotaDay,
 ) -> io::Result<()> {
     quota.validate()?;
+    let start = quota.day.start();
     database::put_record(
         connection,
         namespace,
         &quota.day.to_string(),
-        quota
-            .day
-            .and_hms_opt(0, 0, 0)
-            .expect("UTC midnight exists")
-            .and_utc()
-            .timestamp_millis(),
+        start.timestamp_millis(),
         quota,
     )
 }
@@ -361,15 +352,15 @@ mod tests {
         );
         let source: NodeId = "node-11111111111111111111111111111111".parse().unwrap();
         let directory = store.profile_directory().join("quota-test");
-        let base = DateTime::from_timestamp(1_800_000_000, 0).unwrap();
-        let quota = |observed_at: DateTime<Utc>| RemoteQuotaDay {
-            day: observed_at.date_naive(),
+        let base = UtcTimestamp::from_timestamp(1_800_000_000, 0).unwrap();
+        let quota = |observed_at: UtcTimestamp| RemoteQuotaDay {
+            day: observed_at.utc_date(),
             points: vec![
                 RemoteQuotaPoint::from_local(&QuotaPoint {
                     observed_at,
                     limit_id: "codex".into(),
                     duration_mins: 300,
-                    resets_at: observed_at + chrono::Duration::hours(4),
+                    resets_at: observed_at + crate::time::Duration::hours(4),
                     used_percent: 10.0,
                     remaining_percent: 90.0,
                     provenance: Provenance::ServerSnapshot,
@@ -383,7 +374,7 @@ mod tests {
         };
         let second = RemoteQuotaChange {
             sequence: NonZeroU64::new(u64::MAX - 1).unwrap(),
-            quota: quota(base + chrono::Duration::days(1)),
+            quota: quota(base + crate::time::Duration::days(1)),
         };
         apply_remote_quota(
             &store,
@@ -459,20 +450,20 @@ mod tests {
             .source_directory(&source)
             .join(RedactionProfile::Redacted.directory_name())
             .join("quota-test");
-        let base = DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+        let base = UtcTimestamp::from_timestamp(1_800_000_000, 0).unwrap();
         let changes = (0..105)
             .map(|index| {
-                let observed_at = base + chrono::Duration::days(index);
+                let observed_at = base + crate::time::Duration::days(index);
                 RemoteQuotaChange {
                     sequence: NonZeroU64::new(index as u64 + 1).unwrap(),
                     quota: RemoteQuotaDay {
-                        day: observed_at.date_naive(),
+                        day: observed_at.utc_date(),
                         points: vec![
                             RemoteQuotaPoint::from_local(&QuotaPoint {
                                 observed_at,
                                 limit_id: "codex".into(),
                                 duration_mins: 300,
-                                resets_at: observed_at + chrono::Duration::hours(4),
+                                resets_at: observed_at + crate::time::Duration::hours(4),
                                 used_percent: 10.0,
                                 remaining_percent: 90.0,
                                 provenance: Provenance::ServerSnapshot,
@@ -498,7 +489,7 @@ mod tests {
             &source,
             RedactionProfile::Redacted,
             &directory,
-            base + chrono::Duration::days(70),
+            base + crate::time::Duration::days(70),
             &mut SourceHistoryReadBudget::for_query(),
         )
         .unwrap();
@@ -558,12 +549,12 @@ mod tests {
                 .unwrap(),
             )
             .unwrap();
-        let base = DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+        let base = UtcTimestamp::from_timestamp(1_800_000_000, 0).unwrap();
         let point = QuotaPoint {
             observed_at: base,
             limit_id: "codex".into(),
             duration_mins: 300,
-            resets_at: base + chrono::Duration::hours(4),
+            resets_at: base + crate::time::Duration::hours(4),
             used_percent: 10.0,
             remaining_percent: 90.0,
             provenance: Provenance::ServerSnapshot,
@@ -617,7 +608,7 @@ mod tests {
         let changes = [RemoteQuotaChange {
             sequence: NonZeroU64::new(1).unwrap(),
             quota: RemoteQuotaDay {
-                day: base.date_naive(),
+                day: base.utc_date(),
                 points: vec![RemoteQuotaPoint::from_local(&latest).unwrap()],
             },
         }];
@@ -691,18 +682,18 @@ mod tests {
                 .unwrap(),
             )
             .unwrap();
-        let base = DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+        let base = UtcTimestamp::from_timestamp(1_800_000_000, 0).unwrap();
         store.garbage_collect(base).unwrap();
         let point = |observed_at| QuotaPoint {
             observed_at,
             limit_id: "codex".into(),
             duration_mins: 300,
-            resets_at: observed_at + chrono::Duration::hours(4),
+            resets_at: observed_at + crate::time::Duration::hours(4),
             used_percent: 10.0,
             remaining_percent: 90.0,
             provenance: Provenance::ServerSnapshot,
         };
-        let old = point(base - chrono::Duration::days(40));
+        let old = point(base - crate::time::Duration::days(40));
         let recent = point(base);
         store
             .save_retained_remote_quota_points_unfenced(
@@ -727,7 +718,7 @@ mod tests {
                 .load_remote_quota_since(
                     &source,
                     RedactionProfile::PreviewEnabled,
-                    base - chrono::Duration::days(60)
+                    base - crate::time::Duration::days(60)
                 )
                 .unwrap()
                 .is_empty()

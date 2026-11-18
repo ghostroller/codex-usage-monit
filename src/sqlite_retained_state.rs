@@ -6,7 +6,6 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
-use chrono::NaiveDate;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -18,6 +17,7 @@ use crate::source_history::{
     SourceKind, SourceMetadata, SourcePurgeMarker,
 };
 use crate::source_identity::{NodeId, SourceIdentityStore};
+use crate::time::UtcDay;
 
 const MAX_FILE_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_INPUT_BYTES: u64 = 512 * 1024 * 1024;
@@ -74,7 +74,7 @@ struct AccountQuota {
     format_version: u32,
     quota_revision: u32,
     profile_id: HistoryProfileId,
-    utc_day: NaiveDate,
+    utc_day: UtcDay,
     quota_points: Vec<QuotaPoint>,
 }
 
@@ -83,7 +83,7 @@ struct AccountQuota {
 struct V1Quota {
     format_version: u32,
     namespace: String,
-    utc_day: NaiveDate,
+    utc_day: UtcDay,
     #[serde(default)]
     quota_points: Vec<QuotaPoint>,
 }
@@ -105,7 +105,7 @@ struct RemoteQuota {
     profile_id: HistoryProfileId,
     source_id: NodeId,
     redaction_profile: RedactionProfile,
-    days: BTreeMap<NaiveDate, RemoteQuotaDay>,
+    days: BTreeMap<UtcDay, RemoteQuotaDay>,
 }
 
 /// The caller holds both ownership leases and a single SQLite transaction.
@@ -211,14 +211,14 @@ pub(crate) fn retain_required_state(store: &SourceHistoryStore) -> io::Result<()
 
 fn retain_account_points(
     store: &SourceHistoryStore,
-    day: NaiveDate,
+    day: UtcDay,
     points: &[QuotaPoint],
     budget: &mut InputBudget,
 ) -> io::Result<()> {
     budget.points(points.len())?;
     for point in points {
         crate::source_history::validate_account_quota_point(point)?;
-        if point.observed_at.date_naive() != day {
+        if point.observed_at.utc_date() != day {
             return Err(invalid("retained quota observation is outside its UTC day"));
         }
     }
@@ -291,10 +291,7 @@ fn directories(store: &SourceHistoryStore, path: &Path) -> io::Result<Vec<PathBu
     Ok(paths)
 }
 
-fn day_files(
-    store: &SourceHistoryStore,
-    directory: &Path,
-) -> io::Result<Vec<(PathBuf, NaiveDate)>> {
+fn day_files(store: &SourceHistoryStore, directory: &Path) -> io::Result<Vec<(PathBuf, UtcDay)>> {
     let mut paths = Vec::new();
     for path in directories(store, directory)? {
         if path.extension().and_then(|value| value.to_str()) != Some("json") {
@@ -303,7 +300,7 @@ fn day_files(
         let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
             continue;
         };
-        if let Ok(day) = NaiveDate::parse_from_str(stem, "%Y-%m-%d") {
+        if let Ok(day) = stem.parse::<UtcDay>() {
             paths.push((path, day));
         }
     }

@@ -21,12 +21,12 @@ use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::source_history::{HistoryProfileId, RedactionProfile};
 #[cfg(windows)]
 use crate::source_identity::{validate_windows_private_directory, validate_windows_private_file};
+use crate::time::UtcTimestamp;
 
 pub const HISTORY_OWNERSHIP_MANIFEST_VERSION: u32 = 1;
 /// Older binaries reject this version before obtaining write authority.
@@ -276,11 +276,11 @@ pub enum OwnershipCasOutcome {
 pub struct WriterLeaseDiagnostic {
     version: u32,
     process_id: u32,
-    heartbeat_at: DateTime<Utc>,
+    heartbeat_at: UtcTimestamp,
 }
 
 impl WriterLeaseDiagnostic {
-    pub fn new(process_id: u32, heartbeat_at: DateTime<Utc>) -> io::Result<Self> {
+    pub fn new(process_id: u32, heartbeat_at: UtcTimestamp) -> io::Result<Self> {
         let diagnostic = Self {
             version: WRITER_LEASE_DIAGNOSTIC_VERSION,
             process_id,
@@ -298,7 +298,7 @@ impl WriterLeaseDiagnostic {
         self.process_id
     }
 
-    pub fn heartbeat_at(&self) -> DateTime<Utc> {
+    pub fn heartbeat_at(&self) -> UtcTimestamp {
         self.heartbeat_at
     }
 
@@ -315,7 +315,7 @@ impl WriterLeaseDiagnostic {
 struct StoredWriterLeaseDiagnostic {
     version: u32,
     process_id: u32,
-    heartbeat_at: DateTime<Utc>,
+    heartbeat_at: UtcTimestamp,
 }
 
 impl From<&WriterLeaseDiagnostic> for StoredWriterLeaseDiagnostic {
@@ -1599,7 +1599,7 @@ mod tests {
     use std::thread;
     use std::time::{Duration as StdDuration, Instant};
 
-    use chrono::Duration;
+    use crate::time::Duration;
     use tempfile::tempdir;
 
     const PROFILE: &str = "0123456789abcdef";
@@ -1901,7 +1901,8 @@ mod tests {
     fn stale_pid_and_heartbeat_never_steal_a_live_os_lock() {
         let directory = tempdir().unwrap();
         let store = store(directory.path());
-        let stale = WriterLeaseDiagnostic::new(7, Utc::now() - Duration::days(365)).unwrap();
+        let stale =
+            WriterLeaseDiagnostic::new(7, UtcTimestamp::now() - Duration::days(365)).unwrap();
         let first = match store
             .try_acquire_writer_lease_with_diagnostic(Some(&stale))
             .unwrap()
@@ -1927,7 +1928,7 @@ mod tests {
     fn acquiring_without_diagnostics_clears_the_previous_owner_record() {
         let directory = tempdir().unwrap();
         let store = store(directory.path());
-        let previous = WriterLeaseDiagnostic::new(7, Utc::now()).unwrap();
+        let previous = WriterLeaseDiagnostic::new(7, UtcTimestamp::now()).unwrap();
         let first = match store
             .try_acquire_writer_lease_with_diagnostic(Some(&previous))
             .unwrap()
@@ -2133,7 +2134,7 @@ mod tests {
 
         let directory = tempdir().unwrap();
         let store = store(directory.path());
-        let diagnostic = WriterLeaseDiagnostic::new(42, Utc::now()).unwrap();
+        let diagnostic = WriterLeaseDiagnostic::new(42, UtcTimestamp::now()).unwrap();
         let lease = match store
             .try_acquire_writer_lease_with_diagnostic(Some(&diagnostic))
             .unwrap()

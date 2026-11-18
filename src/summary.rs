@@ -1,11 +1,13 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, Duration, FixedOffset, NaiveDate, NaiveDateTime, Timelike, Utc};
+use jiff::civil::{Date, DateTime as CivilDateTime};
+use jiff::tz::Offset;
 
 use crate::api_cost::ApiCostAccumulator;
 use crate::attribution::{estimate_call_weight, is_spark_model};
 use crate::domain::{ApiCostAmount, TaskRecord, TokenUsage, UsageCall};
+use crate::time::{Duration, UtcTimestamp};
 
 pub const UNKNOWN_PROJECT_KEY: &str = "unknown";
 pub const UNKNOWN_PROJECT_LABEL: &str = "Unknown project";
@@ -13,16 +15,16 @@ pub const UNKNOWN_PROJECT_LABEL: &str = "Unknown project";
 /// A half-open UTC interval used by the summary view: `[starts_at, ends_at)`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SummaryWindow {
-    pub starts_at: DateTime<Utc>,
-    pub ends_at: DateTime<Utc>,
+    pub starts_at: UtcTimestamp,
+    pub ends_at: UtcTimestamp,
 }
 
 impl SummaryWindow {
-    pub fn new(starts_at: DateTime<Utc>, ends_at: DateTime<Utc>) -> Option<Self> {
+    pub fn new(starts_at: UtcTimestamp, ends_at: UtcTimestamp) -> Option<Self> {
         (starts_at < ends_at).then_some(Self { starts_at, ends_at })
     }
 
-    pub fn contains(self, timestamp: DateTime<Utc>) -> bool {
+    pub fn contains(self, timestamp: UtcTimestamp) -> bool {
         timestamp >= self.starts_at && timestamp < self.ends_at
     }
 }
@@ -35,7 +37,7 @@ impl SummaryWindow {
 /// used to complete the thread tree, but their usage is never counted.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SummarySample {
-    pub timestamp: DateTime<Utc>,
+    pub timestamp: UtcTimestamp,
     /// Thread that emitted this usage. This may be a subagent thread.
     pub thread_id: String,
     pub parent_thread_id: Option<String>,
@@ -50,7 +52,7 @@ pub struct SummarySample {
     /// is the turn that spawned its top-level delegated subtree.
     pub session_turn_id: Option<String>,
     pub message_preview: Option<String>,
-    pub turn_started_at: Option<DateTime<Utc>>,
+    pub turn_started_at: Option<UtcTimestamp>,
     /// Optional opaque project identity supplied by persisted history. Raw
     /// rollout samples fall back to the canonical workspace path.
     pub project_key: Option<String>,
@@ -141,14 +143,14 @@ impl SummaryMetrics {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DailySummary {
     /// Calendar date in the offset supplied to [`summarize_samples`].
-    pub date: NaiveDate,
+    pub date: Date,
     pub totals: SummaryMetrics,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HourlySummary {
     /// Start of the local wall-clock hour represented by this bucket.
-    pub starts_at: NaiveDateTime,
+    pub starts_at: CivilDateTime,
     pub totals: SummaryMetrics,
 }
 
@@ -175,7 +177,7 @@ impl SummaryTurnKey {
 pub struct TurnSummary {
     pub key: SummaryTurnKey,
     pub message_preview: Option<String>,
-    pub started_at: Option<DateTime<Utc>>,
+    pub started_at: Option<UtcTimestamp>,
     /// The root turn's own model usage plus every delegated descendant that
     /// can be attributed to that turn. Missing direct and delegated
     /// attribution remain separate compact rows instead of guessing from
@@ -224,7 +226,7 @@ struct ThreadMetadata {
     parent_thread_id: Option<String>,
     project_key: Option<String>,
     project_label: Option<String>,
-    project_label_at: Option<DateTime<Utc>>,
+    project_label_at: Option<UtcTimestamp>,
     cwd: Option<PathBuf>,
     title: Option<String>,
     source: Option<String>,
@@ -233,9 +235,9 @@ struct ThreadMetadata {
 #[derive(Default)]
 struct ProjectAccumulator {
     totals: SummaryMetrics,
-    days: BTreeMap<NaiveDate, SummaryMetrics>,
-    hours: BTreeMap<NaiveDateTime, SummaryMetrics>,
-    label: Option<(DateTime<Utc>, String)>,
+    days: BTreeMap<Date, SummaryMetrics>,
+    hours: BTreeMap<CivilDateTime, SummaryMetrics>,
+    label: Option<(UtcTimestamp, String)>,
     cwd: Option<PathBuf>,
     sessions: BTreeMap<String, SessionAccumulator>,
 }
@@ -250,7 +252,7 @@ struct SessionAccumulator {
 struct TurnAccumulator {
     totals: SummaryMetrics,
     message_preview: Option<String>,
-    started_at: Option<DateTime<Utc>>,
+    started_at: Option<UtcTimestamp>,
 }
 
 /// Aggregates already-additive samples into project totals, a thread tree and
@@ -262,20 +264,20 @@ struct TurnAccumulator {
 pub fn summarize_samples(
     samples: &[SummarySample],
     window: SummaryWindow,
-    day_offset: FixedOffset,
+    day_offset: Offset,
 ) -> UsageSummary {
     summarize_samples_with_local_time(samples, window, |timestamp| {
-        timestamp.with_timezone(&day_offset).naive_local()
+        day_offset.to_datetime(timestamp.as_jiff())
     })
 }
 
 /// Variant used by the TUI so each timestamp is converted with the host's
-/// real local offset. Unlike a single [`FixedOffset`], this remains correct
+/// real local offset. Unlike a single [`Offset`], this remains correct
 /// when a 30-day range crosses a daylight-saving transition.
 pub fn summarize_samples_with_local_date(
     samples: &[SummarySample],
     window: SummaryWindow,
-    local_date: impl Fn(DateTime<Utc>) -> NaiveDate,
+    local_date: impl Fn(UtcTimestamp) -> Date,
 ) -> UsageSummary {
     summarize_samples_with_local_mapping(samples, window, local_date, |_| None)
 }
@@ -285,7 +287,7 @@ pub fn summarize_samples_with_local_date(
 pub fn summarize_samples_with_local_time(
     samples: &[SummarySample],
     window: SummaryWindow,
-    local_time: impl Fn(DateTime<Utc>) -> NaiveDateTime,
+    local_time: impl Fn(UtcTimestamp) -> CivilDateTime,
 ) -> UsageSummary {
     let local_time = &local_time;
     summarize_samples_with_local_mapping(
@@ -299,8 +301,8 @@ pub fn summarize_samples_with_local_time(
 fn summarize_samples_with_local_mapping(
     samples: &[SummarySample],
     window: SummaryWindow,
-    local_date: impl Fn(DateTime<Utc>) -> NaiveDate,
-    local_hour: impl Fn(DateTime<Utc>) -> Option<NaiveDateTime>,
+    local_date: impl Fn(UtcTimestamp) -> Date,
+    local_hour: impl Fn(UtcTimestamp) -> Option<CivilDateTime>,
 ) -> UsageSummary {
     let mut metadata = HashMap::<String, ThreadMetadata>::new();
     let mut metadata_samples = samples.iter().collect::<Vec<_>>();
@@ -316,7 +318,7 @@ fn summarize_samples_with_local_mapping(
         resolve_thread_cwd(&thread_id, &metadata, &mut resolved_cwds, &mut visiting);
     }
     let mut resolved_project_keys = HashMap::<String, String>::new();
-    let mut resolved_project_labels = HashMap::<String, Option<(DateTime<Utc>, String)>>::new();
+    let mut resolved_project_labels = HashMap::<String, Option<(UtcTimestamp, String)>>::new();
     for thread_id in metadata.keys() {
         let mut visiting = HashSet::new();
         resolve_thread_project_key(
@@ -372,7 +374,7 @@ fn summarize_samples_with_local_mapping(
         .copied()
         .map(|date| (date, SummaryMetrics::default()))
         .collect::<BTreeMap<_, _>>();
-    let mut hours = BTreeMap::<NaiveDateTime, SummaryMetrics>::new();
+    let mut hours = BTreeMap::<CivilDateTime, SummaryMetrics>::new();
     let mut projects = BTreeMap::<String, ProjectAccumulator>::new();
 
     for sample in samples
@@ -545,11 +547,8 @@ fn summarize_samples_with_local_mapping(
     }
 }
 
-fn local_hour_start(value: NaiveDateTime) -> NaiveDateTime {
-    value
-        .date()
-        .and_hms_opt(value.hour(), 0, 0)
-        .unwrap_or(value)
+fn local_hour_start(value: CivilDateTime) -> CivilDateTime {
+    value.date().at(value.hour(), 0, 0, 0)
 }
 
 /// Adapts raw rollout calls to the same additive representation used by
@@ -609,7 +608,7 @@ pub fn samples_from_calls(tasks: &[TaskRecord], calls: &[UsageCall]) -> Vec<Summ
             timestamp: task
                 .updated_at
                 .or(task.created_at)
-                .unwrap_or(DateTime::<Utc>::UNIX_EPOCH),
+                .unwrap_or(UtcTimestamp::UNIX_EPOCH),
             thread_id: task.thread_id.clone(),
             parent_thread_id: task.parent_thread_id.clone(),
             turn_id: None,
@@ -636,7 +635,7 @@ pub fn summarize_calls_and_tasks(
     tasks: &[TaskRecord],
     calls: &[UsageCall],
     window: SummaryWindow,
-    day_offset: FixedOffset,
+    day_offset: Offset,
 ) -> UsageSummary {
     summarize_samples(&samples_from_calls(tasks, calls), window, day_offset)
 }
@@ -749,9 +748,9 @@ fn resolve_thread_project_label(
     thread_id: &str,
     metadata: &HashMap<String, ThreadMetadata>,
     resolved_cwds: &HashMap<String, Option<PathBuf>>,
-    cache: &mut HashMap<String, Option<(DateTime<Utc>, String)>>,
+    cache: &mut HashMap<String, Option<(UtcTimestamp, String)>>,
     visiting: &mut HashSet<String>,
-) -> Option<(DateTime<Utc>, String)> {
+) -> Option<(UtcTimestamp, String)> {
     if let Some(cached) = cache.get(thread_id) {
         return cached.clone();
     }
@@ -779,7 +778,7 @@ fn resolve_thread_project_label(
             resolved_cwds
                 .get(thread_id)
                 .and_then(|cwd| cwd.as_deref())
-                .map(|cwd| (DateTime::<Utc>::UNIX_EPOCH, project_label(Some(cwd))))
+                .map(|cwd| (UtcTimestamp::UNIX_EPOCH, project_label(Some(cwd))))
         });
     visiting.remove(thread_id);
     cache.insert(thread_id.to_string(), resolved.clone());
@@ -875,10 +874,7 @@ fn project_label(cwd: Option<&Path>) -> String {
         .unwrap_or_else(|| UNKNOWN_PROJECT_LABEL.to_string())
 }
 
-fn dates_in_window(
-    window: SummaryWindow,
-    local_date: &impl Fn(DateTime<Utc>) -> NaiveDate,
-) -> Vec<NaiveDate> {
+fn dates_in_window(window: SummaryWindow, local_date: &impl Fn(UtcTimestamp) -> Date) -> Vec<Date> {
     if window.starts_at >= window.ends_at {
         return Vec::new();
     }
@@ -891,7 +887,7 @@ fn dates_in_window(
         if date >= last {
             break;
         }
-        let Some(next) = date.succ_opt() else {
+        let Ok(next) = date.tomorrow() else {
             break;
         };
         date = next;
@@ -909,15 +905,13 @@ fn percent(value: u128, total: u128) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use chrono::TimeZone;
+    use jiff::tz::TimeZone;
 
     use super::*;
     use crate::domain::{Confidence, Provenance, TaskStatus};
 
-    fn at(day: u32, hour: u32) -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 8, day, hour, 0, 0)
-            .single()
-            .unwrap()
+    fn at(day: u32, hour: u32) -> UtcTimestamp {
+        UtcTimestamp::from_utc(2026, 8, day, hour, 0, 0).unwrap()
     }
 
     fn metrics(total_tokens: u64, estimated: u128, api: u128) -> SummaryMetrics {
@@ -942,7 +936,7 @@ mod tests {
     }
 
     fn sample(
-        timestamp: DateTime<Utc>,
+        timestamp: UtcTimestamp,
         thread_id: &str,
         parent_thread_id: Option<&str>,
         cwd: Option<&str>,
@@ -1014,7 +1008,7 @@ mod tests {
             ),
         ];
 
-        let summary = summarize_samples(&samples, window, FixedOffset::east_opt(0).unwrap());
+        let summary = summarize_samples(&samples, window, Offset::UTC);
 
         assert_eq!(summary.totals.token_usage.total_tokens, 60);
         assert_eq!(summary.totals.estimated_cost_units, 900);
@@ -1073,11 +1067,7 @@ mod tests {
         nested.session_turn_id = Some("root-turn".to_string());
         nested.message_preview = root.message_preview.clone();
 
-        let summary = summarize_samples(
-            &[root, child, nested],
-            window,
-            FixedOffset::east_opt(0).unwrap(),
-        );
+        let summary = summarize_samples(&[root, child, nested], window, Offset::UTC);
         let session = &summary.projects[0].sessions[0];
         assert_eq!(session.thread_id, "root");
         assert_eq!(session.totals.token_usage.total_tokens, 60);
@@ -1128,11 +1118,7 @@ mod tests {
             SummaryMetrics::default(),
         );
 
-        let summary = summarize_samples(
-            &[metadata, direct, first, second],
-            window,
-            FixedOffset::east_opt(0).unwrap(),
-        );
+        let summary = summarize_samples(&[metadata, direct, first, second], window, Offset::UTC);
         let session = &summary.projects[0].sessions[0];
         assert_eq!(session.turns.len(), 2);
         assert_eq!(session.totals.token_usage.total_tokens, 60);
@@ -1163,7 +1149,7 @@ mod tests {
     #[test]
     fn uses_half_open_window_and_materializes_empty_local_days() {
         let window = SummaryWindow::new(at(1, 16), at(3, 16)).unwrap();
-        let offset = FixedOffset::east_opt(8 * 60 * 60).unwrap();
+        let offset = Offset::from_seconds(8 * 60 * 60).unwrap();
         let samples = vec![
             sample(
                 at(1, 16),
@@ -1298,9 +1284,9 @@ mod tests {
 
     #[test]
     fn local_hour_mapper_merges_the_repeated_fallback_hour_without_losing_usage() {
-        let starts_at = Utc.with_ymd_and_hms(2026, 11, 1, 4, 0, 0).single().unwrap();
-        let transition = Utc.with_ymd_and_hms(2026, 11, 1, 6, 0, 0).single().unwrap();
-        let ends_at = Utc.with_ymd_and_hms(2026, 11, 1, 8, 0, 0).single().unwrap();
+        let new_york = TimeZone::get("America/New_York").unwrap();
+        let starts_at = UtcTimestamp::from_utc(2026, 11, 1, 4, 0, 0).unwrap();
+        let ends_at = UtcTimestamp::from_utc(2026, 11, 1, 8, 0, 0).unwrap();
         let samples = [
             (Duration::minutes(15), 10),
             (Duration::hours(1) + Duration::minutes(15), 20),
@@ -1323,13 +1309,10 @@ mod tests {
         let summary = summarize_samples_with_local_time(
             &samples,
             SummaryWindow::new(starts_at, ends_at).unwrap(),
-            |timestamp| {
-                let offset_hours = if timestamp < transition { -4 } else { -5 };
-                (timestamp + Duration::hours(offset_hours)).naive_utc()
-            },
+            |timestamp| new_york.to_datetime(timestamp.as_jiff()),
         );
-        let local_day = NaiveDate::from_ymd_opt(2026, 11, 1).unwrap();
-        let local_hour = |hour| local_day.and_hms_opt(hour, 0, 0).unwrap();
+        let local_day = Date::new(2026, 11, 1).unwrap();
+        let local_hour = |hour| local_day.at(hour, 0, 0, 0);
 
         assert_eq!(
             summary
@@ -1354,9 +1337,10 @@ mod tests {
 
     #[test]
     fn local_day_mapper_handles_an_offset_change_inside_the_window() {
-        let starts_at = Utc.with_ymd_and_hms(2026, 3, 8, 4, 0, 0).single().unwrap();
-        let transition = Utc.with_ymd_and_hms(2026, 3, 8, 7, 0, 0).single().unwrap();
-        let ends_at = Utc.with_ymd_and_hms(2026, 3, 10, 4, 0, 0).single().unwrap();
+        let new_york = TimeZone::get("America/New_York").unwrap();
+        let starts_at = UtcTimestamp::from_utc(2026, 3, 8, 4, 0, 0).unwrap();
+        let transition = UtcTimestamp::from_utc(2026, 3, 8, 7, 0, 0).unwrap();
+        let ends_at = UtcTimestamp::from_utc(2026, 3, 10, 4, 0, 0).unwrap();
         let samples = vec![
             sample(
                 starts_at + Duration::minutes(30),
@@ -1377,10 +1361,7 @@ mod tests {
         let summary = summarize_samples_with_local_date(
             &samples,
             SummaryWindow::new(starts_at, ends_at).unwrap(),
-            |timestamp| {
-                let hours = if timestamp < transition { -5 } else { -4 };
-                (timestamp + Duration::hours(hours)).date_naive()
-            },
+            |timestamp| new_york.to_datetime(timestamp.as_jiff()).date(),
         );
 
         assert_eq!(
@@ -1405,7 +1386,7 @@ mod tests {
             sample(at(1, 2), "b", None, Some("/two/repo"), metrics(2, 2, 2)),
         ];
 
-        let summary = summarize_samples(&samples, window, FixedOffset::east_opt(0).unwrap());
+        let summary = summarize_samples(&samples, window, Offset::UTC);
 
         assert_eq!(summary.projects.len(), 2);
         assert!(
@@ -1437,7 +1418,7 @@ mod tests {
         );
         old.title = Some("Untitled task".to_string());
 
-        let summary = summarize_samples(&[current, old], window, FixedOffset::east_opt(0).unwrap());
+        let summary = summarize_samples(&[current, old], window, Offset::UTC);
 
         assert_eq!(summary.projects.len(), 1);
         assert_eq!(summary.projects[0].key, "/work/current");
@@ -1461,11 +1442,7 @@ mod tests {
         distinct.project_key = Some("another-id".to_string());
         distinct.project_label = Some("new-name".to_string());
 
-        let summary = summarize_samples(
-            &[distinct, renamed, first],
-            window,
-            FixedOffset::east_opt(0).unwrap(),
-        );
+        let summary = summarize_samples(&[distinct, renamed, first], window, Offset::UTC);
 
         assert_eq!(summary.projects.len(), 2);
         let merged = summary
@@ -1507,7 +1484,7 @@ mod tests {
         beta.project_label = Some("Beta".to_string());
 
         for samples in [vec![alpha.clone(), beta.clone()], vec![beta, alpha]] {
-            let summary = summarize_samples(&samples, window, FixedOffset::east_opt(0).unwrap());
+            let summary = summarize_samples(&samples, window, Offset::UTC);
             assert_eq!(summary.totals.token_usage.total_tokens, 300);
             assert_eq!(summary.projects.len(), 2);
             for (key, label, tokens) in [
@@ -1539,11 +1516,7 @@ mod tests {
         renamed_alpha.project_key = Some("project-alpha".to_string());
         renamed_alpha.project_label = Some("Renamed Alpha".to_string());
 
-        let summary = summarize_samples(
-            &[renamed_alpha, beta, alpha],
-            window,
-            FixedOffset::east_opt(0).unwrap(),
-        );
+        let summary = summarize_samples(&[renamed_alpha, beta, alpha], window, Offset::UTC);
         assert_eq!(summary.projects.len(), 2);
         let alpha = summary
             .projects
@@ -1584,8 +1557,7 @@ mod tests {
                 );
                 beta.project_key = Some("project-beta".to_string());
 
-                let summary =
-                    summarize_samples(&[beta, alpha], window, FixedOffset::east_opt(0).unwrap());
+                let summary = summarize_samples(&[beta, alpha], window, Offset::UTC);
                 let beta = summary
                     .projects
                     .iter()
@@ -1611,7 +1583,7 @@ mod tests {
         root.project_key = Some("project-alpha".to_string());
         root.project_label = Some("Alpha".to_string());
         let child = sample(at(1, 2), "child", Some("root"), None, metrics(50, 5, 1));
-        let summary = summarize_samples(&[child, root], window, FixedOffset::east_opt(0).unwrap());
+        let summary = summarize_samples(&[child, root], window, Offset::UTC);
         assert_eq!(summary.projects.len(), 1);
         assert_eq!(summary.projects[0].key, "project-alpha");
         assert_eq!(summary.projects[0].label, "Alpha");
@@ -1667,7 +1639,7 @@ mod tests {
             &tasks,
             &calls,
             SummaryWindow::new(at(1, 0), at(2, 0)).unwrap(),
-            FixedOffset::east_opt(0).unwrap(),
+            Offset::UTC,
         );
 
         assert_eq!(summary.projects[0].label, "repo");

@@ -1,20 +1,18 @@
 use std::path::PathBuf;
 
-use chrono::{DateTime, Duration, TimeZone, Utc};
 use codex_usage_monit::attribution::{analyze_current_window, analyze_windows};
 use codex_usage_monit::domain::{
     Confidence, LimitBucket, LimitWindow, Provenance, RateObservation, TaskRecord, TaskStatus,
     TokenUsage, TurnRecord, TurnStatus, UsageCall,
 };
+use codex_usage_monit::time::{Duration, UtcTimestamp};
 
-fn at(hour: u32, minute: u32) -> DateTime<Utc> {
+fn at(hour: u32, minute: u32) -> UtcTimestamp {
     on(12, hour, minute)
 }
 
-fn on(day: u32, hour: u32, minute: u32) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 7, day, hour, minute, 0)
-        .single()
-        .unwrap()
+fn on(day: u32, hour: u32, minute: u32) -> UtcTimestamp {
+    UtcTimestamp::from_utc(2026, 7, day, hour, minute, 0).unwrap()
 }
 
 fn tokens(total_tokens: u64) -> TokenUsage {
@@ -70,7 +68,7 @@ fn turn(thread_id: &str, turn_id: &str) -> TurnRecord {
 }
 
 fn call(
-    timestamp: DateTime<Utc>,
+    timestamp: UtcTimestamp,
     thread_id: &str,
     turn_id: &str,
     model: Option<&str>,
@@ -80,7 +78,7 @@ fn call(
 }
 
 fn call_with_tier(
-    timestamp: DateTime<Utc>,
+    timestamp: UtcTimestamp,
     thread_id: &str,
     turn_id: &str,
     model: Option<&str>,
@@ -98,7 +96,7 @@ fn call_with_tier(
 }
 
 fn call_with_usage(
-    timestamp: DateTime<Utc>,
+    timestamp: UtcTimestamp,
     thread_id: &str,
     turn_id: &str,
     model: Option<&str>,
@@ -120,10 +118,10 @@ fn call_with_usage(
 
 fn limit_with_id(
     limit_id: &str,
-    as_of: DateTime<Utc>,
+    as_of: UtcTimestamp,
     used_percent: f64,
     duration_mins: i64,
-    resets_at: DateTime<Utc>,
+    resets_at: UtcTimestamp,
 ) -> LimitBucket {
     LimitBucket {
         limit_id: limit_id.to_string(),
@@ -143,19 +141,19 @@ fn limit_with_id(
 }
 
 fn codex_limit(
-    as_of: DateTime<Utc>,
+    as_of: UtcTimestamp,
     used_percent: f64,
     duration_mins: i64,
-    resets_at: DateTime<Utc>,
+    resets_at: UtcTimestamp,
 ) -> LimitBucket {
     limit_with_id("codex", as_of, used_percent, duration_mins, resets_at)
 }
 
 fn observation(
-    timestamp: DateTime<Utc>,
+    timestamp: UtcTimestamp,
     used_percent: f64,
     duration_mins: i64,
-    resets_at: DateTime<Utc>,
+    resets_at: UtcTimestamp,
 ) -> RateObservation {
     RateObservation {
         timestamp,

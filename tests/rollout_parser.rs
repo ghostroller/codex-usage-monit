@@ -2,17 +2,17 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::time::{Duration, SystemTime};
 
-use chrono::{DateTime, Utc};
 use codex_usage_monit::config::CollectConfig;
 use codex_usage_monit::domain::{
     AgentInteractionKind, Confidence, Provenance, TaskRecord, TaskStatus, TokenUsage, TurnStatus,
 };
 use codex_usage_monit::rollout::scan_rollouts;
+use codex_usage_monit::time::{Duration as SignedDuration, UtcTimestamp};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
-fn timestamp(value: DateTime<Utc>) -> String {
-    value.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+fn timestamp(value: UtcTimestamp) -> String {
+    value.to_rfc3339_millis_z()
 }
 
 fn usage(input: u64, cached: u64, output: u64, reasoning: u64, total: u64) -> Value {
@@ -80,7 +80,7 @@ fn config(home: &std::path::Path) -> CollectConfig {
 }
 
 fn simple_task_rollout(
-    started_at: DateTime<Utc>,
+    started_at: UtcTimestamp,
     session_payload: Value,
     turn_id: &str,
     title: &str,
@@ -101,12 +101,12 @@ fn simple_task_rollout(
             }
         }),
         json!({
-            "timestamp": timestamp(started_at + chrono::Duration::milliseconds(1)),
+            "timestamp": timestamp(started_at + SignedDuration::milliseconds(1)),
             "type": "event_msg",
             "payload": {"type": "user_message", "message": title}
         }),
         json!({
-            "timestamp": timestamp(started_at + chrono::Duration::milliseconds(2)),
+            "timestamp": timestamp(started_at + SignedDuration::milliseconds(2)),
             "type": "event_msg",
             "payload": {"type": "task_complete", "turn_id": turn_id}
         }),
@@ -116,7 +116,7 @@ fn simple_task_rollout(
 #[test]
 fn latest_session_index_title_overrides_the_first_message_without_bypassing_redaction() {
     let temp = TempDir::new().unwrap();
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let path = temp.path().join("sessions/rollout-titled.jsonl");
     write_jsonl(
         &path,
@@ -141,38 +141,38 @@ fn latest_session_index_title_overrides_the_first_message_without_bypassing_reda
             json!({
                 "id": "renamed-thread",
                 "thread_name": "Current Desktop title",
-                "updated_at": timestamp(now + chrono::Duration::seconds(2))
+                "updated_at": timestamp(now + SignedDuration::seconds(2))
             }),
             json!({
                 "id": "renamed-thread",
                 "thread_name": "Older title written later",
-                "updated_at": timestamp(now + chrono::Duration::seconds(1))
+                "updated_at": timestamp(now + SignedDuration::seconds(1))
             }),
             json!({
                 "id": "renamed-thread",
                 "thread_name": "   ",
-                "updated_at": timestamp(now + chrono::Duration::seconds(3))
+                "updated_at": timestamp(now + SignedDuration::seconds(3))
             }),
         ],
         true,
     );
 
-    let dataset = scan_rollouts(&config(temp.path()), now + chrono::Duration::seconds(2)).unwrap();
+    let dataset = scan_rollouts(&config(temp.path()), now + SignedDuration::seconds(2)).unwrap();
     assert_eq!(dataset.tasks[0].title, "Current Desktop title");
 
     let mut redacted = config(temp.path());
     redacted.redact_content = true;
-    let dataset = scan_rollouts(&redacted, now + chrono::Duration::seconds(2)).unwrap();
+    let dataset = scan_rollouts(&redacted, now + SignedDuration::seconds(2)).unwrap();
     assert_eq!(dataset.tasks[0].title, "[redacted]");
 }
 
 #[test]
 fn reconstructs_turn_deltas_ignores_duplicates_and_starts_a_new_epoch_on_reset() {
     let temp = TempDir::new().unwrap();
-    let now = Utc::now();
-    let t0 = now - chrono::Duration::minutes(4);
-    let t1 = now - chrono::Duration::minutes(3);
-    let t2 = now - chrono::Duration::minutes(2);
+    let now = UtcTimestamp::now();
+    let t0 = now - SignedDuration::minutes(4);
+    let t1 = now - SignedDuration::minutes(3);
+    let t2 = now - SignedDuration::minutes(2);
     let path = temp
         .path()
         .join("sessions/2026/07/12/rollout-synthetic.jsonl");
@@ -204,26 +204,26 @@ fn reconstructs_turn_deltas_ignores_duplicates_and_starts_a_new_epoch_on_reset()
             "payload": {"turn_id": "turn-1", "model": "gpt-test", "effort": "high"}
         }),
         json!({
-            "timestamp": timestamp(t0 + chrono::Duration::seconds(5)),
+            "timestamp": timestamp(t0 + SignedDuration::seconds(5)),
             "type": "event_msg",
             "payload": {
                 "type": "token_count",
                 "info": {"total_token_usage": usage(8, 2, 2, 1, 10)},
                 "rate_limits": {
                     "limit_id": "codex",
-                    "primary": {"used_percent": 12.0, "window_minutes": 300, "resets_at": (now + chrono::Duration::hours(2)).timestamp()},
-                    "secondary": {"used_percent": 3.0, "window_minutes": 10080, "resets_at": (now + chrono::Duration::days(4)).timestamp()}
+                    "primary": {"used_percent": 12.0, "window_minutes": 300, "resets_at": (now + SignedDuration::hours(2)).timestamp()},
+                    "secondary": {"used_percent": 3.0, "window_minutes": 10080, "resets_at": (now + SignedDuration::days(4)).timestamp()}
                 }
             }
         }),
         // Codex can persist the same cumulative notification more than once.
         json!({
-            "timestamp": timestamp(t0 + chrono::Duration::seconds(6)),
+            "timestamp": timestamp(t0 + SignedDuration::seconds(6)),
             "type": "event_msg",
             "payload": {"type": "token_count", "info": {"total_token_usage": usage(8, 2, 2, 1, 10)}}
         }),
         json!({
-            "timestamp": timestamp(t0 + chrono::Duration::seconds(7)),
+            "timestamp": timestamp(t0 + SignedDuration::seconds(7)),
             "type": "event_msg",
             "payload": {"type": "token_count", "info": {"total_token_usage": usage(12, 3, 3, 1, 15)}}
         }),
@@ -233,28 +233,28 @@ fn reconstructs_turn_deltas_ignores_duplicates_and_starts_a_new_epoch_on_reset()
             "payload": {"type": "task_complete", "turn_id": "turn-1", "completed_at": t1.timestamp(), "duration_ms": 60_000}
         }),
         json!({
-            "timestamp": timestamp(t1 + chrono::Duration::seconds(1)),
+            "timestamp": timestamp(t1 + SignedDuration::seconds(1)),
             "type": "event_msg",
             "payload": {"type": "task_started", "turn_id": "turn-2", "started_at": t1.timestamp() + 1}
         }),
         json!({
-            "timestamp": timestamp(t1 + chrono::Duration::seconds(1)),
+            "timestamp": timestamp(t1 + SignedDuration::seconds(1)),
             "type": "turn_context",
             "payload": {"turn_id": "turn-2", "model": "gpt-next", "reasoning_effort": "medium"}
         }),
         json!({
-            "timestamp": timestamp(t1 + chrono::Duration::seconds(3)),
+            "timestamp": timestamp(t1 + SignedDuration::seconds(3)),
             "type": "event_msg",
             "payload": {"type": "token_count", "info": {"total_token_usage": usage(18, 5, 4, 1, 22)}}
         }),
         // Every cumulative field moves backwards, indicating a new counter epoch.
         json!({
-            "timestamp": timestamp(t1 + chrono::Duration::seconds(4)),
+            "timestamp": timestamp(t1 + SignedDuration::seconds(4)),
             "type": "event_msg",
             "payload": {"type": "token_count", "info": {"total_token_usage": usage(3, 0, 1, 0, 4)}}
         }),
         json!({
-            "timestamp": timestamp(t1 + chrono::Duration::seconds(5)),
+            "timestamp": timestamp(t1 + SignedDuration::seconds(5)),
             "type": "event_msg",
             "payload": {"type": "token_count", "info": {"total_token_usage": usage(5, 1, 2, 0, 7)}}
         }),
@@ -361,7 +361,7 @@ fn reconstructs_turn_deltas_ignores_duplicates_and_starts_a_new_epoch_on_reset()
 #[test]
 fn counts_an_exact_first_sample_after_a_cumulative_counter_epoch_reset() {
     let temp = TempDir::new().unwrap();
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let path = temp
         .path()
         .join("sessions/rollout-exact-counter-epoch.jsonl");
@@ -502,9 +502,9 @@ fn counts_an_exact_first_sample_after_a_cumulative_counter_epoch_reset() {
 #[test]
 fn omitted_same_thread_predecessor_counts_only_known_last_request_and_marks_partial() {
     let temp = TempDir::new().unwrap();
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let thread_id = "019f52c6-60d1-72e3-8f3f-b348d83da52e";
-    let old_at = now - chrono::Duration::days(2);
+    let old_at = now - SignedDuration::days(2);
     let old_path = temp.path().join(format!(
         "sessions/2026/08/27/rollout-2026-08-27T00-00-00-{thread_id}.jsonl"
     ));
@@ -520,7 +520,7 @@ fn omitted_same_thread_predecessor_counts_only_known_last_request_and_marks_part
                 "payload": {"id": thread_id, "timestamp": timestamp(old_at)}
             }),
             json!({
-                "timestamp": timestamp(old_at + chrono::Duration::seconds(1)),
+                "timestamp": timestamp(old_at + SignedDuration::seconds(1)),
                 "type": "event_msg",
                 "payload": {"type": "token_count", "info": {
                     "total_token_usage": usage(900, 0, 0, 0, 900),
@@ -534,22 +534,22 @@ fn omitted_same_thread_predecessor_counts_only_known_last_request_and_marks_part
         &current_path,
         &[
             json!({
-                "timestamp": timestamp(now - chrono::Duration::minutes(1)),
+                "timestamp": timestamp(now - SignedDuration::minutes(1)),
                 "type": "session_meta",
                 "payload": {"id": thread_id, "timestamp": timestamp(old_at)}
             }),
             json!({
-                "timestamp": timestamp(now - chrono::Duration::seconds(50)),
+                "timestamp": timestamp(now - SignedDuration::seconds(50)),
                 "type": "event_msg",
                 "payload": {"type": "task_started", "turn_id": "current-turn"}
             }),
             json!({
-                "timestamp": timestamp(now - chrono::Duration::seconds(40)),
+                "timestamp": timestamp(now - SignedDuration::seconds(40)),
                 "type": "turn_context",
                 "payload": {"turn_id": "current-turn", "model": "gpt-current"}
             }),
             json!({
-                "timestamp": timestamp(now - chrono::Duration::seconds(30)),
+                "timestamp": timestamp(now - SignedDuration::seconds(30)),
                 "type": "event_msg",
                 "payload": {"type": "token_count", "info": {
                     "total_token_usage": usage(1_000, 0, 0, 0, 1_000),
@@ -588,7 +588,7 @@ fn omitted_same_thread_predecessor_counts_only_known_last_request_and_marks_part
 #[test]
 fn omitted_owner_probe_budget_degrades_unknown_boundary_without_unbounded_reads() {
     let temp = TempDir::new().unwrap();
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     for index in 0..70 {
         let path = temp
             .path()
@@ -611,7 +611,7 @@ fn omitted_owner_probe_budget_degrades_unknown_boundary_without_unbounded_reads(
                 "payload": {"id": "selected-thread"}
             }),
             json!({
-                "timestamp": timestamp(now + chrono::Duration::seconds(1)),
+                "timestamp": timestamp(now + SignedDuration::seconds(1)),
                 "type": "event_msg",
                 "payload": {"type": "token_count", "info": {
                     "total_token_usage": usage(10, 0, 0, 0, 10)
@@ -623,7 +623,7 @@ fn omitted_owner_probe_budget_degrades_unknown_boundary_without_unbounded_reads(
 
     let mut scan_config = config(temp.path());
     scan_config.lookback_days = 1;
-    let dataset = scan_rollouts(&scan_config, now + chrono::Duration::seconds(1)).unwrap();
+    let dataset = scan_rollouts(&scan_config, now + SignedDuration::seconds(1)).unwrap();
 
     assert!(dataset.calls.is_empty());
     assert_eq!(dataset.tasks[0].token_usage.total_tokens, 0);
@@ -639,7 +639,7 @@ fn omitted_owner_probe_budget_degrades_unknown_boundary_without_unbounded_reads(
 #[test]
 fn unrelated_canonical_uuid_inventory_does_not_consume_owner_probe_budget() {
     let temp = TempDir::new().unwrap();
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     for index in 0..70_u64 {
         let unrelated_thread = format!("00000000-0000-0000-0000-{index:012x}");
         let path = temp.path().join(format!(
@@ -664,7 +664,7 @@ fn unrelated_canonical_uuid_inventory_does_not_consume_owner_probe_budget() {
         )),
         &[
             json!({"timestamp": timestamp(now), "type": "session_meta", "payload": {"id": selected_thread}}),
-            json!({"timestamp": timestamp(now + chrono::Duration::seconds(1)), "type": "event_msg", "payload": {"type": "token_count", "info": {
+            json!({"timestamp": timestamp(now + SignedDuration::seconds(1)), "type": "event_msg", "payload": {"type": "token_count", "info": {
                 "total_token_usage": usage(10, 0, 0, 0, 10)
             }}}),
         ],
@@ -673,7 +673,7 @@ fn unrelated_canonical_uuid_inventory_does_not_consume_owner_probe_budget() {
 
     let mut scan_config = config(temp.path());
     scan_config.lookback_days = 1;
-    let dataset = scan_rollouts(&scan_config, now + chrono::Duration::seconds(1)).unwrap();
+    let dataset = scan_rollouts(&scan_config, now + SignedDuration::seconds(1)).unwrap();
 
     assert_eq!(dataset.calls.len(), 1);
     assert_eq!(dataset.calls[0].tokens.total_tokens, 10);
@@ -683,7 +683,7 @@ fn unrelated_canonical_uuid_inventory_does_not_consume_owner_probe_budget() {
 #[test]
 fn exhausted_owner_probe_byte_budget_is_uncertain_not_a_proven_absence() {
     let temp = TempDir::new().unwrap();
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let old_path = temp.path().join("sessions/old/rollout-large-prelude.jsonl");
     write_jsonl(
         &old_path,
@@ -708,7 +708,7 @@ fn exhausted_owner_probe_byte_budget_is_uncertain_not_a_proven_absence() {
                 "payload": {"id": "selected-thread"}
             }),
             json!({
-                "timestamp": timestamp(now + chrono::Duration::seconds(1)),
+                "timestamp": timestamp(now + SignedDuration::seconds(1)),
                 "type": "event_msg",
                 "payload": {"type": "token_count", "info": {
                     "total_token_usage": usage(10, 0, 0, 0, 10)
@@ -720,7 +720,7 @@ fn exhausted_owner_probe_byte_budget_is_uncertain_not_a_proven_absence() {
 
     let mut scan_config = config(temp.path());
     scan_config.lookback_days = 1;
-    let dataset = scan_rollouts(&scan_config, now + chrono::Duration::seconds(1)).unwrap();
+    let dataset = scan_rollouts(&scan_config, now + SignedDuration::seconds(1)).unwrap();
 
     assert!(dataset.calls.is_empty());
     assert_eq!(dataset.stats.ambiguous_token_resets, 1);
@@ -729,9 +729,9 @@ fn exhausted_owner_probe_byte_budget_is_uncertain_not_a_proven_absence() {
 #[test]
 fn same_thread_files_replay_by_content_time_after_mtime_is_reversed() {
     let temp = TempDir::new().unwrap();
-    let now = Utc::now();
-    let first_at = now - chrono::Duration::minutes(2);
-    let second_at = now - chrono::Duration::minutes(1);
+    let now = UtcTimestamp::now();
+    let first_at = now - SignedDuration::minutes(2);
+    let second_at = now - SignedDuration::minutes(1);
     let thread_id = "019f52c6-60d1-72e3-8f3f-b348d83da52e";
     let first_path = temp
         .path()
@@ -743,12 +743,12 @@ fn same_thread_files_replay_by_content_time_after_mtime_is_reversed() {
         &first_path,
         &[
             json!({"timestamp": timestamp(first_at), "type": "session_meta", "payload": {"id": thread_id, "timestamp": timestamp(first_at)}}),
-            json!({"timestamp": timestamp(first_at + chrono::Duration::seconds(1)), "type": "event_msg", "payload": {"type": "task_started", "turn_id": "first-turn"}}),
-            json!({"timestamp": timestamp(first_at + chrono::Duration::seconds(2)), "type": "event_msg", "payload": {"type": "token_count", "info": {
+            json!({"timestamp": timestamp(first_at + SignedDuration::seconds(1)), "type": "event_msg", "payload": {"type": "task_started", "turn_id": "first-turn"}}),
+            json!({"timestamp": timestamp(first_at + SignedDuration::seconds(2)), "type": "event_msg", "payload": {"type": "token_count", "info": {
                 "total_token_usage": usage(100, 0, 0, 0, 100),
                 "last_token_usage": usage(100, 0, 0, 0, 100)
             }}}),
-            json!({"timestamp": timestamp(first_at + chrono::Duration::seconds(3)), "type": "event_msg", "payload": {"type": "task_complete", "turn_id": "first-turn"}}),
+            json!({"timestamp": timestamp(first_at + SignedDuration::seconds(3)), "type": "event_msg", "payload": {"type": "task_complete", "turn_id": "first-turn"}}),
         ],
         false,
     );
@@ -756,12 +756,12 @@ fn same_thread_files_replay_by_content_time_after_mtime_is_reversed() {
         &second_path,
         &[
             json!({"timestamp": timestamp(second_at), "type": "session_meta", "payload": {"id": thread_id, "timestamp": timestamp(first_at)}}),
-            json!({"timestamp": timestamp(second_at + chrono::Duration::seconds(1)), "type": "event_msg", "payload": {"type": "task_started", "turn_id": "second-turn"}}),
-            json!({"timestamp": timestamp(second_at + chrono::Duration::seconds(2)), "type": "event_msg", "payload": {"type": "token_count", "info": {
+            json!({"timestamp": timestamp(second_at + SignedDuration::seconds(1)), "type": "event_msg", "payload": {"type": "task_started", "turn_id": "second-turn"}}),
+            json!({"timestamp": timestamp(second_at + SignedDuration::seconds(2)), "type": "event_msg", "payload": {"type": "token_count", "info": {
                 "total_token_usage": usage(150, 0, 0, 0, 150),
                 "last_token_usage": usage(50, 0, 0, 0, 50)
             }}}),
-            json!({"timestamp": timestamp(second_at + chrono::Duration::seconds(3)), "type": "event_msg", "payload": {"type": "task_complete", "turn_id": "second-turn"}}),
+            json!({"timestamp": timestamp(second_at + SignedDuration::seconds(3)), "type": "event_msg", "payload": {"type": "task_complete", "turn_id": "second-turn"}}),
         ],
         false,
     );
@@ -791,7 +791,7 @@ fn same_thread_files_replay_by_content_time_after_mtime_is_reversed() {
 #[test]
 fn overlapping_same_thread_file_times_mark_replay_order_ambiguous() {
     let temp = TempDir::new().unwrap();
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let thread_id = "overlapping-thread";
     let first_path = temp.path().join("sessions/rollout-a-overlap.jsonl");
     let second_path = temp.path().join("sessions/rollout-b-overlap.jsonl");
@@ -799,20 +799,20 @@ fn overlapping_same_thread_file_times_mark_replay_order_ambiguous() {
         &first_path,
         &[
             json!({"timestamp": timestamp(now), "type": "session_meta", "payload": {"id": thread_id}}),
-            json!({"timestamp": timestamp(now + chrono::Duration::seconds(10)), "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": usage(100, 0, 0, 0, 100)}}}),
+            json!({"timestamp": timestamp(now + SignedDuration::seconds(10)), "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": usage(100, 0, 0, 0, 100)}}}),
         ],
         false,
     );
     write_jsonl(
         &second_path,
         &[
-            json!({"timestamp": timestamp(now + chrono::Duration::seconds(5)), "type": "session_meta", "payload": {"id": thread_id}}),
-            json!({"timestamp": timestamp(now + chrono::Duration::seconds(15)), "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": usage(150, 0, 0, 0, 150)}}}),
+            json!({"timestamp": timestamp(now + SignedDuration::seconds(5)), "type": "session_meta", "payload": {"id": thread_id}}),
+            json!({"timestamp": timestamp(now + SignedDuration::seconds(15)), "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": usage(150, 0, 0, 0, 150)}}}),
         ],
         false,
     );
 
-    let dataset = scan_rollouts(&config(temp.path()), now + chrono::Duration::seconds(15)).unwrap();
+    let dataset = scan_rollouts(&config(temp.path()), now + SignedDuration::seconds(15)).unwrap();
 
     assert_eq!(dataset.stats.ambiguous_token_resets, 2);
     assert_eq!(dataset.calls.len(), 1);
@@ -828,7 +828,7 @@ fn overlapping_same_thread_file_times_mark_replay_order_ambiguous() {
 #[test]
 fn missing_same_thread_content_times_mark_replay_order_ambiguous() {
     let temp = TempDir::new().unwrap();
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     for (name, total) in [("a", 100), ("b", 150)] {
         write_jsonl(
             &temp
@@ -844,7 +844,7 @@ fn missing_same_thread_content_times_mark_replay_order_ambiguous() {
         );
     }
 
-    let dataset = scan_rollouts(&config(temp.path()), now + chrono::Duration::seconds(4)).unwrap();
+    let dataset = scan_rollouts(&config(temp.path()), now + SignedDuration::seconds(4)).unwrap();
 
     assert_eq!(dataset.stats.ambiguous_token_resets, 2);
     assert_eq!(dataset.calls.len(), 1);
@@ -860,13 +860,13 @@ fn missing_same_thread_content_times_mark_replay_order_ambiguous() {
 #[test]
 fn missing_replay_event_time_is_ambiguous_even_when_session_times_are_ordered() {
     let temp = TempDir::new().unwrap();
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let thread_id = "partially-timed-thread";
     write_jsonl(
         &temp.path().join("sessions/rollout-a-timed.jsonl"),
         &[
-            json!({"timestamp": timestamp(now - chrono::Duration::minutes(2)), "type": "session_meta", "payload": {"id": thread_id}}),
-            json!({"timestamp": timestamp(now - chrono::Duration::minutes(2) + chrono::Duration::seconds(1)), "type": "event_msg", "payload": {"type": "token_count", "info": {
+            json!({"timestamp": timestamp(now - SignedDuration::minutes(2)), "type": "session_meta", "payload": {"id": thread_id}}),
+            json!({"timestamp": timestamp(now - SignedDuration::minutes(2) + SignedDuration::seconds(1)), "type": "event_msg", "payload": {"type": "token_count", "info": {
                 "total_token_usage": usage(100, 0, 0, 0, 100),
                 "last_token_usage": usage(100, 0, 0, 0, 100)
             }}}),
@@ -876,7 +876,7 @@ fn missing_replay_event_time_is_ambiguous_even_when_session_times_are_ordered() 
     write_jsonl(
         &temp.path().join("sessions/rollout-b-partially-timed.jsonl"),
         &[
-            json!({"timestamp": timestamp(now - chrono::Duration::minutes(1)), "type": "session_meta", "payload": {"id": thread_id}}),
+            json!({"timestamp": timestamp(now - SignedDuration::minutes(1)), "type": "session_meta", "payload": {"id": thread_id}}),
             json!({"type": "event_msg", "payload": {"type": "token_count", "info": {
                 "total_token_usage": usage(150, 0, 0, 0, 150),
                 "last_token_usage": usage(50, 0, 0, 0, 50)
@@ -899,7 +899,7 @@ fn missing_replay_event_time_is_ambiguous_even_when_session_times_are_ordered() 
 #[test]
 fn selected_file_without_an_owner_makes_first_cumulative_total_partial() {
     let temp = TempDir::new().unwrap();
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     write_jsonl(
         &temp.path().join("sessions/rollout-unknown-owner.jsonl"),
         &[json!({"type": "unknown"})],
@@ -909,14 +909,14 @@ fn selected_file_without_an_owner_makes_first_cumulative_total_partial() {
         &temp.path().join("sessions/rollout-selected-owner.jsonl"),
         &[
             json!({"timestamp": timestamp(now), "type": "session_meta", "payload": {"id": "selected-owner-thread"}}),
-            json!({"timestamp": timestamp(now + chrono::Duration::seconds(1)), "type": "event_msg", "payload": {"type": "token_count", "info": {
+            json!({"timestamp": timestamp(now + SignedDuration::seconds(1)), "type": "event_msg", "payload": {"type": "token_count", "info": {
                 "total_token_usage": usage(10, 0, 0, 0, 10)
             }}}),
         ],
         false,
     );
 
-    let dataset = scan_rollouts(&config(temp.path()), now + chrono::Duration::seconds(1)).unwrap();
+    let dataset = scan_rollouts(&config(temp.path()), now + SignedDuration::seconds(1)).unwrap();
 
     assert!(dataset.calls.is_empty());
     assert_eq!(dataset.tasks[0].token_usage.total_tokens, 0);
@@ -926,19 +926,19 @@ fn selected_file_without_an_owner_makes_first_cumulative_total_partial() {
 #[test]
 fn skipped_selected_line_makes_first_cumulative_total_partial() {
     let temp = TempDir::new().unwrap();
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     write_jsonl(
         &temp.path().join("sessions/rollout-skipped-line.jsonl"),
         &[
             json!({"timestamp": timestamp(now), "type": "session_meta", "payload": {"id": "skipped-line-thread"}}),
-            json!({"timestamp": timestamp(now + chrono::Duration::seconds(1)), "type": "event_msg", "payload": {"type": "token_count", "info": {
+            json!({"timestamp": timestamp(now + SignedDuration::seconds(1)), "type": "event_msg", "payload": {"type": "token_count", "info": {
                 "total_token_usage": usage(10, 0, 0, 0, 10)
             }}}),
         ],
         true,
     );
 
-    let dataset = scan_rollouts(&config(temp.path()), now + chrono::Duration::seconds(1)).unwrap();
+    let dataset = scan_rollouts(&config(temp.path()), now + SignedDuration::seconds(1)).unwrap();
 
     assert_eq!(dataset.stats.skipped_lines, 1);
     assert!(dataset.calls.is_empty());
@@ -949,7 +949,7 @@ fn skipped_selected_line_makes_first_cumulative_total_partial() {
 #[test]
 fn preserves_exact_per_request_usage_and_cache_write_fields() {
     let temp = TempDir::new().unwrap();
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let path = temp
         .path()
         .join("sessions/rollout-long-context-requests.jsonl");
@@ -1007,7 +1007,7 @@ fn preserves_exact_per_request_usage_and_cache_write_fields() {
 #[test]
 fn does_not_treat_a_mismatched_last_sample_as_one_request() {
     let temp = TempDir::new().unwrap();
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let path = temp
         .path()
         .join("sessions/rollout-unverified-request-boundary.jsonl");
@@ -1057,7 +1057,7 @@ fn does_not_treat_a_mismatched_last_sample_as_one_request() {
 #[test]
 fn ignores_non_finite_string_quota_percentages() {
     let temp = TempDir::new().unwrap();
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let path = temp.path().join("sessions/rollout-non-finite.jsonl");
     write_jsonl(
         &path,
@@ -1078,7 +1078,7 @@ fn ignores_non_finite_string_quota_percentages() {
                         "primary": {
                             "used_percent": "NaN",
                             "window_minutes": 300,
-                            "resets_at": (now + chrono::Duration::hours(2)).timestamp()
+                            "resets_at": (now + SignedDuration::hours(2)).timestamp()
                         }
                     }
                 }
@@ -1097,13 +1097,13 @@ fn ignores_non_finite_string_quota_percentages() {
 #[test]
 fn captures_service_tier_at_turn_start_and_preserves_it_until_changed() {
     let temp = TempDir::new().unwrap();
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let path = temp
         .path()
         .join("sessions/2026/07/13/rollout-service-tier.jsonl");
     let event = |offset: i64, payload: Value| {
         json!({
-            "timestamp": timestamp(now + chrono::Duration::seconds(offset)),
+            "timestamp": timestamp(now + SignedDuration::seconds(offset)),
             "type": "event_msg",
             "payload": payload
         })
@@ -1193,7 +1193,7 @@ fn captures_service_tier_at_turn_start_and_preserves_it_until_changed() {
     ];
     write_jsonl(&path, &records, false);
 
-    let dataset = scan_rollouts(&config(temp.path()), now + chrono::Duration::seconds(18)).unwrap();
+    let dataset = scan_rollouts(&config(temp.path()), now + SignedDuration::seconds(18)).unwrap();
     let turn = |id: &str| {
         dataset
             .turns
@@ -1236,13 +1236,13 @@ fn captures_service_tier_at_turn_start_and_preserves_it_until_changed() {
 #[test]
 fn usage_calls_keep_their_turn_service_tier_without_changing_token_deltas() {
     let temp = TempDir::new().unwrap();
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let path = temp
         .path()
         .join("sessions/2026/07/13/rollout-fast-usage.jsonl");
     let event = |offset: i64, payload: Value| {
         json!({
-            "timestamp": timestamp(now + chrono::Duration::seconds(offset)),
+            "timestamp": timestamp(now + SignedDuration::seconds(offset)),
             "type": "event_msg",
             "payload": payload
         })
@@ -1309,7 +1309,7 @@ fn usage_calls_keep_their_turn_service_tier_without_changing_token_deltas() {
     ];
     write_jsonl(&path, &records, false);
 
-    let dataset = scan_rollouts(&config(temp.path()), now + chrono::Duration::seconds(11)).unwrap();
+    let dataset = scan_rollouts(&config(temp.path()), now + SignedDuration::seconds(11)).unwrap();
 
     assert_eq!(dataset.tasks[0].token_usage.total_tokens, 30);
     assert_eq!(dataset.calls.len(), 3);
@@ -1338,7 +1338,7 @@ fn usage_calls_keep_their_turn_service_tier_without_changing_token_deltas() {
 #[test]
 fn resumes_the_parent_turn_after_a_nested_turn_completes() {
     let temp = TempDir::new().unwrap();
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let path = temp.path().join("sessions/rollout-nested-turns.jsonl");
     write_jsonl(
         &path,
@@ -1432,7 +1432,7 @@ fn resumes_the_parent_turn_after_a_nested_turn_completes() {
 #[test]
 fn associates_only_active_or_explicit_messages_without_guessing_a_future_turn() {
     let temp = TempDir::new().unwrap();
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let path = temp
         .path()
         .join("sessions/rollout-message-association.jsonl");
@@ -1528,7 +1528,7 @@ fn associates_only_active_or_explicit_messages_without_guessing_a_future_turn() 
 #[test]
 fn parses_response_item_user_messages_without_treating_internal_context_as_prompts() {
     let temp = TempDir::new().unwrap();
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let path = temp
         .path()
         .join("sessions/rollout-response-item-messages.jsonl");
@@ -1720,7 +1720,7 @@ fn parses_response_item_user_messages_without_treating_internal_context_as_promp
 #[test]
 fn source_labels_distinguish_clients_roles_and_fallbacks() {
     let temp = TempDir::new().unwrap();
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let cases = vec![
         (
             "desktop-thread",
@@ -1787,10 +1787,10 @@ fn source_labels_distinguish_clients_roles_and_fallbacks() {
 #[test]
 fn joins_exact_spawn_and_interacted_agent_activity_to_parent_turns() {
     let temp = TempDir::new().unwrap();
-    let now = DateTime::from_timestamp_millis(Utc::now().timestamp_millis()).unwrap();
-    let requested_at = now - chrono::Duration::seconds(4);
-    let started_at = now - chrono::Duration::seconds(3);
-    let interacted_at = now - chrono::Duration::seconds(1);
+    let now = UtcTimestamp::from_timestamp_millis(UtcTimestamp::now().timestamp_millis()).unwrap();
+    let requested_at = now - SignedDuration::seconds(4);
+    let started_at = now - SignedDuration::seconds(3);
+    let interacted_at = now - SignedDuration::seconds(1);
     write_jsonl(
         &temp.path().join("sessions/rollout-parent.jsonl"),
         &[
@@ -1918,17 +1918,17 @@ fn joins_exact_spawn_and_interacted_agent_activity_to_parent_turns() {
 #[test]
 fn joins_agent_activity_when_the_activity_precedes_its_function_call() {
     let temp = TempDir::new().unwrap();
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     write_jsonl(
         &temp.path().join("sessions/rollout-parent.jsonl"),
         &[
             json!({
-                "timestamp": timestamp(now - chrono::Duration::seconds(3)),
+                "timestamp": timestamp(now - SignedDuration::seconds(3)),
                 "type": "session_meta",
                 "payload": {"id": "parent-thread", "source": "vscode"}
             }),
             json!({
-                "timestamp": timestamp(now - chrono::Duration::seconds(2)),
+                "timestamp": timestamp(now - SignedDuration::seconds(2)),
                 "type": "event_msg",
                 "payload": {
                     "type": "sub_agent_activity",
@@ -1938,7 +1938,7 @@ fn joins_agent_activity_when_the_activity_precedes_its_function_call() {
                 }
             }),
             json!({
-                "timestamp": timestamp(now - chrono::Duration::seconds(1)),
+                "timestamp": timestamp(now - SignedDuration::seconds(1)),
                 "type": "response_item",
                 "payload": {
                     "type": "function_call",
@@ -1963,7 +1963,7 @@ fn joins_agent_activity_when_the_activity_precedes_its_function_call() {
 #[test]
 fn rejects_malformed_mismatched_and_contradictory_agent_links() {
     let temp = TempDir::new().unwrap();
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     write_jsonl(
         &temp.path().join("sessions/rollout-parent.jsonl"),
         &[
@@ -2035,7 +2035,7 @@ fn rejects_malformed_mismatched_and_contradictory_agent_links() {
 #[test]
 fn deduplicates_identical_agent_evidence_and_omits_ambiguous_links() {
     let temp = TempDir::new().unwrap();
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let call = |call_id: &str, turn_id: &str| {
         json!({
             "timestamp": timestamp(now),
@@ -2101,7 +2101,7 @@ fn deduplicates_identical_agent_evidence_and_omits_ambiguous_links() {
 #[test]
 fn legacy_subagent_parent_metadata_does_not_fabricate_a_turn_link() {
     let temp = TempDir::new().unwrap();
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     write_jsonl(
         &temp.path().join("sessions/rollout-child.jsonl"),
         &[json!({
@@ -2128,7 +2128,7 @@ fn legacy_subagent_parent_metadata_does_not_fabricate_a_turn_link() {
 #[test]
 fn preserves_direct_parent_chains_and_metadata_fallback_priority() {
     let temp = TempDir::new().unwrap();
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let root_id = "root-thread";
     let child_id = "child-thread";
     let grandchild_id = "grandchild-thread";
@@ -2136,7 +2136,7 @@ fn preserves_direct_parent_chains_and_metadata_fallback_priority() {
     let self_id = "self-parent-thread";
     let ordinary_fork_id = "ordinary-user-fork";
 
-    let root_started = now - chrono::Duration::minutes(10);
+    let root_started = now - SignedDuration::minutes(10);
     write_jsonl(
         &temp.path().join("sessions/rollout-root.jsonl"),
         &simple_task_rollout(
@@ -2153,7 +2153,7 @@ fn preserves_direct_parent_chains_and_metadata_fallback_priority() {
         false,
     );
 
-    let child_started = now - chrono::Duration::minutes(8);
+    let child_started = now - SignedDuration::minutes(8);
     write_jsonl(
         &temp.path().join("sessions/rollout-child.jsonl"),
         &simple_task_rollout(
@@ -2172,7 +2172,7 @@ fn preserves_direct_parent_chains_and_metadata_fallback_priority() {
         false,
     );
 
-    let grandchild_started = now - chrono::Duration::minutes(6);
+    let grandchild_started = now - SignedDuration::minutes(6);
     write_jsonl(
         &temp.path().join("sessions/rollout-grandchild.jsonl"),
         &simple_task_rollout(
@@ -2192,7 +2192,7 @@ fn preserves_direct_parent_chains_and_metadata_fallback_priority() {
         false,
     );
 
-    let nested_started = now - chrono::Duration::minutes(4);
+    let nested_started = now - SignedDuration::minutes(4);
     write_jsonl(
         &temp.path().join("sessions/rollout-nested.jsonl"),
         &simple_task_rollout(
@@ -2214,7 +2214,7 @@ fn preserves_direct_parent_chains_and_metadata_fallback_priority() {
         false,
     );
 
-    let ordinary_started = now - chrono::Duration::minutes(3);
+    let ordinary_started = now - SignedDuration::minutes(3);
     write_jsonl(
         &temp.path().join("sessions/rollout-ordinary-fork.jsonl"),
         &simple_task_rollout(
@@ -2233,7 +2233,7 @@ fn preserves_direct_parent_chains_and_metadata_fallback_priority() {
         false,
     );
 
-    let self_started = now - chrono::Duration::minutes(2);
+    let self_started = now - SignedDuration::minutes(2);
     write_jsonl(
         &temp.path().join("sessions/rollout-self.jsonl"),
         &simple_task_rollout(
@@ -2276,7 +2276,7 @@ fn preserves_direct_parent_chains_and_metadata_fallback_priority() {
 #[test]
 fn upgrades_parent_priority_when_a_thread_spans_multiple_rollout_files() {
     let temp = TempDir::new().unwrap();
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let thread_id = "child-thread";
     let root_id = "root-thread";
     let direct_parent_id = "direct-parent-thread";
@@ -2286,11 +2286,11 @@ fn upgrades_parent_priority_when_a_thread_spans_multiple_rollout_files() {
     write_jsonl(
         &old_path,
         &simple_task_rollout(
-            now - chrono::Duration::minutes(2),
+            now - SignedDuration::minutes(2),
             json!({
                 "id": thread_id,
                 "forked_from_id": root_id,
-                "timestamp": timestamp(now - chrono::Duration::minutes(2)),
+                "timestamp": timestamp(now - SignedDuration::minutes(2)),
                 "source": {"subagent": {"other": "worker"}},
                 "thread_source": "subagent"
             }),
@@ -2302,12 +2302,12 @@ fn upgrades_parent_priority_when_a_thread_spans_multiple_rollout_files() {
     write_jsonl(
         &new_path,
         &simple_task_rollout(
-            now - chrono::Duration::minutes(1),
+            now - SignedDuration::minutes(1),
             json!({
                 "id": thread_id,
                 "parent_thread_id": root_id,
                 "forked_from_id": root_id,
-                "timestamp": timestamp(now - chrono::Duration::minutes(1)),
+                "timestamp": timestamp(now - SignedDuration::minutes(1)),
                 "source": {"subagent": {"thread_spawn": {
                     "parent_thread_id": direct_parent_id
                 }}},
@@ -2394,9 +2394,9 @@ fn task_record_parent_id_is_optional_in_legacy_json_and_uses_camel_case() {
 #[test]
 fn ignores_embedded_parent_history_but_uses_its_cumulative_token_baseline() {
     let temp = TempDir::new().unwrap();
-    let now = Utc::now();
-    let parent_started = now - chrono::Duration::minutes(20);
-    let child_created = now - chrono::Duration::minutes(2);
+    let now = UtcTimestamp::now();
+    let parent_started = now - SignedDuration::minutes(20);
+    let child_created = now - SignedDuration::minutes(2);
     let path = temp.path().join("sessions/2026/07/12/rollout-child.jsonl");
     let child_id = "019f52c6-60d1-72e3-8f3f-b348d83da52e";
     let parent_id = "019f52ac-7a9f-7fd1-8dda-e775ef950785";
@@ -2424,12 +2424,12 @@ fn ignores_embedded_parent_history_but_uses_its_cumulative_token_baseline() {
         // session_meta. Fork metadata must put the parser in foreign mode
         // immediately so these records only contribute a counter baseline.
         json!({
-            "timestamp": timestamp(child_created + chrono::Duration::microseconds(100)),
+            "timestamp": timestamp(child_created + SignedDuration::microseconds(100)),
             "type": "event_msg",
             "payload": {"type": "task_started", "turn_id": parent_turn, "started_at": parent_started.timestamp()}
         }),
         json!({
-            "timestamp": timestamp(child_created + chrono::Duration::microseconds(110)),
+            "timestamp": timestamp(child_created + SignedDuration::microseconds(110)),
             "type": "response_item",
             "payload": {
                 "type": "function_call",
@@ -2439,7 +2439,7 @@ fn ignores_embedded_parent_history_but_uses_its_cumulative_token_baseline() {
             }
         }),
         json!({
-            "timestamp": timestamp(child_created + chrono::Duration::microseconds(120)),
+            "timestamp": timestamp(child_created + SignedDuration::microseconds(120)),
             "type": "event_msg",
             "payload": {
                 "type": "sub_agent_activity",
@@ -2449,34 +2449,34 @@ fn ignores_embedded_parent_history_but_uses_its_cumulative_token_baseline() {
             }
         }),
         json!({
-            "timestamp": timestamp(child_created + chrono::Duration::microseconds(150)),
+            "timestamp": timestamp(child_created + SignedDuration::microseconds(150)),
             "type": "event_msg",
             "payload": {"type": "user_message", "message": "foreign parent prompt"}
         }),
         json!({
-            "timestamp": timestamp(child_created + chrono::Duration::microseconds(200)),
+            "timestamp": timestamp(child_created + SignedDuration::microseconds(200)),
             "type": "event_msg",
             "payload": {"type": "token_count", "info": {"total_token_usage": usage(40, 15, 10, 2, 50)}}
         }),
         json!({
-            "timestamp": timestamp(child_created + chrono::Duration::microseconds(300)),
+            "timestamp": timestamp(child_created + SignedDuration::microseconds(300)),
             "type": "event_msg",
             "payload": {"type": "task_complete", "turn_id": parent_turn}
         }),
         // Codex then replays the parent's metadata and full history into the
         // same physical file before appending the child's own events.
         json!({
-            "timestamp": timestamp(child_created + chrono::Duration::milliseconds(1)),
+            "timestamp": timestamp(child_created + SignedDuration::milliseconds(1)),
             "type": "session_meta",
             "payload": {"id": parent_id, "timestamp": timestamp(parent_started), "source": "vscode"}
         }),
         json!({
-            "timestamp": timestamp(child_created + chrono::Duration::milliseconds(2)),
+            "timestamp": timestamp(child_created + SignedDuration::milliseconds(2)),
             "type": "event_msg",
             "payload": {"type": "task_started", "turn_id": parent_turn, "started_at": parent_started.timestamp()}
         }),
         json!({
-            "timestamp": timestamp(child_created + chrono::Duration::microseconds(2_100)),
+            "timestamp": timestamp(child_created + SignedDuration::microseconds(2_100)),
             "type": "response_item",
             "payload": {
                 "type": "function_call",
@@ -2486,7 +2486,7 @@ fn ignores_embedded_parent_history_but_uses_its_cumulative_token_baseline() {
             }
         }),
         json!({
-            "timestamp": timestamp(child_created + chrono::Duration::microseconds(2_200)),
+            "timestamp": timestamp(child_created + SignedDuration::microseconds(2_200)),
             "type": "event_msg",
             "payload": {
                 "type": "sub_agent_activity",
@@ -2496,7 +2496,7 @@ fn ignores_embedded_parent_history_but_uses_its_cumulative_token_baseline() {
             }
         }),
         json!({
-            "timestamp": timestamp(child_created + chrono::Duration::milliseconds(2)),
+            "timestamp": timestamp(child_created + SignedDuration::milliseconds(2)),
             "type": "event_msg",
             "payload": {
                 "type": "token_count",
@@ -2505,12 +2505,12 @@ fn ignores_embedded_parent_history_but_uses_its_cumulative_token_baseline() {
             }
         }),
         json!({
-            "timestamp": timestamp(child_created + chrono::Duration::milliseconds(3)),
+            "timestamp": timestamp(child_created + SignedDuration::milliseconds(3)),
             "type": "event_msg",
             "payload": {"type": "task_complete", "turn_id": parent_turn}
         }),
         json!({
-            "timestamp": timestamp(child_created + chrono::Duration::milliseconds(4)),
+            "timestamp": timestamp(child_created + SignedDuration::milliseconds(4)),
             "type": "event_msg",
             "payload": {
                 "type": "thread_settings_applied",
@@ -2518,22 +2518,22 @@ fn ignores_embedded_parent_history_but_uses_its_cumulative_token_baseline() {
             }
         }),
         json!({
-            "timestamp": timestamp(child_created + chrono::Duration::milliseconds(300)),
+            "timestamp": timestamp(child_created + SignedDuration::milliseconds(300)),
             "type": "event_msg",
             "payload": {"type": "task_started", "turn_id": child_turn, "started_at": child_created.timestamp()}
         }),
         json!({
-            "timestamp": timestamp(child_created + chrono::Duration::milliseconds(301)),
+            "timestamp": timestamp(child_created + SignedDuration::milliseconds(301)),
             "type": "turn_context",
             "payload": {"turn_id": child_turn, "model": "gpt-child", "effort": "high"}
         }),
         json!({
-            "timestamp": timestamp(child_created + chrono::Duration::milliseconds(302)),
+            "timestamp": timestamp(child_created + SignedDuration::milliseconds(302)),
             "type": "event_msg",
             "payload": {"type": "user_message", "message": "implement the child task"}
         }),
         json!({
-            "timestamp": timestamp(child_created + chrono::Duration::seconds(1)),
+            "timestamp": timestamp(child_created + SignedDuration::seconds(1)),
             "type": "event_msg",
             "payload": {
                 "type": "token_count",
@@ -2542,7 +2542,7 @@ fn ignores_embedded_parent_history_but_uses_its_cumulative_token_baseline() {
             }
         }),
         json!({
-            "timestamp": timestamp(child_created + chrono::Duration::seconds(2)),
+            "timestamp": timestamp(child_created + SignedDuration::seconds(2)),
             "type": "event_msg",
             "payload": {"type": "task_complete", "turn_id": child_turn}
         }),
@@ -2666,7 +2666,7 @@ fn inherits_only_compatible_plain_subagent_thread_settings() {
 
     for (name, subagent, settings, child_model, expected_tier) in cases {
         let temp = TempDir::new().unwrap();
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         let child_id = format!("child-{name}");
         let child_turn = format!("turn-{name}");
         let path = temp.path().join(format!("sessions/rollout-{name}.jsonl"));
@@ -2762,7 +2762,7 @@ fn newer_child_settings_override_inherited_thread_spawn_settings() {
 
     for (name, child_settings, expected_tier) in cases {
         let temp = TempDir::new().unwrap();
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         let path = temp
             .path()
             .join(format!("sessions/rollout-child-tier-{name}.jsonl"));
@@ -2868,7 +2868,7 @@ fn newer_child_settings_override_inherited_thread_spawn_settings() {
 #[test]
 fn attributes_a_final_token_update_after_task_completion_to_the_last_turn() {
     let temp = TempDir::new().unwrap();
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let path = temp.path().join("sessions/rollout-final-token.jsonl");
     write_jsonl(
         &path,
@@ -2924,8 +2924,8 @@ fn attributes_a_final_token_update_after_task_completion_to_the_last_turn() {
 #[test]
 fn scans_archived_sessions_filters_old_mtime_and_redacts_active_task_titles() {
     let temp = TempDir::new().unwrap();
-    let now = Utc::now();
-    let active_at = now - chrono::Duration::seconds(10);
+    let now = UtcTimestamp::now();
+    let active_at = now - SignedDuration::seconds(10);
     let archived = temp.path().join("archived_sessions/rollout-archived.jsonl");
     write_jsonl(
         &archived,
@@ -3003,7 +3003,7 @@ fn scans_archived_sessions_filters_old_mtime_and_redacts_active_task_titles() {
 #[test]
 fn active_rollout_copy_wins_over_an_archived_copy_for_resume_eligibility() {
     let temp = TempDir::new().unwrap();
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let records = [
         json!({
             "timestamp": timestamp(now),
@@ -3016,22 +3016,22 @@ fn active_rollout_copy_wins_over_an_archived_copy_for_resume_eligibility() {
             }
         }),
         json!({
-            "timestamp": timestamp(now + chrono::Duration::seconds(1)),
+            "timestamp": timestamp(now + SignedDuration::seconds(1)),
             "type": "event_msg",
             "payload": {"type": "task_started", "turn_id": "shared-turn"}
         }),
         json!({
-            "timestamp": timestamp(now + chrono::Duration::seconds(2)),
+            "timestamp": timestamp(now + SignedDuration::seconds(2)),
             "type": "event_msg",
             "payload": {"type": "token_count", "info": {"total_token_usage": usage(8, 2, 2, 1, 10)}}
         }),
         json!({
-            "timestamp": timestamp(now + chrono::Duration::seconds(3)),
+            "timestamp": timestamp(now + SignedDuration::seconds(3)),
             "type": "event_msg",
             "payload": {"type": "token_count", "info": {"total_token_usage": usage(16, 4, 4, 2, 20)}}
         }),
         json!({
-            "timestamp": timestamp(now + chrono::Duration::seconds(4)),
+            "timestamp": timestamp(now + SignedDuration::seconds(4)),
             "type": "event_msg",
             "payload": {"type": "task_complete", "turn_id": "shared-turn"}
         }),
@@ -3047,7 +3047,7 @@ fn active_rollout_copy_wins_over_an_archived_copy_for_resume_eligibility() {
         );
     }
 
-    let dataset = scan_rollouts(&config(temp.path()), now + chrono::Duration::seconds(4)).unwrap();
+    let dataset = scan_rollouts(&config(temp.path()), now + SignedDuration::seconds(4)).unwrap();
 
     assert_eq!(dataset.tasks.len(), 1);
     assert_eq!(dataset.tasks[0].thread_id, "shared-thread");
@@ -3060,7 +3060,7 @@ fn active_rollout_copy_wins_over_an_archived_copy_for_resume_eligibility() {
 #[test]
 fn reports_files_truncated_by_the_scan_limit() {
     let temp = TempDir::new().unwrap();
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     for index in 0..3 {
         let path = temp.path().join(format!("sessions/rollout-{index}.jsonl"));
         write_jsonl(
@@ -3089,7 +3089,7 @@ fn missing_codex_home_is_reported_as_incomplete() {
     let temp = TempDir::new().unwrap();
     let missing = temp.path().join("missing-codex-home");
 
-    let dataset = scan_rollouts(&config(&missing), Utc::now()).unwrap();
+    let dataset = scan_rollouts(&config(&missing), UtcTimestamp::now()).unwrap();
 
     assert!(dataset.tasks.is_empty());
     assert_eq!(dataset.stats.unreadable_files, 1);
@@ -3104,7 +3104,7 @@ fn missing_codex_home_is_reported_as_incomplete() {
 #[test]
 fn an_extreme_lookback_does_not_overflow() {
     let temp = TempDir::new().unwrap();
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let mut scan_config = config(temp.path());
     scan_config.lookback_days = i64::MAX;
 
@@ -3117,8 +3117,8 @@ fn an_extreme_lookback_does_not_overflow() {
 #[test]
 fn marks_an_unclosed_turn_stale_after_the_active_grace_period() {
     let temp = TempDir::new().unwrap();
-    let now = Utc::now();
-    let old_activity = now - chrono::Duration::minutes(10);
+    let now = UtcTimestamp::now();
+    let old_activity = now - SignedDuration::minutes(10);
     let path = temp.path().join("sessions/rollout-stale.jsonl");
     write_jsonl(
         &path,

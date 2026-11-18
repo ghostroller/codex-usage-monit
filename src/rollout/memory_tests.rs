@@ -9,11 +9,11 @@ fn fixture_config(home: &Path) -> CollectConfig {
     }
 }
 
-fn record(at: DateTime<Utc>, kind: &str, payload: Value) -> Value {
+fn record(at: UtcTimestamp, kind: &str, payload: Value) -> Value {
     serde_json::json!({"timestamp": at.to_rfc3339(), "type": kind, "payload": payload})
 }
 
-fn counter(at: DateTime<Utc>, total: u64) -> Value {
+fn counter(at: UtcTimestamp, total: u64) -> Value {
     record(
         at,
         "event_msg",
@@ -26,7 +26,7 @@ fn counter(at: DateTime<Utc>, total: u64) -> Value {
     )
 }
 
-fn activity(at: DateTime<Utc>) -> Value {
+fn activity(at: UtcTimestamp) -> Value {
     record(
         at,
         "response_item",
@@ -56,7 +56,7 @@ fn append(path: &Path, value: Value) {
     .unwrap();
 }
 
-fn session(at: DateTime<Utc>, thread: &str, filler: usize) -> Vec<Value> {
+fn session(at: UtcTimestamp, thread: &str, filler: usize) -> Vec<Value> {
     let mut records = vec![
         record(
             at,
@@ -80,7 +80,7 @@ fn session(at: DateTime<Utc>, thread: &str, filler: usize) -> Vec<Value> {
         ),
     ];
     records.extend((0..filler).map(|_| activity(at)));
-    records.push(counter(at + ChronoDuration::seconds(1), 100));
+    records.push(counter(at + SignedDuration::seconds(1), 100));
     records
 }
 
@@ -112,26 +112,26 @@ fn event_pointer(cache: &RolloutCache, path: &Path, index: usize) -> *const Pars
 #[test]
 fn rollout_memory_fork_widens_scan_without_widening_live_selection_or_coverage() {
     let temp = tempfile::tempdir().unwrap();
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let recent = temp.path().join("sessions/rollout-recent.jsonl");
     let older = temp.path().join("sessions/rollout-older.jsonl");
     write_records(
         &recent,
-        &session(now - ChronoDuration::minutes(1), "recent", 1),
+        &session(now - SignedDuration::minutes(1), "recent", 1),
     );
-    let old_at = now - ChronoDuration::days(20);
+    let old_at = now - SignedDuration::days(20);
     write_records(&older, &session(old_at, "older", 1));
     File::options()
         .write(true)
         .open(&older)
         .unwrap()
-        .set_times(fs::FileTimes::new().set_modified(SystemTime::from(old_at)))
+        .set_times(fs::FileTimes::new().set_modified(old_at.as_jiff().try_into().unwrap()))
         .unwrap();
     let mut live_config = fixture_config(temp.path());
     live_config.max_files = 1;
     let mut live = RolloutCache::new();
     let original = live
-        .scan_with_external_boundary(&live_config, now, Some(now + ChronoDuration::minutes(1)))
+        .scan_with_external_boundary(&live_config, now, Some(now + SignedDuration::minutes(1)))
         .unwrap();
     assert_eq!(original.tasks.len(), 1);
     assert_eq!(original.tasks[0].thread_id, "recent");
@@ -181,7 +181,7 @@ fn rollout_memory_fork_widens_scan_without_widening_live_selection_or_coverage()
     assert_eq!(live.local_coverage_started_at, Some(now));
     assert_eq!(
         live.next_external_evidence_boundary,
-        Some(now + ChronoDuration::minutes(1))
+        Some(now + SignedDuration::minutes(1))
     );
     assert_same_dataset(&original, &live.scan(&live_config, now).unwrap());
 }
@@ -189,13 +189,13 @@ fn rollout_memory_fork_widens_scan_without_widening_live_selection_or_coverage()
 #[test]
 fn rollout_memory_shared_append_keeps_full_chunks_and_unique_append_moves_buffer() {
     let temp = tempfile::tempdir().unwrap();
-    let at = Utc::now() - ChronoDuration::minutes(1);
+    let at = UtcTimestamp::now() - SignedDuration::minutes(1);
     let path = temp.path().join("sessions/rollout-tail.jsonl");
     // Four setup events + 509 Activities + one counter: two full chunks and
     // two events in the last chunk, which has room for subsequent appends.
     write_records(&path, &session(at, "tail", 509));
     let config = fixture_config(temp.path());
-    let now = at + ChronoDuration::seconds(10);
+    let now = at + SignedDuration::seconds(10);
     let mut live = RolloutCache::new();
     let initial = live.scan(&config, now).unwrap();
     assert_eq!(live.files[&path].parsed.events.len(), 514);
@@ -204,7 +204,7 @@ fn rollout_memory_shared_append_keeps_full_chunks_and_unique_append_moves_buffer
     let prefix = event_pointer(&live, &path, 0);
     let second_chunk = event_pointer(&live, &path, 256);
     let shared_last = event_pointer(&live, &path, 512);
-    append(&path, counter(at + ChronoDuration::seconds(2), 200));
+    append(&path, counter(at + SignedDuration::seconds(2), 200));
     let changed = live.scan(&config, now).unwrap();
     assert_eq!(live.last_refresh.tail_parsed_files, 1);
     assert_eq!(live.last_refresh.full_parsed_files, 0);
@@ -229,7 +229,7 @@ fn rollout_memory_shared_append_keeps_full_chunks_and_unique_append_moves_buffer
     append(
         &path,
         record(
-            at + ChronoDuration::seconds(3),
+            at + SignedDuration::seconds(3),
             "event_msg",
             serde_json::json!({"type": "task_complete", "turn_id": "turn"}),
         ),
@@ -248,11 +248,11 @@ fn rollout_memory_shared_append_keeps_full_chunks_and_unique_append_moves_buffer
 #[test]
 fn rollout_memory_replacement_and_failed_tail_guard_leave_fork_prefix_untouched() {
     let temp = tempfile::tempdir().unwrap();
-    let at = Utc::now() - ChronoDuration::minutes(1);
+    let at = UtcTimestamp::now() - SignedDuration::minutes(1);
     let path = temp.path().join("sessions/rollout-replace.jsonl");
     write_records(&path, &session(at, "original", 270));
     let config = fixture_config(temp.path());
-    let now = at + ChronoDuration::seconds(10);
+    let now = at + SignedDuration::seconds(10);
     let mut live = RolloutCache::new();
     live.scan(&config, now).unwrap();
     let fork = live.fork_for_history_scan();
@@ -287,20 +287,20 @@ fn rollout_memory_replacement_and_failed_tail_guard_leave_fork_prefix_untouched(
 #[test]
 fn rollout_memory_fork_redaction_home_and_as_of_projections_are_independent() {
     let temp = tempfile::tempdir().unwrap();
-    let at = Utc::now() - ChronoDuration::minutes(1);
+    let at = UtcTimestamp::now() - SignedDuration::minutes(1);
     let path = temp.path().join("sessions/rollout-as-of.jsonl");
-    let future = at + ChronoDuration::seconds(30);
+    let future = at + SignedDuration::seconds(30);
     let mut records = session(at, "as-of", 270);
     records.extend([
         record(future, "event_msg", serde_json::json!({"type": "thread_settings_applied", "thread_settings": {"service_tier": "fast"}})),
         record(future, "turn_context", serde_json::json!({"turn_id": "turn", "model": "future-model"})),
-        counter(future + ChronoDuration::seconds(1), 200),
-        record(at + ChronoDuration::seconds(2), "event_msg", serde_json::json!({"type": "task_complete", "turn_id": "turn", "completed_at": (future + ChronoDuration::seconds(2)).to_rfc3339()})),
+        counter(future + SignedDuration::seconds(1), 200),
+        record(at + SignedDuration::seconds(2), "event_msg", serde_json::json!({"type": "task_complete", "turn_id": "turn", "completed_at": (future + SignedDuration::seconds(2)).to_rfc3339()})),
     ]);
     write_records(&path, &records);
     let config = fixture_config(temp.path());
-    let early = at + ChronoDuration::seconds(10);
-    let late = future + ChronoDuration::seconds(3);
+    let early = at + SignedDuration::seconds(10);
+    let late = future + SignedDuration::seconds(3);
     let mut live = RolloutCache::new();
     let completed = live.scan(&config, late).unwrap();
     assert_eq!(completed.tasks[0].status, TaskStatus::Completed);
@@ -351,7 +351,7 @@ fn rollout_memory_fork_redaction_home_and_as_of_projections_are_independent() {
 
 #[test]
 fn rollout_memory_chunk_boundary_keeps_global_counter_indices_and_baseline_cow_local() {
-    let at = DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+    let at = UtcTimestamp::from_timestamp(1_800_000_000, 0).unwrap();
     let mut events = ParsedEvents::default();
     events.push(ParsedEvent::TaskStarted {
         timestamp: at,
@@ -407,7 +407,7 @@ fn rollout_memory_chunk_boundary_keeps_global_counter_indices_and_baseline_cow_l
         |events: &ParsedEvents, index| events.iter().nth(index).unwrap() as *const ParsedEvent;
     assert!(!retain_latest_foreign_baseline(
         &mut events,
-        at + ChronoDuration::seconds(1),
+        at + SignedDuration::seconds(1),
         TokenUsage {
             input_tokens: 200,
             total_tokens: 200,
@@ -427,7 +427,7 @@ fn rollout_memory_chunk_boundary_keeps_global_counter_indices_and_baseline_cow_l
 
 #[test]
 fn rollout_memory_shared_prefix_comparison_retains_float_value_semantics() {
-    let at = DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+    let at = UtcTimestamp::from_timestamp(1_800_000_000, 0).unwrap();
     let mut events = ParsedEvents::default();
     events.push(ParsedEvent::TokenCount(Box::new(TokenCountEvent {
         timestamp: at,

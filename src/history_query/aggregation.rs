@@ -6,8 +6,6 @@ mod tests;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 
-use chrono::{DateTime, Duration, Utc};
-
 use super::reconciliation::{LogicalThreadProjection, add_optional_units};
 use super::{
     DUPLICATE_SESSION_WEEKLY_REBUILT_FROM_BUCKETS, RESET_DRIFT_SECONDS, SourceSlice,
@@ -21,6 +19,7 @@ use crate::project_mapping::ProjectMappingProjection;
 use crate::source_history::{SourceKind, SourceMetadata};
 use crate::source_identity::NodeId;
 use crate::source_model::ObservedProjectKey;
+use crate::time::{Duration, UtcTimestamp};
 use crate::trace::{TraceFields, TraceOutcome, process_trace_log};
 
 // Reset schedules can change several times within a week. Bound the actual
@@ -100,7 +99,7 @@ pub(super) fn aggregate_source_buckets_with_logical_threads(
     project_mapping: &ProjectMappingProjection,
     logical_threads: &LogicalThreadProjection,
 ) -> BucketProjection {
-    let mut buckets = BTreeMap::<DateTime<Utc>, LocalHalfHourBucket>::new();
+    let mut buckets = BTreeMap::<UtcTimestamp, LocalHalfHourBucket>::new();
     let mut project_observations = false;
     let mut unmapped_projects = false;
     for source in sources {
@@ -276,7 +275,6 @@ fn mask_api_cost_projection(
 
 #[cfg(test)]
 mod revision_merge_tests {
-    use chrono::TimeZone;
 
     use super::*;
     use crate::domain::{ApiCostAmount, PicoUsd};
@@ -301,7 +299,7 @@ mod revision_merge_tests {
         api_pricing_catalog_revision: u32,
         thread_id: &str,
     ) -> LocalHalfHourBucket {
-        let starts_at = Utc.with_ymd_and_hms(2026, 9, 7, 10, 0, 0).unwrap();
+        let starts_at = UtcTimestamp::from_utc(2026, 9, 7, 10, 0, 0).unwrap();
         let token_usage = TokenUsage {
             input_tokens: tokens,
             total_tokens: tokens,
@@ -528,7 +526,7 @@ fn scoped_value(value: &str, source_id: &NodeId) -> String {
 pub(super) fn aggregate_source_weekly_points(
     sources: &[SourceSlice],
     account_quota: &[QuotaPoint],
-    since: DateTime<Utc>,
+    since: UtcTimestamp,
 ) -> io::Result<Vec<WeeklyLocalPoint>> {
     let resets = canonical_weekly_resets(sources, account_quota)?;
     aggregate_source_weekly_points_for_resets(sources, &resets, since)
@@ -539,8 +537,8 @@ pub(super) fn aggregate_source_weekly_points(
 /// buckets, and replica rebuilding cannot reinterpret rolling reset samples.
 pub(super) fn aggregate_source_weekly_points_for_resets(
     sources: &[SourceSlice],
-    resets: &[DateTime<Utc>],
-    since: DateTime<Utc>,
+    resets: &[UtcTimestamp],
+    since: UtcTimestamp,
 ) -> io::Result<Vec<WeeklyLocalPoint>> {
     let trace = process_trace_log().span_with("history.weekly_aggregate", || {
         TraceFields::new()
@@ -592,7 +590,7 @@ pub(super) struct WeeklyAggregationWork {
 pub(super) fn aggregate_source_weekly_points_with_work(
     sources: &[SourceSlice],
     account_quota: &[QuotaPoint],
-    since: DateTime<Utc>,
+    since: UtcTimestamp,
 ) -> io::Result<(Vec<WeeklyLocalPoint>, WeeklyAggregationWork)> {
     let resets = canonical_weekly_resets(sources, account_quota)?;
     aggregate_weekly_resets_with_work(sources, &resets, since)
@@ -600,8 +598,8 @@ pub(super) fn aggregate_source_weekly_points_with_work(
 
 fn aggregate_weekly_resets_with_work(
     sources: &[SourceSlice],
-    resets: &[DateTime<Utc>],
-    since: DateTime<Utc>,
+    resets: &[UtcTimestamp],
+    since: UtcTimestamp,
 ) -> io::Result<(Vec<WeeklyLocalPoint>, WeeklyAggregationWork)> {
     let mut work = WeeklyAggregationWork {
         reset_cycles: resets.len(),
@@ -695,9 +693,9 @@ struct WeeklyCycleSourceInput<'a> {
 }
 
 struct WeeklyCyclePlan<'a> {
-    starts_at: DateTime<Utc>,
-    resets_at: DateTime<Utc>,
-    timeline: Vec<DateTime<Utc>>,
+    starts_at: UtcTimestamp,
+    resets_at: UtcTimestamp,
+    timeline: Vec<UtcTimestamp>,
     source_inputs: Vec<WeeklyCycleSourceInput<'a>>,
 }
 
@@ -725,7 +723,7 @@ fn reserve_weekly_membership<T>(
 /// complete record set once per canonical reset.
 fn weekly_cycle_plans<'a>(
     sources: &'a [SourceSlice],
-    resets: &[DateTime<Utc>],
+    resets: &[UtcTimestamp],
     work: &mut WeeklyAggregationWork,
     budget: &mut WeeklyProjectionBudget,
 ) -> io::Result<Vec<WeeklyCyclePlan<'a>>> {
@@ -752,7 +750,7 @@ fn weekly_cycle_plans<'a>(
         plans.push(WeeklyCyclePlan {
             starts_at: resets_at
                 .checked_sub_signed(Duration::minutes(WEEKLY_WINDOW_MINUTES))
-                .unwrap_or(DateTime::<Utc>::MIN_UTC),
+                .unwrap_or(UtcTimestamp::MIN),
             resets_at,
             timeline: Vec::new(),
             source_inputs,
@@ -833,7 +831,7 @@ fn weekly_cycle_plans<'a>(
 pub(super) fn canonical_weekly_resets(
     sources: &[SourceSlice],
     account_quota: &[QuotaPoint],
-) -> io::Result<Vec<DateTime<Utc>>> {
+) -> io::Result<Vec<UtcTimestamp>> {
     // A server reports `observed_at + 7d` while a completely unused weekly
     // window is not anchored yet. A local call can arrive before that gauge
     // refreshes, so non-zero local usage alone must not turn a known rolling
@@ -960,7 +958,7 @@ pub(super) fn canonical_weekly_resets(
 /// source-only cycle even after later cycles arrive. The sorted index keeps
 /// matching logarithmic in retained samples.
 struct RollingResetEvidence {
-    observations: Vec<(DateTime<Utc>, DateTime<Utc>)>,
+    observations: Vec<(UtcTimestamp, UtcTimestamp)>,
 }
 
 impl RollingResetEvidence {
@@ -990,7 +988,7 @@ impl RollingResetEvidence {
         Ok(Self { observations })
     }
 
-    fn was_superseded(&self, point: &WeeklyLocalPoint, account_resets: &[DateTime<Utc>]) -> bool {
+    fn was_superseded(&self, point: &WeeklyLocalPoint, account_resets: &[UtcTimestamp]) -> bool {
         let Some(rolling_observed_at) = self
             .observations
             .binary_search_by_key(&point.resets_at, |(reset, _)| *reset)
@@ -1012,7 +1010,7 @@ impl RollingResetEvidence {
     }
 }
 
-fn cluster_sorted_weekly_resets(candidates: &[DateTime<Utc>]) -> io::Result<Vec<DateTime<Utc>>> {
+fn cluster_sorted_weekly_resets(candidates: &[UtcTimestamp]) -> io::Result<Vec<UtcTimestamp>> {
     let mut resets = Vec::new();
     resets.try_reserve(candidates.len()).map_err(|error| {
         io::Error::other(format!(
@@ -1045,7 +1043,7 @@ fn weekly_point_establishes_cycle(point: &WeeklyLocalPoint) -> bool {
             .any(|reason| reason == DUPLICATE_SESSION_WEEKLY_REBUILT_FROM_BUCKETS)
 }
 
-fn reset_matches(left: DateTime<Utc>, right: DateTime<Utc>) -> bool {
+fn reset_matches(left: UtcTimestamp, right: UtcTimestamp) -> bool {
     left.signed_duration_since(right)
         .num_seconds()
         .unsigned_abs()
@@ -1057,9 +1055,9 @@ fn reset_matches(left: DateTime<Utc>, right: DateTime<Utc>) -> bool {
 /// matching every cycle would count the same cumulative weekly baseline twice.
 /// The nearest anchor wins, with the earlier anchor breaking an exact tie.
 pub(super) fn assigned_canonical_reset(
-    reported: DateTime<Utc>,
-    canonical: &[DateTime<Utc>],
-) -> Option<DateTime<Utc>> {
+    reported: UtcTimestamp,
+    canonical: &[UtcTimestamp],
+) -> Option<UtcTimestamp> {
     // `canonical_weekly_resets` returns a sorted set. Only the neighbours at
     // the insertion point can be nearest; avoiding a full scan matters when a
     // large source history is projected across several retained cycles.
@@ -1086,16 +1084,16 @@ pub(super) fn assigned_canonical_reset(
 
 pub(super) struct WeeklySourceCursor<'a> {
     source_kind: SourceKind,
-    cycle_starts_at: DateTime<Utc>,
+    cycle_starts_at: UtcTimestamp,
     weekly: Vec<&'a WeeklyLocalPoint>,
     buckets: Vec<&'a LocalHalfHourBucket>,
     coverage_buckets: Vec<&'a LocalHalfHourBucket>,
     weekly_index: usize,
     bucket_index: usize,
     coverage_index: usize,
-    base_observed_at: Option<DateTime<Utc>>,
+    base_observed_at: Option<UtcTimestamp>,
     aggregate: WeeklyAccumulator,
-    coverage_through: DateTime<Utc>,
+    coverage_through: UtcTimestamp,
     coverage_gap: bool,
 }
 
@@ -1103,8 +1101,8 @@ impl<'a> WeeklySourceCursor<'a> {
     #[cfg(test)]
     pub(super) fn new(
         source: &'a SourceSlice,
-        cycle_starts_at: DateTime<Utc>,
-        resets_at: DateTime<Utc>,
+        cycle_starts_at: UtcTimestamp,
+        resets_at: UtcTimestamp,
     ) -> Self {
         Self::new_assigned(source, cycle_starts_at, resets_at, &[resets_at])
     }
@@ -1112,9 +1110,9 @@ impl<'a> WeeklySourceCursor<'a> {
     #[cfg(test)]
     fn new_assigned(
         source: &'a SourceSlice,
-        cycle_starts_at: DateTime<Utc>,
-        resets_at: DateTime<Utc>,
-        canonical_resets: &[DateTime<Utc>],
+        cycle_starts_at: UtcTimestamp,
+        resets_at: UtcTimestamp,
+        canonical_resets: &[UtcTimestamp],
     ) -> Self {
         let mut weekly = source
             .weekly_local_points
@@ -1151,7 +1149,7 @@ impl<'a> WeeklySourceCursor<'a> {
 
     fn from_partitioned(
         source_kind: SourceKind,
-        cycle_starts_at: DateTime<Utc>,
+        cycle_starts_at: UtcTimestamp,
         input: WeeklyCycleSourceInput<'a>,
     ) -> Self {
         Self {
@@ -1172,7 +1170,7 @@ impl<'a> WeeklySourceCursor<'a> {
 
     pub(super) fn advance_to(
         &mut self,
-        observed_at: DateTime<Utc>,
+        observed_at: UtcTimestamp,
         work: &mut WeeklyAggregationWork,
     ) -> Option<WeeklyAccumulator> {
         while self
@@ -1227,7 +1225,7 @@ impl<'a> WeeklySourceCursor<'a> {
 
     fn coverage_complete_through(
         &mut self,
-        observed_at: DateTime<Utc>,
+        observed_at: UtcTimestamp,
         work: &mut WeeklyAggregationWork,
     ) -> bool {
         let target = observed_at - Duration::seconds(observed_at.timestamp().rem_euclid(15 * 60));
@@ -1257,9 +1255,9 @@ impl<'a> WeeklySourceCursor<'a> {
 #[cfg(test)]
 pub(super) fn source_weekly_cumulative_at(
     source: &SourceSlice,
-    cycle_starts_at: DateTime<Utc>,
-    resets_at: DateTime<Utc>,
-    observed_at: DateTime<Utc>,
+    cycle_starts_at: UtcTimestamp,
+    resets_at: UtcTimestamp,
+    observed_at: UtcTimestamp,
 ) -> Option<WeeklyAccumulator> {
     let base = source
         .weekly_local_points
@@ -1306,8 +1304,8 @@ pub(super) fn source_weekly_cumulative_at(
 #[cfg(test)]
 fn source_buckets_cover_cycle(
     buckets: &[LocalHalfHourBucket],
-    cycle_starts_at: DateTime<Utc>,
-    observed_through: DateTime<Utc>,
+    cycle_starts_at: UtcTimestamp,
+    observed_through: UtcTimestamp,
 ) -> bool {
     let target =
         observed_through - Duration::seconds(observed_through.timestamp().rem_euclid(15 * 60));

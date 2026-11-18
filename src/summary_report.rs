@@ -8,9 +8,10 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
+use jiff::civil::{Date, DateTime as CivilDateTime, Time};
 #[cfg(test)]
-use chrono::FixedOffset;
-use chrono::{DateTime, Duration, Local, NaiveDate, NaiveDateTime, NaiveTime, Timelike, Utc};
+use jiff::tz::Offset;
+use jiff::tz::TimeZone;
 use serde::{Deserialize, Serialize};
 
 #[cfg(test)]
@@ -29,6 +30,7 @@ use crate::summary::{
     ProjectSummary, SessionSummary, SummaryMetrics, SummarySample, SummaryTurnKey, SummaryWindow,
     TurnSummary, UsageSummary, summarize_samples_with_local_time,
 };
+use crate::time::{Duration, UtcTimestamp};
 
 const WEEK_MINUTES: i64 = 10_080;
 pub const SUMMARY_REPORT_SCHEMA_VERSION: u32 = 1;
@@ -38,12 +40,12 @@ pub const SUMMARY_BACKFILL_RETRY_DAYS: i64 = 7;
 
 #[cfg(test)]
 thread_local! {
-    static TEST_LOCAL_OFFSET: std::cell::Cell<Option<FixedOffset>> =
+    static TEST_LOCAL_OFFSET: std::cell::Cell<Option<Offset>> =
         const { std::cell::Cell::new(None) };
 }
 
 #[cfg(test)]
-pub(crate) struct SummaryTestLocalOffsetGuard(Option<FixedOffset>);
+pub(crate) struct SummaryTestLocalOffsetGuard(Option<Offset>);
 
 #[cfg(test)]
 impl Drop for SummaryTestLocalOffsetGuard {
@@ -53,19 +55,19 @@ impl Drop for SummaryTestLocalOffsetGuard {
 }
 
 /// Override the shared default local-time mapper on the current test thread.
-/// Production builds always resolve [`Local`] separately for each timestamp.
+/// Production builds resolve the system time zone's offset for each timestamp.
 #[cfg(test)]
-pub(crate) fn set_test_local_offset(offset: FixedOffset) -> SummaryTestLocalOffsetGuard {
+pub(crate) fn set_test_local_offset(offset: Offset) -> SummaryTestLocalOffsetGuard {
     SummaryTestLocalOffsetGuard(TEST_LOCAL_OFFSET.with(|current| current.replace(Some(offset))))
 }
 
-fn default_local_time(timestamp: DateTime<Utc>) -> NaiveDateTime {
+fn default_local_time(timestamp: UtcTimestamp) -> CivilDateTime {
     #[cfg(test)]
     if let Some(offset) = TEST_LOCAL_OFFSET.with(std::cell::Cell::get) {
-        return timestamp.with_timezone(&offset).naive_local();
+        return offset.to_datetime(timestamp.as_jiff());
     }
 
-    timestamp.with_timezone(&Local).naive_local()
+    TimeZone::system().to_datetime(timestamp.as_jiff())
 }
 
 /// Time range queried by Summary.
@@ -99,7 +101,7 @@ impl SummaryRange {
     pub fn window(
         self,
         snapshot: &Snapshot,
-        query_now: DateTime<Utc>,
+        query_now: UtcTimestamp,
     ) -> (SummaryWindow, Option<&'static str>) {
         let query_now = query_now.max(snapshot.as_of);
         let ends_at = query_now
@@ -168,12 +170,10 @@ impl SummaryGrain {
         }
     }
 
-    pub fn bucket_start(self, hour: NaiveDateTime) -> NaiveDateTime {
-        let bucket_hour = match self {
-            Self::Day => 0,
-            _ => hour.hour().div_euclid(self.hours()) * self.hours(),
-        };
-        hour.date().and_hms_opt(bucket_hour, 0, 0).unwrap_or(hour)
+    pub fn bucket_start(self, hour: CivilDateTime) -> CivilDateTime {
+        let hours = self.hours() as i8;
+        let bucket_hour = hour.hour() / hours * hours;
+        hour.date().at(bucket_hour, 0, 0, 0)
     }
 }
 
@@ -219,7 +219,7 @@ pub struct SummaryReportQuery {
     pub grain: SummaryGrain,
     pub metric: SummaryMetric,
     pub api_long_context: bool,
-    pub query_now: DateTime<Utc>,
+    pub query_now: UtcTimestamp,
 }
 
 impl SummaryReportQuery {
@@ -228,7 +228,7 @@ impl SummaryReportQuery {
         grain: SummaryGrain,
         metric: SummaryMetric,
         api_long_context: bool,
-        query_now: DateTime<Utc>,
+        query_now: UtcTimestamp,
     ) -> Self {
         Self {
             range,
@@ -318,8 +318,8 @@ pub struct PreparedSummary {
     pub expected_buckets: usize,
     pub estimated_covered_tokens: u64,
     pub long_context_breakdown_complete: bool,
-    pub daily_coverage: BTreeMap<NaiveDate, SummaryDailyCoverage>,
-    pub hourly_coverage: BTreeMap<NaiveDateTime, SummaryDailyCoverage>,
+    pub daily_coverage: BTreeMap<Date, SummaryDailyCoverage>,
+    pub hourly_coverage: BTreeMap<CivilDateTime, SummaryDailyCoverage>,
     pub partial_reasons: Vec<String>,
 }
 
@@ -412,7 +412,7 @@ impl PreparedSummary {
     /// Metric-aware state using the host's true local offset at each edge.
     pub fn daily_state(
         &self,
-        date: NaiveDate,
+        date: Date,
         totals: SummaryMetrics,
         metric: SummaryMetric,
         api_long_context: bool,
@@ -422,11 +422,11 @@ impl PreparedSummary {
 
     pub fn daily_state_with_local_time(
         &self,
-        date: NaiveDate,
+        date: Date,
         totals: SummaryMetrics,
         metric: SummaryMetric,
         api_long_context: bool,
-        local_time: impl Fn(DateTime<Utc>) -> NaiveDateTime,
+        local_time: impl Fn(UtcTimestamp) -> CivilDateTime,
     ) -> SummaryCoverageState {
         let Some(coverage) = self.daily_coverage.get(&date) else {
             return SummaryCoverageState::Missing;
@@ -467,7 +467,7 @@ impl PreparedSummary {
         grain: SummaryGrain,
         metric: SummaryMetric,
         api_long_context: bool,
-        local_time: impl Fn(DateTime<Utc>) -> NaiveDateTime,
+        local_time: impl Fn(UtcTimestamp) -> CivilDateTime,
     ) -> SummaryCoverageState {
         if grain == SummaryGrain::Day {
             return self.daily_state_with_local_time(
@@ -498,7 +498,7 @@ impl PreparedSummary {
 
 #[derive(Clone, Debug)]
 pub struct SummaryChartBucket {
-    pub starts_at: NaiveDateTime,
+    pub starts_at: CivilDateTime,
     pub totals: SummaryMetrics,
     pub coverage: SummaryDailyCoverage,
 }
@@ -507,7 +507,7 @@ pub struct SummaryChartBucket {
 pub struct SummaryChartData {
     pub grain: SummaryGrain,
     pub buckets: Vec<SummaryChartBucket>,
-    pub project_values: HashMap<String, BTreeMap<NaiveDateTime, SummaryMetrics>>,
+    pub project_values: HashMap<String, BTreeMap<CivilDateTime, SummaryMetrics>>,
 }
 
 fn partial_reason_implies_omitted_usage(reason: &str) -> bool {
@@ -525,10 +525,10 @@ fn partial_reason_implies_omitted_usage(reason: &str) -> bool {
 /// Earliest timestamp loaded by the shared history view. The timestamp is
 /// aligned down to the persisted 15-minute bucket boundary before retaining
 /// the extra 31st day needed to answer a rolling 30-day query safely.
-pub fn history_view_since(now: DateTime<Utc>) -> DateTime<Utc> {
+pub fn history_view_since(now: UtcTimestamp) -> UtcTimestamp {
     let bucket_seconds = LOCAL_BUCKET_MINUTES * 60;
     let aligned_seconds = now.timestamp().div_euclid(bucket_seconds) * bucket_seconds;
-    DateTime::from_timestamp(aligned_seconds, 0).unwrap_or(now)
+    UtcTimestamp::from_timestamp(aligned_seconds, 0).unwrap_or(now)
         - Duration::days(SUMMARY_HISTORY_DAYS)
 }
 
@@ -544,7 +544,7 @@ pub fn summary_backfill_config(config: &CollectConfig) -> CollectConfig {
 }
 
 /// Whether a new 30-day reconstruction should be attempted now.
-pub fn summary_history_backfill_needed(history: &HistoryData, now: DateTime<Utc>) -> bool {
+pub fn summary_history_backfill_needed(history: &HistoryData, now: UtcTimestamp) -> bool {
     if history.read_only {
         return false;
     }
@@ -565,7 +565,7 @@ pub fn summary_history_backfill_needed(history: &HistoryData, now: DateTime<Utc>
 /// A covered bucket must have current project attribution, estimator and API
 /// pricing revisions, plus the separately stored Longx component. This remains
 /// a pure query; it does not trust a prior backfill marker over actual buckets.
-pub fn summary_history_coverage_complete(history: &HistoryData, now: DateTime<Utc>) -> bool {
+pub fn summary_history_coverage_complete(history: &HistoryData, now: UtcTimestamp) -> bool {
     let ends_at = now
         .checked_add_signed(Duration::nanoseconds(1))
         .unwrap_or(now);
@@ -626,7 +626,7 @@ pub fn prepare_summary(
     snapshot: &Snapshot,
     history: &HistoryData,
     range: SummaryRange,
-    query_now: DateTime<Utc>,
+    query_now: UtcTimestamp,
 ) -> PreparedSummary {
     prepare_summary_with_local_time(snapshot, history, range, query_now, default_local_time)
 }
@@ -636,8 +636,8 @@ pub fn prepare_summary_with_local_time(
     snapshot: &Snapshot,
     history: &HistoryData,
     range: SummaryRange,
-    query_now: DateTime<Utc>,
-    local_time: impl Fn(DateTime<Utc>) -> NaiveDateTime,
+    query_now: UtcTimestamp,
+    local_time: impl Fn(UtcTimestamp) -> CivilDateTime,
 ) -> PreparedSummary {
     let (window, range_note) = range.window(snapshot, query_now);
     let mut samples = Vec::new();
@@ -861,7 +861,7 @@ fn remote_catalog_uncovered_tokens(bucket: &crate::history::LocalHalfHourBucket)
 
 /// Re-bucket a prepared summary without rescanning history.
 pub fn prepare_summary_chart(prepared: &PreparedSummary, grain: SummaryGrain) -> SummaryChartData {
-    let mut coverage_by_bucket = BTreeMap::<NaiveDateTime, SummaryDailyCoverage>::new();
+    let mut coverage_by_bucket = BTreeMap::<CivilDateTime, SummaryDailyCoverage>::new();
     for (hour, coverage) in &prepared.hourly_coverage {
         coverage_by_bucket
             .entry(grain.bucket_start(*hour))
@@ -869,7 +869,7 @@ pub fn prepare_summary_chart(prepared: &PreparedSummary, grain: SummaryGrain) ->
             .add_assign(coverage);
     }
 
-    let mut totals_by_bucket = BTreeMap::<NaiveDateTime, SummaryMetrics>::new();
+    let mut totals_by_bucket = BTreeMap::<CivilDateTime, SummaryMetrics>::new();
     for hour in &prepared.usage.hours {
         totals_by_bucket
             .entry(grain.bucket_start(hour.starts_at))
@@ -893,7 +893,7 @@ pub fn prepare_summary_chart(prepared: &PreparedSummary, grain: SummaryGrain) ->
         .projects
         .iter()
         .map(|project| {
-            let mut by_bucket = BTreeMap::<NaiveDateTime, SummaryMetrics>::new();
+            let mut by_bucket = BTreeMap::<CivilDateTime, SummaryMetrics>::new();
             for hour in &project.hours {
                 by_bucket
                     .entry(grain.bucket_start(hour.starts_at))
@@ -915,8 +915,8 @@ pub fn prepare_summary_chart(prepared: &PreparedSummary, grain: SummaryGrain) ->
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SummaryReportWindow {
-    pub starts_at: DateTime<Utc>,
-    pub ends_at: DateTime<Utc>,
+    pub starts_at: UtcTimestamp,
+    pub ends_at: UtcTimestamp,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
 }
@@ -969,7 +969,7 @@ pub struct SummaryCoverageReport {
 #[serde(rename_all = "camelCase")]
 pub struct SummaryBucketReport {
     /// Start of the bucket in the local wall clock selected by the builder.
-    pub starts_at: NaiveDateTime,
+    pub starts_at: CivilDateTime,
     pub metrics: SummaryReportMetrics,
     #[serde(with = "crate::exact_json::u128_decimal")]
     pub value: u128,
@@ -980,7 +980,7 @@ pub struct SummaryBucketReport {
 #[serde(rename_all = "camelCase")]
 pub struct SummaryProjectBucketReport {
     /// Start of the sparse project bucket in the selected local wall clock.
-    pub starts_at: NaiveDateTime,
+    pub starts_at: CivilDateTime,
     pub metrics: SummaryReportMetrics,
     #[serde(with = "crate::exact_json::u128_decimal")]
     pub value: u128,
@@ -1003,7 +1003,7 @@ pub struct SummaryTurnReport {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message_preview: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub started_at: Option<DateTime<Utc>>,
+    pub started_at: Option<UtcTimestamp>,
     pub metrics: SummaryReportMetrics,
     #[serde(with = "crate::exact_json::u128_decimal")]
     pub value: u128,
@@ -1058,7 +1058,7 @@ pub struct SummaryProjectReport {
 #[serde(rename_all = "camelCase")]
 pub struct SummaryReport {
     pub schema_version: u32,
-    pub generated_at: DateTime<Utc>,
+    pub generated_at: UtcTimestamp,
     pub range: SummaryRange,
     pub grain: SummaryGrain,
     pub metric: SummaryMetric,
@@ -1091,7 +1091,7 @@ pub fn build_summary_report_with_local_time(
     snapshot: &Snapshot,
     history: &HistoryData,
     query: SummaryReportQuery,
-    local_time: impl Fn(DateTime<Utc>) -> NaiveDateTime,
+    local_time: impl Fn(UtcTimestamp) -> CivilDateTime,
 ) -> SummaryReport {
     let prepared = prepare_summary_with_local_time(
         snapshot,
@@ -1117,7 +1117,7 @@ pub fn summary_report_from_prepared_with_local_time(
     prepared: &PreparedSummary,
     chart: &SummaryChartData,
     query: SummaryReportQuery,
-    local_time: impl Fn(DateTime<Utc>) -> NaiveDateTime,
+    local_time: impl Fn(UtcTimestamp) -> CivilDateTime,
 ) -> SummaryReport {
     debug_assert_eq!(chart.grain, query.grain);
     let total_metrics = prepared.usage.totals;
@@ -1211,7 +1211,7 @@ pub fn summary_report_from_prepared_with_local_time(
 
 fn project_report(
     project: &ProjectSummary,
-    project_buckets: Option<&BTreeMap<NaiveDateTime, SummaryMetrics>>,
+    project_buckets: Option<&BTreeMap<CivilDateTime, SummaryMetrics>>,
     total_metrics: SummaryMetrics,
     metric: SummaryMetric,
     api_long_context: bool,
@@ -1285,7 +1285,7 @@ fn turn_report(
     }
 }
 
-fn active_week_analysis(snapshot: &Snapshot, query_now: DateTime<Utc>) -> Option<&WindowAnalysis> {
+fn active_week_analysis(snapshot: &Snapshot, query_now: UtcTimestamp) -> Option<&WindowAnalysis> {
     let analysis = snapshot.window_analyses.iter().find(|analysis| {
         analysis.duration_mins == WEEK_MINUTES
             && analysis
@@ -1308,7 +1308,7 @@ fn active_week_analysis(snapshot: &Snapshot, query_now: DateTime<Utc>) -> Option
 
 pub(crate) fn expected_summary_coverage<K: Ord>(
     window: SummaryWindow,
-    local_key: impl Fn(DateTime<Utc>) -> K,
+    local_key: impl Fn(UtcTimestamp) -> K,
 ) -> BTreeMap<K, SummaryDailyCoverage> {
     let bucket_seconds = LOCAL_BUCKET_MINUTES * 60;
     let mut starts_at_seconds = window
@@ -1316,11 +1316,12 @@ pub(crate) fn expected_summary_coverage<K: Ord>(
         .timestamp()
         .div_euclid(bucket_seconds)
         .saturating_mul(bucket_seconds);
-    let aligned = DateTime::from_timestamp(starts_at_seconds, 0).unwrap_or(window.starts_at);
+    let aligned = UtcTimestamp::from_timestamp(starts_at_seconds, 0).unwrap_or(window.starts_at);
     if aligned < window.starts_at {
         starts_at_seconds = starts_at_seconds.saturating_add(bucket_seconds);
     }
-    let mut starts_at = DateTime::from_timestamp(starts_at_seconds, 0).unwrap_or(window.starts_at);
+    let mut starts_at =
+        UtcTimestamp::from_timestamp(starts_at_seconds, 0).unwrap_or(window.starts_at);
     let mut coverage = BTreeMap::<K, SummaryDailyCoverage>::new();
     while starts_at < window.ends_at {
         let bucket = coverage.entry(local_key(starts_at)).or_default();
@@ -1424,8 +1425,8 @@ fn api_cost_coverage_is_partial(amount: ApiCostAmount) -> bool {
 
 fn summary_day_is_partial_window_edge(
     window: SummaryWindow,
-    date: NaiveDate,
-    local_time: &impl Fn(DateTime<Utc>) -> NaiveDateTime,
+    date: Date,
+    local_time: &impl Fn(UtcTimestamp) -> CivilDateTime,
 ) -> bool {
     let local_start = local_time(window.starts_at);
     let starts_on_date = local_start.date() == date;
@@ -1434,15 +1435,15 @@ fn summary_day_is_partial_window_edge(
         .ends_at
         .checked_sub_signed(Duration::nanoseconds(1))
         .is_some_and(|last| local_time(last).date() == date);
-    (starts_on_date && local_start.time() != NaiveTime::MIN)
-        || (ends_on_date && local_end.time() != NaiveTime::MIN)
+    (starts_on_date && local_start.time() != Time::MIN)
+        || (ends_on_date && local_end.time() != Time::MIN)
 }
 
 fn summary_bucket_is_partial_window_edge(
     window: SummaryWindow,
-    starts_at: NaiveDateTime,
+    starts_at: CivilDateTime,
     grain: SummaryGrain,
-    local_time: &impl Fn(DateTime<Utc>) -> NaiveDateTime,
+    local_time: &impl Fn(UtcTimestamp) -> CivilDateTime,
 ) -> bool {
     let local_start = local_time(window.starts_at);
     let local_end = local_time(window.ends_at);
@@ -1452,17 +1453,14 @@ fn summary_bucket_is_partial_window_edge(
         .map(local_time)
         .unwrap_or(local_end);
     let bucket_end = starts_at
-        .checked_add_signed(Duration::hours(i64::from(grain.hours())))
+        .checked_add(jiff::SignedDuration::from_hours(i64::from(grain.hours())))
         .unwrap_or(starts_at);
     (grain.bucket_start(local_start) == starts_at && local_start != starts_at)
         || (grain.bucket_start(local_last) == starts_at && local_end != bucket_end)
 }
 
-fn local_hour(value: NaiveDateTime) -> NaiveDateTime {
-    value
-        .date()
-        .and_hms_opt(value.hour(), 0, 0)
-        .unwrap_or(value)
+fn local_hour(value: CivilDateTime) -> CivilDateTime {
+    value.date().at(value.hour(), 0, 0, 0)
 }
 
 fn sorted_projects(
@@ -1521,7 +1519,6 @@ fn percent_u128(value: u128, total: u128) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use chrono::{FixedOffset, TimeZone};
     use serde_json::Value;
 
     use super::*;
@@ -1531,10 +1528,8 @@ mod tests {
     };
     use crate::history::{LocalHalfHourBucket, LocalProjectUsageGroup};
 
-    fn at(day: u32, hour: u32, minute: u32) -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 8, day, hour, minute, 0)
-            .single()
-            .unwrap()
+    fn at(day: u32, hour: u32, minute: u32) -> UtcTimestamp {
+        UtcTimestamp::from_utc(2026, 8, day, hour, minute, 0).unwrap()
     }
 
     fn token_usage(total_tokens: u64) -> TokenUsage {
@@ -1545,7 +1540,7 @@ mod tests {
         }
     }
 
-    fn snapshot(as_of: DateTime<Utc>) -> Snapshot {
+    fn snapshot(as_of: UtcTimestamp) -> Snapshot {
         Snapshot {
             schema_version: 2,
             api_pricing: Default::default(),
@@ -1602,7 +1597,7 @@ mod tests {
     }
 
     fn bucket(
-        starts_at: DateTime<Utc>,
+        starts_at: UtcTimestamp,
         token_total: u64,
         groups: Vec<LocalProjectUsageGroup>,
     ) -> LocalHalfHourBucket {
@@ -2353,7 +2348,7 @@ mod tests {
 
     #[test]
     fn fixed_offset_mapper_is_applied_per_timestamp() {
-        let offset = FixedOffset::east_opt(8 * 60 * 60).unwrap();
+        let offset = Offset::from_seconds(8 * 60 * 60).unwrap();
         let now = at(30, 10, 7);
         let history = HistoryData {
             half_hour_buckets: vec![bucket(
@@ -2374,7 +2369,7 @@ mod tests {
                 false,
                 now,
             ),
-            |timestamp| timestamp.with_timezone(&offset).naive_local(),
+            |timestamp| offset.to_datetime(timestamp.as_jiff()),
         );
 
         assert_eq!(report.projects[0].buckets[0].starts_at.hour(), 8);

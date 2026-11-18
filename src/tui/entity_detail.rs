@@ -822,8 +822,8 @@ fn is_local_entity(app: &App, thread_id: &str, source: Option<&str>, cwd: Option
 struct DetailReadTarget {
     thread_id: String,
     turn_id: Option<String>,
-    starts_at: Option<DateTime<Utc>>,
-    as_of: DateTime<Utc>,
+    starts_at: Option<UtcTimestamp>,
+    as_of: UtcTimestamp,
 }
 
 fn raw_local_history_identity<'a>(app: &App, identity: &'a str) -> Option<&'a str> {
@@ -914,7 +914,7 @@ fn detail_enrichment_target(app: &App) -> Option<DetailReadTarget> {
                         .usage
                         .window
                         .ends_at
-                        .checked_sub_signed(ChronoDuration::nanoseconds(1))?;
+                        .checked_sub_signed(SignedDuration::nanoseconds(1))?;
                     let as_of = cache.snapshot_as_of.min(range_last);
                     if selected.kind == SummaryRowKind::Session
                         && selected.id == summary_thread_node_id(&project.key, &session.thread_id)
@@ -1067,15 +1067,10 @@ fn optional_text(value: Option<&str>) -> &str {
         .unwrap_or("unavailable")
 }
 
-fn timestamp(value: Option<DateTime<Utc>>) -> String {
+fn timestamp(value: Option<UtcTimestamp>) -> String {
     value.map_or_else(
         || "unavailable".to_string(),
-        |value| {
-            value
-                .with_timezone(&Local)
-                .format("%Y-%m-%d %H:%M:%S %:z")
-                .to_string()
-        },
+        |value| format_local_time(value, "%Y-%m-%d %H:%M:%S %:z"),
     )
 }
 
@@ -1086,7 +1081,7 @@ fn duration(value: Option<u64>) -> String {
     )
 }
 
-fn elapsed(start: Option<DateTime<Utc>>, end: DateTime<Utc>) -> Option<u64> {
+fn elapsed(start: Option<UtcTimestamp>, end: UtcTimestamp) -> Option<u64> {
     start.and_then(|start| {
         end.signed_duration_since(start)
             .num_milliseconds()

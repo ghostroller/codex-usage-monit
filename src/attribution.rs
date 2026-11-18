@@ -1,7 +1,5 @@
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, Duration, Utc};
-
 use crate::api_cost::{ApiCostAggregation, pricing_metadata};
 use crate::domain::{
     AttributionSummary, Confidence, LimitBucket, LimitWindow, ModelUsage, Provenance,
@@ -12,6 +10,7 @@ use crate::model_catalog::{
     PricingTier, credit_rates, fallback_credit_rates, long_context_input_threshold,
     model_supports_credit_long_context,
 };
+use crate::time::{Duration, UtcTimestamp};
 
 const FIVE_HOURS_MINS: i64 = 300;
 const WEEK_MINS: i64 = 10_080;
@@ -91,8 +90,8 @@ struct WindowAggregation {
 struct SelectedWindow<'a> {
     bucket: &'a LimitBucket,
     window: &'a LimitWindow,
-    starts_at: DateTime<Utc>,
-    ends_at: DateTime<Utc>,
+    starts_at: UtcTimestamp,
+    ends_at: UtcTimestamp,
 }
 
 /// Calculates raw local-token shares and low-confidence quota estimates for
@@ -107,7 +106,7 @@ pub fn analyze_windows(
     calls: &[UsageCall],
     _observations: &[RateObservation],
     limits: &[LimitBucket],
-    now: DateTime<Utc>,
+    now: UtcTimestamp,
 ) -> Vec<WindowAnalysis> {
     let settled = is_settled(tasks);
     select_windows(limits, now)
@@ -124,7 +123,7 @@ pub fn analyze_current_window(
     calls: &[UsageCall],
     observations: &[RateObservation],
     limits: &[LimitBucket],
-    now: DateTime<Utc>,
+    now: UtcTimestamp,
 ) -> (Vec<ModelUsage>, AttributionSummary) {
     let analyses = analyze_windows(tasks, turns, calls, observations, limits, now);
     project_five_hour_analysis(tasks, turns, &analyses)
@@ -205,7 +204,7 @@ fn is_settled(tasks: &[TaskRecord]) -> bool {
 fn analyze_selected_window(
     calls: &[UsageCall],
     selected: SelectedWindow<'_>,
-    now: DateTime<Utc>,
+    now: UtcTimestamp,
     settled: bool,
 ) -> WindowAnalysis {
     let quota_window_stale = matches!(
@@ -413,7 +412,7 @@ fn reset_records(tasks: &mut [TaskRecord], turns: &mut [TurnRecord]) {
     }
 }
 
-fn select_windows(limits: &[LimitBucket], now: DateTime<Utc>) -> Vec<SelectedWindow<'_>> {
+fn select_windows(limits: &[LimitBucket], now: UtcTimestamp) -> Vec<SelectedWindow<'_>> {
     let mut usable = Vec::new();
     let mut invalid_windows = 0;
     for bucket in limits {
@@ -483,11 +482,11 @@ pub(crate) fn is_spark_model(model: Option<&str>) -> bool {
     model.is_some_and(|model| model.trim().eq_ignore_ascii_case(SPARK_MODEL))
 }
 
-fn is_current_window(window: &SelectedWindow<'_>, now: DateTime<Utc>) -> bool {
+fn is_current_window(window: &SelectedWindow<'_>, now: UtcTimestamp) -> bool {
     let earliest = window
         .starts_at
         .checked_sub_signed(Duration::seconds(RESET_DRIFT_SECS))
-        .unwrap_or(DateTime::<Utc>::MIN_UTC);
+        .unwrap_or(UtcTimestamp::MIN);
     now >= earliest && now < window.ends_at
 }
 
@@ -603,7 +602,7 @@ mod tests {
 
     #[test]
     fn select_windows_rejects_invalid_input_and_checks_datetime_boundaries() {
-        fn bucket(id: &str, duration: i64, reset: DateTime<Utc>) -> LimitBucket {
+        fn bucket(id: &str, duration: i64, reset: UtcTimestamp) -> LimitBucket {
             LimitBucket {
                 limit_id: id.to_owned(),
                 limit_name: None,
@@ -616,7 +615,7 @@ mod tests {
                 as_of: reset,
             }
         }
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         for id in ["codex", "unrelated"] {
             for duration in [i64::MAX, 0, -1, 301] {
                 assert!(select_windows(&[bucket(id, duration, now)], now).is_empty());
@@ -629,11 +628,11 @@ mod tests {
             assert_eq!(selected.len(), 1);
             assert_eq!(selected[0].starts_at, reset - Duration::minutes(duration));
 
-            let min = DateTime::<Utc>::MIN_UTC;
+            let min = UtcTimestamp::MIN;
             assert!(select_windows(&[bucket("codex", duration, min)], min).is_empty());
             let limits = [bucket("codex", duration, min + Duration::minutes(duration))];
             assert_eq!(select_windows(&limits, min).len(), 1);
-            let max = DateTime::<Utc>::MAX_UTC;
+            let max = UtcTimestamp::MAX;
             let limits = [bucket("codex", duration, max)];
             assert_eq!(select_windows(&limits, max - Duration::seconds(1)).len(), 1);
             assert!(select_windows(&limits, max).is_empty());
@@ -642,7 +641,7 @@ mod tests {
 
     fn rated_call(model: &str, fast: bool, tokens: TokenUsage) -> UsageCall {
         UsageCall {
-            timestamp: Utc::now(),
+            timestamp: UtcTimestamp::now(),
             thread_id: "thread".to_string(),
             turn_id: Some("turn".to_string()),
             usage_event_id: None,
@@ -919,9 +918,7 @@ mod tests {
             total_tokens: 272_002,
             ..TokenUsage::default()
         };
-        let api_price_change = DateTime::parse_from_rfc3339("2027-03-01T08:00:00Z")
-            .unwrap()
-            .to_utc();
+        let api_price_change = UtcTimestamp::parse_from_rfc3339("2027-03-01T08:00:00Z").unwrap();
         for (model, included_multiplier) in [
             ("gpt-6.2-astra", 6),
             ("gpt-6.2-sol", 6),

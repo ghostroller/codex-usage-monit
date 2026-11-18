@@ -11,7 +11,6 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, TimeDelta, Utc};
 use serde::{Deserialize, Serialize};
 
 #[cfg(test)]
@@ -19,6 +18,7 @@ use crate::private_state_store::stable_lock_share_mode;
 use crate::private_state_store::{LockFilePolicy, LockMode, PrivateStoreLayout};
 use crate::remote_sync::{MIN_REMOTE_SYNC_RESPONSE_BYTES, RemoteSyncReport};
 use crate::source_identity::NodeId;
+use crate::time::{Duration, UtcTimestamp};
 
 pub const REMOTE_BANDWIDTH_BUDGET_SCHEMA_VERSION: u32 = 1;
 pub const REMOTE_BANDWIDTH_WINDOW_HOURS: i64 = 24;
@@ -125,7 +125,7 @@ pub struct RemoteBandwidthUsage {
     node_id: Option<NodeId>,
     committed_bytes: u64,
     reserved_bytes: u64,
-    oldest_expiry_at: Option<DateTime<Utc>>,
+    oldest_expiry_at: Option<UtcTimestamp>,
 }
 
 impl RemoteBandwidthUsage {
@@ -144,7 +144,7 @@ impl RemoteBandwidthUsage {
     pub fn rolling_bytes(&self) -> u64 {
         self.committed_bytes.saturating_add(self.reserved_bytes)
     }
-    pub fn oldest_expiry_at(&self) -> Option<DateTime<Utc>> {
+    pub fn oldest_expiry_at(&self) -> Option<UtcTimestamp> {
         self.oldest_expiry_at
     }
 }
@@ -156,7 +156,7 @@ pub struct RemoteBandwidthBudgetPause {
     level: RemoteBandwidthBudgetLevel,
     reason: RemoteBandwidthPauseReason,
     limit_bytes: u64,
-    resume_at: Option<DateTime<Utc>>,
+    resume_at: Option<UtcTimestamp>,
 }
 
 impl RemoteBandwidthBudgetPause {
@@ -172,7 +172,7 @@ impl RemoteBandwidthBudgetPause {
     pub fn limit_bytes(&self) -> u64 {
         self.limit_bytes
     }
-    pub fn resume_at(&self) -> Option<DateTime<Utc>> {
+    pub fn resume_at(&self) -> Option<UtcTimestamp> {
         self.resume_at
     }
     pub fn budget_paused(&self) -> bool {
@@ -187,7 +187,7 @@ pub struct RemoteBandwidthReservation {
     id: String,
     host_id: String,
     node_id: Option<NodeId>,
-    started_at: DateTime<Utc>,
+    started_at: UtcTimestamp,
     reserved_bytes: u64,
     reserved_transport_overhead_bytes: u64,
     kind: RemoteBandwidthTransferKind,
@@ -200,7 +200,7 @@ impl RemoteBandwidthReservation {
     pub fn node_id(&self) -> Option<&NodeId> {
         self.node_id.as_ref()
     }
-    pub fn started_at(&self) -> DateTime<Utc> {
+    pub fn started_at(&self) -> UtcTimestamp {
         self.started_at
     }
     pub fn reserved_bytes(&self) -> u64 {
@@ -284,7 +284,7 @@ struct LedgerEntry {
     host_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     node_id: Option<NodeId>,
-    recorded_at: DateTime<Utc>,
+    recorded_at: UtcTimestamp,
     bytes: u64,
     kind: LedgerEntryKind,
 }
@@ -297,7 +297,7 @@ impl LedgerEntry {
         }
     }
 
-    fn expires_at(&self) -> io::Result<DateTime<Utc>> {
+    fn expires_at(&self) -> io::Result<UtcTimestamp> {
         self.recorded_at
             .checked_add_signed(window_duration())
             .ok_or_else(|| invalid_data("remote bandwidth expiry timestamp overflows"))
@@ -321,7 +321,7 @@ impl LedgerEntry {
 struct StoredRemoteBandwidthLedger {
     schema_version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    last_observed_at: Option<DateTime<Utc>>,
+    last_observed_at: Option<UtcTimestamp>,
     entries: Vec<LedgerEntry>,
 }
 
@@ -353,7 +353,7 @@ impl StoredRemoteBandwidthLedger {
         }
         let mut ids = HashSet::with_capacity(self.entries.len());
         let mut source_counts = HashMap::<String, usize>::new();
-        let mut previous: Option<(DateTime<Utc>, &str)> = None;
+        let mut previous: Option<(UtcTimestamp, &str)> = None;
         for entry in &self.entries {
             entry.validate()?;
             if !ids.insert(entry.id.as_str()) {
@@ -393,7 +393,7 @@ impl StoredRemoteBandwidthLedger {
             .sort_by(|a, b| (a.recorded_at, &a.id).cmp(&(b.recorded_at, &b.id)));
     }
 
-    fn clock_anomaly_at(&self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    fn clock_anomaly_at(&self, now: UtcTimestamp) -> Option<UtcTimestamp> {
         self.last_observed_at
             .filter(|time| *time > now)
             .into_iter()
@@ -406,7 +406,7 @@ impl StoredRemoteBandwidthLedger {
             .max()
     }
 
-    fn advance_clock_and_prune(&mut self, now: DateTime<Utc>) -> io::Result<()> {
+    fn advance_clock_and_prune(&mut self, now: UtcTimestamp) -> io::Result<()> {
         if self.clock_anomaly_at(now).is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
@@ -434,7 +434,7 @@ impl StoredRemoteBandwidthLedger {
     fn usage(&self, host_id: &str, node_id: Option<&NodeId>) -> RemoteBandwidthUsage {
         let mut committed_bytes = 0_u64;
         let mut reserved_bytes = 0_u64;
-        let mut oldest_expiry_at: Option<DateTime<Utc>> = None;
+        let mut oldest_expiry_at: Option<UtcTimestamp> = None;
         for entry in self.source_entries(host_id, node_id) {
             match entry.kind {
                 LedgerEntryKind::Committed => {
@@ -463,7 +463,7 @@ impl StoredRemoteBandwidthLedger {
         host_id: &str,
         node_id: Option<&NodeId>,
         threshold: u64,
-    ) -> Option<DateTime<Utc>> {
+    ) -> Option<UtcTimestamp> {
         let mut remaining = self.usage(host_id, node_id).rolling_bytes();
         let mut entries = self.source_entries(host_id, node_id).collect::<Vec<_>>();
         entries.sort_by_key(|entry| entry.recorded_at);
@@ -556,7 +556,7 @@ impl RemoteBandwidthBudgetStore {
         &self,
         host_id: &str,
         node_id: Option<&NodeId>,
-        now: DateTime<Utc>,
+        now: UtcTimestamp,
         kind: RemoteBandwidthTransferKind,
         requested_max_response_bytes: usize,
     ) -> io::Result<RemoteBandwidthAdmission> {
@@ -583,7 +583,7 @@ impl RemoteBandwidthBudgetStore {
         &self,
         host_id: &str,
         node_id: Option<&NodeId>,
-        now: DateTime<Utc>,
+        now: UtcTimestamp,
         kind: RemoteBandwidthTransferKind,
         requested_max_response_bytes: usize,
         max_exchanges: usize,
@@ -625,7 +625,7 @@ impl RemoteBandwidthBudgetStore {
         &self,
         host_id: &str,
         node_id: Option<&NodeId>,
-        now: DateTime<Utc>,
+        now: UtcTimestamp,
     ) -> io::Result<RemoteBandwidthAdmission> {
         let overhead = REMOTE_BANDWIDTH_ESTIMATED_SSH_EXCHANGE_OVERHEAD_BYTES;
         let requested_total = REMOTE_BANDWIDTH_AUTOMATIC_PROBE_MAX_RESPONSE_BYTES
@@ -648,7 +648,7 @@ impl RemoteBandwidthBudgetStore {
         &self,
         host_id: &str,
         node_id: Option<&NodeId>,
-        now: DateTime<Utc>,
+        now: UtcTimestamp,
         kind: RemoteBandwidthTransferKind,
         bytes: ReservationByteRequest,
     ) -> io::Result<RemoteBandwidthAdmission> {
@@ -837,7 +837,7 @@ impl RemoteBandwidthBudgetStore {
     pub fn complete_attempt(
         &self,
         reservation: &RemoteBandwidthReservation,
-        completed_at: DateTime<Utc>,
+        completed_at: UtcTimestamp,
         explicit_total_bytes: usize,
     ) -> io::Result<RemoteBandwidthUsage> {
         let actual = u64::try_from(explicit_total_bytes)
@@ -877,7 +877,7 @@ impl RemoteBandwidthBudgetStore {
     pub fn complete_report(
         &self,
         reservation: &RemoteBandwidthReservation,
-        completed_at: DateTime<Utc>,
+        completed_at: UtcTimestamp,
         report: &RemoteSyncReport,
     ) -> io::Result<RemoteBandwidthUsage> {
         self.complete_attempt(
@@ -893,7 +893,7 @@ impl RemoteBandwidthBudgetStore {
     pub fn complete_automatic_probe_attempt(
         &self,
         reservation: &RemoteBandwidthReservation,
-        completed_at: DateTime<Utc>,
+        completed_at: UtcTimestamp,
         response_bytes: usize,
     ) -> io::Result<RemoteBandwidthUsage> {
         if reservation.kind != RemoteBandwidthTransferKind::AutomaticProbe {
@@ -917,7 +917,7 @@ impl RemoteBandwidthBudgetStore {
     pub fn cancel_attempt(
         &self,
         reservation: &RemoteBandwidthReservation,
-        cancelled_at: DateTime<Utc>,
+        cancelled_at: UtcTimestamp,
     ) -> io::Result<RemoteBandwidthUsage> {
         self.mutate(|ledger| {
             ensure_completion_clock(ledger, reservation, cancelled_at)?;
@@ -938,7 +938,7 @@ impl RemoteBandwidthBudgetStore {
         &self,
         host_id: &str,
         node_id: Option<&NodeId>,
-        now: DateTime<Utc>,
+        now: UtcTimestamp,
     ) -> io::Result<Result<RemoteBandwidthUsage, RemoteBandwidthBudgetPause>> {
         validate_host_id(host_id)?;
         let node_id = node_id.cloned();
@@ -965,7 +965,7 @@ impl RemoteBandwidthBudgetStore {
         &self,
         host_id: &str,
         node_id: Option<&NodeId>,
-        now: DateTime<Utc>,
+        now: UtcTimestamp,
         kind: RemoteBandwidthTransferKind,
     ) -> io::Result<Result<RemoteBandwidthUsage, RemoteBandwidthBudgetPause>> {
         validate_host_id(host_id)?;
@@ -994,7 +994,7 @@ impl RemoteBandwidthBudgetStore {
     pub fn check_many_read_only(
         &self,
         sources: &[(&str, Option<&NodeId>)],
-        now: DateTime<Utc>,
+        now: UtcTimestamp,
         kind: RemoteBandwidthTransferKind,
     ) -> io::Result<Vec<Result<RemoteBandwidthUsage, RemoteBandwidthBudgetPause>>> {
         for (host_id, _) in sources {
@@ -1102,7 +1102,7 @@ fn pause(
     level: RemoteBandwidthBudgetLevel,
     reason: RemoteBandwidthPauseReason,
     limit_bytes: u64,
-    resume_at: Option<DateTime<Utc>>,
+    resume_at: Option<UtcTimestamp>,
 ) -> RemoteBandwidthBudgetPause {
     RemoteBandwidthBudgetPause {
         usage,
@@ -1116,7 +1116,7 @@ fn pause(
 fn ensure_completion_clock(
     _ledger: &StoredRemoteBandwidthLedger,
     reservation: &RemoteBandwidthReservation,
-    completed_at: DateTime<Utc>,
+    completed_at: UtcTimestamp,
 ) -> io::Result<()> {
     // Another concurrent attempt can legitimately settle a later wall-time
     // observation first. Compare only with this exact reservation's start;
@@ -1153,11 +1153,11 @@ fn find_reservation(
         })
 }
 
-fn window_duration() -> TimeDelta {
-    TimeDelta::hours(REMOTE_BANDWIDTH_WINDOW_HOURS)
+fn window_duration() -> Duration {
+    Duration::hours(REMOTE_BANDWIDTH_WINDOW_HOURS)
 }
 
-fn utc_minute_key(value: DateTime<Utc>) -> i64 {
+fn utc_minute_key(value: UtcTimestamp) -> i64 {
     value.timestamp().div_euclid(60)
 }
 
@@ -1304,7 +1304,6 @@ mod tests {
     use std::sync::{Arc, Barrier};
     use std::thread;
 
-    use chrono::TimeZone;
     use tempfile::tempdir;
 
     use crate::remote_ingest_state::RemoteDeltaNextRequestPosition;
@@ -1313,10 +1312,8 @@ mod tests {
     const NODE_A: &str = "node-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const NODE_B: &str = "node-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
-    fn at(day: u32, hour: u32, minute: u32, second: u32) -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 8, day, hour, minute, second)
-            .single()
-            .unwrap()
+    fn at(day: u32, hour: u32, minute: u32, second: u32) -> UtcTimestamp {
+        UtcTimestamp::from_utc(2026, 8, day, hour, minute, second).unwrap()
     }
 
     fn test_store(directory: &tempfile::TempDir) -> RemoteBandwidthBudgetStore {
@@ -1347,7 +1344,7 @@ mod tests {
         store: &RemoteBandwidthBudgetStore,
         host: &str,
         node: Option<&NodeId>,
-        at: DateTime<Utc>,
+        at: UtcTimestamp,
         bytes: u64,
     ) {
         let reservation = granted(
@@ -1926,20 +1923,20 @@ mod tests {
                 .begin_attempt(
                     "alpha",
                     None,
-                    first + TimeDelta::hours(23),
+                    first + Duration::hours(23),
                     RemoteBandwidthTransferKind::AutomaticBulk,
                     1024,
                 )
                 .unwrap(),
         );
-        assert_eq!(pause.resume_at(), Some(first + TimeDelta::hours(24)));
+        assert_eq!(pause.resume_at(), Some(first + Duration::hours(24)));
 
         assert!(matches!(
             store
                 .begin_attempt(
                     "alpha",
                     None,
-                    first + TimeDelta::hours(24),
+                    first + Duration::hours(24),
                     RemoteBandwidthTransferKind::AutomaticBulk,
                     1024,
                 )
@@ -1965,7 +1962,7 @@ mod tests {
                 .unwrap(),
         );
         let pause = store
-            .usage("alpha", None, future - TimeDelta::minutes(1))
+            .usage("alpha", None, future - Duration::minutes(1))
             .unwrap()
             .unwrap_err();
         assert_eq!(pause.level(), RemoteBandwidthBudgetLevel::Hard);
@@ -1974,7 +1971,7 @@ mod tests {
         assert_eq!(pause.usage().reserved_bytes(), 4096);
 
         let error = store
-            .cancel_attempt(&reservation, future - TimeDelta::seconds(1))
+            .cancel_attempt(&reservation, future - Duration::seconds(1))
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
         assert_eq!(
@@ -2121,22 +2118,22 @@ mod tests {
                 .begin_attempt(
                     "alpha",
                     None,
-                    first_at + TimeDelta::seconds(2),
+                    first_at + Duration::seconds(2),
                     RemoteBandwidthTransferKind::Manual,
                     4096,
                 )
                 .unwrap(),
         );
         store
-            .complete_attempt(&second, first_at + TimeDelta::seconds(4), 200)
+            .complete_attempt(&second, first_at + Duration::seconds(4), 200)
             .unwrap();
         let usage = store
-            .complete_attempt(&first, first_at + TimeDelta::seconds(1), 100)
+            .complete_attempt(&first, first_at + Duration::seconds(1), 100)
             .unwrap();
         assert_eq!(usage.rolling_bytes(), 300);
         assert_eq!(
             store
-                .usage("alpha", None, first_at + TimeDelta::seconds(4))
+                .usage("alpha", None, first_at + Duration::seconds(4))
                 .unwrap()
                 .unwrap()
                 .rolling_bytes(),
@@ -2286,7 +2283,7 @@ mod tests {
         let samples_per_source = 25 * 60 * 2;
         let mut entries = Vec::with_capacity(samples_per_source * 2);
         for sample in 0..samples_per_source {
-            let recorded_at = start + TimeDelta::seconds((sample * 30) as i64);
+            let recorded_at = start + Duration::seconds((sample * 30) as i64);
             for (source_index, (host_id, node_id)) in [("alpha", &node_a), ("beta", &node_b)]
                 .into_iter()
                 .enumerate()
@@ -2302,7 +2299,7 @@ mod tests {
                 });
             }
         }
-        let now = start + TimeDelta::hours(25);
+        let now = start + Duration::hours(25);
         let mut ledger = StoredRemoteBandwidthLedger {
             schema_version: REMOTE_BANDWIDTH_BUDGET_SCHEMA_VERSION,
             last_observed_at: Some(now),
@@ -2343,7 +2340,7 @@ mod tests {
         let start = at(14, 0, 0, 0);
         let mut entries = Vec::with_capacity(MAX_ENTRIES_PER_SOURCE * 2);
         for sample in 0..MAX_ENTRIES_PER_SOURCE {
-            let recorded_at = start + TimeDelta::seconds((sample * 30) as i64);
+            let recorded_at = start + Duration::seconds((sample * 30) as i64);
             for (source_index, (host_id, node_id)) in [("alpha", &node_a), ("beta", &node_b)]
                 .into_iter()
                 .enumerate()
@@ -2359,7 +2356,7 @@ mod tests {
                 });
             }
         }
-        let now = start + TimeDelta::seconds((MAX_ENTRIES_PER_SOURCE * 30) as i64);
+        let now = start + Duration::seconds((MAX_ENTRIES_PER_SOURCE * 30) as i64);
         let ledger = StoredRemoteBandwidthLedger {
             schema_version: REMOTE_BANDWIDTH_BUDGET_SCHEMA_VERSION,
             last_observed_at: Some(now),

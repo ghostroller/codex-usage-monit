@@ -8,11 +8,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use chrono::Utc;
 use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::diagnostic_log::{DIAGNOSTIC_LOG_MAX_BYTES, JsonlWriter};
+use crate::time::UtcTimestamp;
 
 const PERF_LOG_SCHEMA_VERSION: u32 = 6;
 pub const PERF_SAMPLE_INTERVAL: Duration = Duration::from_secs(30);
@@ -259,7 +259,7 @@ impl PerfLog {
                 &json!({
                     "schemaVersion": PERF_LOG_SCHEMA_VERSION,
                     "event": "refresh",
-                    "at": Utc::now(),
+                    "at": UtcTimestamp::now(),
                     "atUs": duration_us(inner.origin.elapsed()),
                     "metrics": metrics,
                 }),
@@ -288,7 +288,7 @@ impl PerfLog {
                 &json!({
                     "schemaVersion": PERF_LOG_SCHEMA_VERSION,
                     "event": "history",
-                    "at": Utc::now(),
+                    "at": UtcTimestamp::now(),
                     "atUs": duration_us(inner.origin.elapsed()),
                     "metrics": metrics,
                 }),
@@ -361,7 +361,7 @@ impl PerfLog {
             &json!({
                 "schemaVersion": PERF_LOG_SCHEMA_VERSION,
                 "event": "perf_stop",
-                "at": Utc::now(),
+                "at": UtcTimestamp::now(),
                 "atUs": at_us,
             }),
         ) && let Some(writer) = state.writer.as_mut()
@@ -385,7 +385,7 @@ impl PerfLog {
 
     fn enabled_with_jsonl_writer(mut writer: JsonlWriter) -> Self {
         let origin = Instant::now();
-        let started_at = Utc::now();
+        let started_at = UtcTimestamp::now();
         let start = json!({
             "schemaVersion": PERF_LOG_SCHEMA_VERSION,
             "event": "perf_start",
@@ -501,7 +501,7 @@ impl PerfLog {
         let value = json!({
             "schemaVersion": PERF_LOG_SCHEMA_VERSION,
             "event": "sample",
-            "at": Utc::now(),
+            "at": UtcTimestamp::now(),
             "atUs": at_us,
             "windowDurationUs": window_duration_us,
             "draw": {

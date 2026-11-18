@@ -7,7 +7,6 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Utc};
 use codex_usage_monit::domain::Provenance;
 use codex_usage_monit::history::{HistoryObservation, QuotaPoint};
 use codex_usage_monit::history_profile_lease::{
@@ -16,6 +15,7 @@ use codex_usage_monit::history_profile_lease::{
 use codex_usage_monit::history_runtime::HistoryRuntime;
 use codex_usage_monit::project_mapping::ProjectMappingStore;
 use codex_usage_monit::source_history::LocalObservationMode;
+use codex_usage_monit::time::{Duration as SignedDuration, UtcTimestamp};
 use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 use serde_json::{Value, json};
 
@@ -103,18 +103,17 @@ fn mutate(root: &Path, home: &Path, policy: bool) {
             )
             .unwrap();
     } else {
-        let base = DateTime::parse_from_rfc3339(&std::env::var("N2_OBSERVED_AT").unwrap())
-            .unwrap()
-            .with_timezone(&Utc);
+        let base =
+            UtcTimestamp::parse_from_rfc3339(&std::env::var("N2_OBSERVED_AT").unwrap()).unwrap();
         runtime
             .record_local_observation(
                 &HistoryObservation {
-                    observed_at: base + chrono::Duration::minutes(5),
+                    observed_at: base + SignedDuration::minutes(5),
                     quota_points: vec![QuotaPoint {
-                        observed_at: base + chrono::Duration::minutes(5),
+                        observed_at: base + SignedDuration::minutes(5),
                         limit_id: "codex".to_owned(),
                         duration_mins: 10_080,
-                        resets_at: base + chrono::Duration::days(6),
+                        resets_at: base + SignedDuration::days(6),
                         used_percent: 37.0,
                         remaining_percent: 63.0,
                         provenance: Provenance::ServerSnapshot,
@@ -203,7 +202,7 @@ fn synthetic_history_sample() {
     let mut phases = Vec::new();
     let mut phase = "initial";
     let mut phase_started = Instant::now();
-    let mut phase_started_at = Utc::now();
+    let mut phase_started_at = UtcTimestamp::now();
     let mut initial_overview_requested = false;
     let mut initial_ready = None;
     let mut timeout = false;
@@ -269,7 +268,7 @@ fn synthetic_history_sample() {
         if ready {
             let elapsed = started.elapsed().as_secs_f64();
             phases.push(json!({"phase": phase, "elapsedSeconds": elapsed, "phaseSeconds": phase_started.elapsed().as_secs_f64(),
-                "startedAt": phase_started_at, "finishedAt": Utc::now(), "selectedTab": expected_tab,
+                "startedAt": phase_started_at, "finishedAt": UtcTimestamp::now(), "selectedTab": expected_tab,
                 "screen": parser.screen().contents()}));
             if phase == "initial" {
                 initial_ready = Some(elapsed);
@@ -293,7 +292,7 @@ fn synthetic_history_sample() {
                 break;
             }
             phase_started = Instant::now();
-            phase_started_at = Utc::now();
+            phase_started_at = UtcTimestamp::now();
         }
         let deadline = if phase == "initial" { 30 } else { 55 };
         if phase_started.elapsed() > Duration::from_secs(deadline) {
@@ -323,12 +322,12 @@ fn synthetic_history_sample() {
     let traces = records(&trace);
     let event_records = records(&events);
     for phase in &mut phases {
-        let start = DateTime::parse_from_rfc3339(phase["startedAt"].as_str().unwrap()).unwrap();
-        let end = DateTime::parse_from_rfc3339(phase["finishedAt"].as_str().unwrap()).unwrap();
+        let start = UtcTimestamp::parse_from_rfc3339(phase["startedAt"].as_str().unwrap()).unwrap();
+        let end = UtcTimestamp::parse_from_rfc3339(phase["finishedAt"].as_str().unwrap()).unwrap();
         let at = |event: &Value| {
             event["at"]
                 .as_str()
-                .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                .and_then(|value| UtcTimestamp::parse_from_rfc3339(value).ok())
         };
         phase["traceRecords"] = json!(
             traces
@@ -345,13 +344,13 @@ fn synthetic_history_sample() {
         );
     }
     let initial_trace_confirmed = phases.first().is_some_and(|phase| {
-        let end = DateTime::parse_from_rfc3339(phase["finishedAt"].as_str().unwrap()).unwrap();
+        let end = UtcTimestamp::parse_from_rfc3339(phase["finishedAt"].as_str().unwrap()).unwrap();
         traces.iter().any(|event| {
             event["event"] == "span_finish"
                 && event["stage"] == "tui.initial_data_ready"
                 && event["at"]
                     .as_str()
-                    .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                    .and_then(|value| UtcTimestamp::parse_from_rfc3339(value).ok())
                     .is_some_and(|at| at <= end)
         })
     });

@@ -1,15 +1,11 @@
-use chrono::TimeZone;
-
 use super::*;
 use crate::domain::Provenance;
 
-fn at(day: u32, hour: u32, minute: u32) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 10, day, hour, minute, 0)
-        .single()
-        .unwrap()
+fn at(day: u32, hour: u32, minute: u32) -> UtcTimestamp {
+    UtcTimestamp::from_utc(2026, 10, day, hour, minute, 0).unwrap()
 }
 
-fn quota(observed_at: DateTime<Utc>, resets_at: DateTime<Utc>, used_percent: f64) -> QuotaPoint {
+fn quota(observed_at: UtcTimestamp, resets_at: UtcTimestamp, used_percent: f64) -> QuotaPoint {
     QuotaPoint {
         observed_at,
         limit_id: "codex".to_string(),
@@ -21,7 +17,7 @@ fn quota(observed_at: DateTime<Utc>, resets_at: DateTime<Utc>, used_percent: f64
     }
 }
 
-fn weekly(observed_at: DateTime<Utc>, resets_at: DateTime<Utc>, total: u64) -> WeeklyLocalPoint {
+fn weekly(observed_at: UtcTimestamp, resets_at: UtcTimestamp, total: u64) -> WeeklyLocalPoint {
     WeeklyLocalPoint {
         observed_at,
         resets_at,
@@ -53,7 +49,7 @@ fn source(weekly_local_points: Vec<WeeklyLocalPoint>) -> SourceSlice {
     }
 }
 
-fn bucket(starts_at: DateTime<Utc>, total: u64) -> LocalHalfHourBucket {
+fn bucket(starts_at: UtcTimestamp, total: u64) -> LocalHalfHourBucket {
     LocalHalfHourBucket {
         starts_at,
         ends_at: starts_at + Duration::minutes(15),

@@ -571,7 +571,7 @@ mod tests {
     use std::thread;
     use std::time::Duration as StdDuration;
 
-    use chrono::Utc;
+    use crate::time::UtcTimestamp;
     use tempfile::{TempDir, tempdir};
 
     use crate::history_ownership::OwnershipManifestStatus;
@@ -693,7 +693,7 @@ mod tests {
                     None,
                     &generation,
                     &binding,
-                    Utc::now(),
+                    UtcTimestamp::now(),
                 )
                 .unwrap();
         }

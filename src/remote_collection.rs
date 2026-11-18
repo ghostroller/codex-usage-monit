@@ -9,7 +9,6 @@ use std::collections::BTreeMap;
 use std::num::NonZeroU64;
 
 use anyhow::{Result, bail};
-use chrono::{DateTime, Duration, Utc};
 
 use crate::config::CollectConfig;
 use crate::domain::{CollectionStats, RolloutDataset};
@@ -18,6 +17,7 @@ use crate::remote_export_state::RemoteExportReconcileMode;
 use crate::remote_protocol::{ExportRange, RemoteDeltaStats, RemoteDeltaWarning};
 use crate::rollout::{RolloutCache, RolloutCacheMetrics, RolloutCacheRefresh};
 use crate::source_history::RedactionProfile;
+use crate::time::{Duration, UtcTimestamp};
 
 /// The one and only aggregate journal domain used by the remote exporter.
 ///
@@ -109,7 +109,7 @@ impl RemoteCollection {
 pub fn collect_remote_rollouts(
     config: &CollectConfig,
     requested_range: &ExportRange,
-    observed_at: DateTime<Utc>,
+    observed_at: UtcTimestamp,
     redaction_profile: RedactionProfile,
 ) -> Result<RemoteCollection> {
     let mut cache = RolloutCache::new();
@@ -127,7 +127,7 @@ pub fn collect_remote_rollouts(
 pub fn collect_remote_rollouts_with_cache(
     config: &CollectConfig,
     requested_range: &ExportRange,
-    observed_at: DateTime<Utc>,
+    observed_at: UtcTimestamp,
     redaction_profile: RedactionProfile,
     cache: &mut RolloutCache,
 ) -> Result<RemoteCollection> {
@@ -174,7 +174,7 @@ pub fn collect_remote_rollouts_with_cache(
 fn remote_worker_config(
     config: &CollectConfig,
     requested_range: &ExportRange,
-    _observed_at: DateTime<Utc>,
+    _observed_at: UtcTimestamp,
     redaction_profile: RedactionProfile,
 ) -> Result<CollectConfig> {
     validate_requested_range(requested_range)?;
@@ -349,18 +349,15 @@ mod tests {
     use std::fs;
     use std::time::Duration as StdDuration;
 
-    use chrono::TimeZone;
     use serde_json::json;
 
     use super::*;
 
-    fn at(hour: u32, minute: u32) -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 8, 30, hour, minute, 0)
-            .single()
-            .unwrap()
+    fn at(hour: u32, minute: u32) -> UtcTimestamp {
+        UtcTimestamp::from_utc(2026, 8, 30, hour, minute, 0).unwrap()
     }
 
-    fn range(from: DateTime<Utc>, to: DateTime<Utc>) -> ExportRange {
+    fn range(from: UtcTimestamp, to: UtcTimestamp) -> ExportRange {
         ExportRange { from, to }
     }
 
@@ -376,7 +373,7 @@ mod tests {
         fs::write(sessions.join("rollout-remote.jsonl"), contents).unwrap();
     }
 
-    fn session_records(now: DateTime<Utc>) -> Vec<serde_json::Value> {
+    fn session_records(now: UtcTimestamp) -> Vec<serde_json::Value> {
         vec![
             json!({
                 "timestamp": (now - Duration::minutes(3)).to_rfc3339(),

@@ -14,8 +14,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
-use chrono::{DateTime, TimeDelta, Utc};
-
 use crate::config::CollectConfig;
 use crate::history_ownership::{HistoryOwnershipState, OwnershipManifestStatus};
 use crate::history_profile_lease::{TryHistoryProfileLease, try_acquire_history_profile_lease};
@@ -57,6 +55,7 @@ use crate::replica_fact_followup::{
     execute_prepared_replica_fact_followup, fact_limits_for_response_budget,
     prepare_replica_fact_followup,
 };
+use crate::time::{Duration as SignedDuration, UtcTimestamp};
 
 const CONFIG_ERROR_RETRY_BASE: Duration = Duration::from_secs(30);
 const CONFIG_ERROR_RETRY_MAX: Duration = Duration::from_secs(5 * 60);
@@ -285,7 +284,7 @@ where
         if self.durable_schedule_seeds.is_none() {
             // Load the bounded health file only once even when hundreds of
             // hosts are eligible at process start.
-            let now = Utc::now();
+            let now = UtcTimestamp::now();
             let mut seeds = BTreeMap::new();
             for health in RemoteSyncHealthStore::new(self.state_root.clone())
                 .list()
@@ -320,7 +319,7 @@ where
                 let consecutive_failures = health.consecutive_failures();
                 let active_until_in = health.last_activity_at().and_then(|last_activity_at| {
                     let hysteresis =
-                        TimeDelta::from_std(AUTOMATIC_REMOTE_SYNC_ACTIVITY_HYSTERESIS).ok()?;
+                        SignedDuration::from_std(AUTOMATIC_REMOTE_SYNC_ACTIVITY_HYSTERESIS).ok()?;
                     last_activity_at
                         .checked_add_signed(hysteresis)?
                         .signed_duration_since(now)
@@ -451,9 +450,9 @@ where
         // short preflight after admission to fence concurrent changes.
         let mut prepared =
             PreparedRemoteAggregateLocal::new(&self.config_store, selected, &runtime)?;
-        let position = prepared.preflight(Utc::now())?;
+        let position = prepared.preflight(UtcTimestamp::now())?;
         let transfer_kind = automatic_transfer_kind_for_position(&position);
-        let budget_now = Utc::now();
+        let budget_now = UtcTimestamp::now();
         let fact_limits = RemoteFactSyncLimits::default();
         let reservation = match prepared
             .begin_budget_attempt(&self.bandwidth_budget, budget_now, transfer_kind, limits)
@@ -480,9 +479,12 @@ where
         // guards. No guard exists while the transport performs one-shot SSH.
         let report = match prepared
             .admitted_attempt(&mut self.transport, &self.bandwidth_budget, &reservation)
-            .execute(Utc::now(), budgeted_limits, Utc::now, || {
-                ensure_automatic_selection_current(&self.config_store, selected)
-            }) {
+            .execute(
+                UtcTimestamp::now(),
+                budgeted_limits,
+                UtcTimestamp::now,
+                || ensure_automatic_selection_current(&self.config_store, selected),
+            ) {
             Ok(report) => report,
             Err(RemoteAggregateAttemptError::Sync(error)) => {
                 if RemoteSyncErrorCategory::from_sync_error(&error)
@@ -492,7 +494,7 @@ where
                         .record_process_containment_pause(
                             selected.host().id(),
                             expected_source,
-                            Utc::now(),
+                            UtcTimestamp::now(),
                             selected.host(),
                         );
                     self.process_containment_uncertain = true;
@@ -505,7 +507,7 @@ where
             Err(RemoteAggregateAttemptError::Fence(error)) => return Err(error),
         };
         let fact_health = RemoteSyncHealthStore::new(self.state_root.clone());
-        let fact_started_at = Utc::now();
+        let fact_started_at = UtcTimestamp::now();
         let prepared = prepare_automatic_fact_followup_without_config_lock(
             &self.config_store,
             selected,
@@ -577,7 +579,7 @@ where
                 }
             }
         };
-        let fact_completed_at = Utc::now();
+        let fact_completed_at = UtcTimestamp::now();
         let fact_process_containment =
             followup.error_category() == Some(RemoteSyncErrorCategory::ProcessContainment);
         if fact_process_containment {
@@ -650,7 +652,7 @@ fn settle_automatic_fact_attempt_before_final_fence(
     bandwidth_budget: &RemoteBandwidthBudgetStore,
     reservation: Option<&RemoteBandwidthReservation>,
     followup: &mut ReplicaFactFollowupReport,
-    completed_at: DateTime<Utc>,
+    completed_at: UtcTimestamp,
     config_store: &RemotesConfigStore,
     selected: &RemoteSyncHostSnapshot,
 ) -> Result<(), RemoteSyncError> {
@@ -704,7 +706,7 @@ impl<T: AutomaticRemoteProbeTransport, F> FilesystemAutomaticRemoteSyncExecutor<
         &mut self,
         selected: &RemoteSyncHostSnapshot,
         expected_source: &crate::remote_protocol::SourceGeneration,
-        now: chrono::DateTime<Utc>,
+        now: crate::time::UtcTimestamp,
     ) -> bool {
         if self
             .config_store
@@ -737,9 +739,10 @@ impl<T: AutomaticRemoteProbeTransport, F> FilesystemAutomaticRemoteSyncExecutor<
             .with_current_host(selected.config_revision(), selected.host(), || Ok(()))
             .is_err()
         {
-            let _ = self
-                .bandwidth_budget
-                .cancel_attempt(&reservation, Utc::now().max(reservation.started_at()));
+            let _ = self.bandwidth_budget.cancel_attempt(
+                &reservation,
+                UtcTimestamp::now().max(reservation.started_at()),
+            );
             return false;
         }
 
@@ -761,7 +764,7 @@ impl<T: AutomaticRemoteProbeTransport, F> FilesystemAutomaticRemoteSyncExecutor<
                 if report.response.source == *expected_source
                     && report.response.redaction_profile == options.redaction_profile =>
             {
-                let completed_at = Utc::now().max(reservation.started_at());
+                let completed_at = UtcTimestamp::now().max(reservation.started_at());
                 self.bandwidth_budget
                     .complete_automatic_probe_attempt(
                         &reservation,
@@ -786,7 +789,7 @@ impl<T: AutomaticRemoteProbeTransport, F> FilesystemAutomaticRemoteSyncExecutor<
             let _ = health.record_process_containment_pause(
                 selected.host().id(),
                 expected_source,
-                Utc::now(),
+                UtcTimestamp::now(),
                 selected.host(),
             );
         }
@@ -1487,7 +1490,7 @@ mod tests {
                     "fake due probe failure".to_owned(),
                 ));
             }
-            let observed_at = Utc::now();
+            let observed_at = UtcTimestamp::now();
             Ok(RemoteProbeReport {
                 response: RemoteExportResponse {
                     protocol_version: REMOTE_PROTOCOL_VERSION,
@@ -1588,9 +1591,9 @@ mod tests {
     fn seed_due_hard_pause(
         state_root: &std::path::Path,
         expected_source: &SourceGeneration,
-        now: chrono::DateTime<Utc>,
+        now: crate::time::UtcTimestamp,
     ) {
-        let paused_at = now - chrono::TimeDelta::minutes(31);
+        let paused_at = now - crate::time::Duration::minutes(31);
         let health = RemoteSyncHealthStore::new(state_root.to_path_buf());
         health
             .record_failure(
@@ -1607,7 +1610,7 @@ mod tests {
                 Some(expected_source),
                 paused_at,
                 RemoteBandwidthBudgetLevel::Hard,
-                Some(now + chrono::TimeDelta::hours(24)),
+                Some(now + crate::time::Duration::hours(24)),
             )
             .unwrap();
 
@@ -1994,7 +1997,7 @@ mod tests {
             )
             .unwrap();
 
-        let error = prepared.preflight(Utc::now()).unwrap_err();
+        let error = prepared.preflight(UtcTimestamp::now()).unwrap_err();
 
         assert!(matches!(
             error,
@@ -2102,7 +2105,7 @@ mod tests {
         assert!(health.last_fact_sync_at().is_some());
         assert_eq!(health.fact_sync_error_category(), None);
         let usage = RemoteBandwidthBudgetStore::new(state_root)
-            .usage("dev", Some(&expected_source.node_id), Utc::now())
+            .usage("dev", Some(&expected_source.node_id), UtcTimestamp::now())
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -2130,7 +2133,7 @@ mod tests {
                     .unwrap();
             let budget = RemoteBandwidthBudgetStore::new(state_root);
             let limits = RemoteSyncLimits::default();
-            let started_at = Utc::now();
+            let started_at = UtcTimestamp::now();
             let RemoteBandwidthAdmission::Granted(reservation) = budget
                 .begin_sync_attempt(
                     "dev",
@@ -2172,7 +2175,7 @@ mod tests {
                 &budget,
                 &reservation,
                 &report,
-                Utc::now().max(reservation.started_at()),
+                UtcTimestamp::now().max(reservation.started_at()),
                 || ensure_automatic_selection_current(&store, &selected),
             )
             .unwrap_err();
@@ -2182,7 +2185,7 @@ mod tests {
                 RemoteAggregateAttemptError::Fence(RemoteSyncError::ConfigurationChanged { .. })
             ));
             let usage = budget
-                .usage("dev", Some(&expected_source.node_id), Utc::now())
+                .usage("dev", Some(&expected_source.node_id), UtcTimestamp::now())
                 .unwrap()
                 .unwrap();
             assert_eq!(
@@ -2217,7 +2220,7 @@ mod tests {
                     .unwrap();
             let budget = RemoteBandwidthBudgetStore::new(state_root);
             let limits = RemoteFactSyncLimits::default();
-            let started_at = Utc::now();
+            let started_at = UtcTimestamp::now();
             let RemoteBandwidthAdmission::Granted(reservation) = budget
                 .begin_sync_attempt(
                     "dev",
@@ -2243,7 +2246,7 @@ mod tests {
                 &budget,
                 Some(&reservation),
                 &mut followup,
-                Utc::now(),
+                UtcTimestamp::now(),
                 &store,
                 &selected,
             )
@@ -2254,7 +2257,7 @@ mod tests {
                 RemoteSyncError::ConfigurationChanged { .. }
             ));
             let usage = budget
-                .usage("dev", Some(&expected_source.node_id), Utc::now())
+                .usage("dev", Some(&expected_source.node_id), UtcTimestamp::now())
                 .unwrap()
                 .unwrap();
             assert_eq!(
@@ -2379,7 +2382,7 @@ mod tests {
             .load_remote_history_snapshot_since(
                 &remote_node.parse().unwrap(),
                 RedactionProfile::PreviewEnabled,
-                chrono::DateTime::<Utc>::MIN_UTC,
+                crate::time::UtcTimestamp::MIN,
             )
             .unwrap();
         assert!(snapshot.active_ref.is_none());
@@ -2415,7 +2418,7 @@ mod tests {
                 .unwrap();
 
         let budget = RemoteBandwidthBudgetStore::new(state_root.clone());
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         let RemoteBandwidthAdmission::Granted(reservation) = budget
             .begin_attempt(
                 "dev",
@@ -2465,14 +2468,14 @@ mod tests {
             RemoteSyncHostSnapshot::capture_for_automatic(&config, config.host("dev").unwrap())
                 .unwrap();
         let expected_source = selected.host().expected_source().unwrap().clone();
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         RemoteSyncHealthStore::new(state_root.clone())
             .record_pause(
                 "dev",
                 Some(&expected_source),
                 now,
                 RemoteBandwidthBudgetLevel::Hard,
-                Some(now + chrono::TimeDelta::hours(24)),
+                Some(now + crate::time::Duration::hours(24)),
             )
             .unwrap();
         let mut executor = FilesystemAutomaticRemoteSyncExecutor::with_transport(
@@ -2507,7 +2510,7 @@ mod tests {
                 RemoteSyncHostSnapshot::capture_for_automatic(&config, config.host("dev").unwrap())
                     .unwrap();
             let expected_source = selected.host().expected_source().unwrap().clone();
-            let now = Utc::now();
+            let now = UtcTimestamp::now();
             seed_due_hard_pause(&state_root, &expected_source, now);
             let mut executor = FilesystemAutomaticRemoteSyncExecutor::with_transport(
                 state_root.clone(),
@@ -2522,7 +2525,7 @@ mod tests {
             executor.try_due_hard_pause_probe(
                 &selected,
                 &expected_source,
-                now + chrono::TimeDelta::minutes(1),
+                now + crate::time::Duration::minutes(1),
             );
 
             assert_eq!(executor.transport.probe_calls, 1);
@@ -2546,10 +2549,10 @@ mod tests {
             assert_eq!(health.budget_last_probe_succeeded(), Some(succeeds));
             assert_eq!(
                 health.budget_probe_due_at(),
-                Some(now + chrono::TimeDelta::minutes(30))
+                Some(now + crate::time::Duration::minutes(30))
             );
             let usage = RemoteBandwidthBudgetStore::new(state_root)
-                .usage("dev", Some(&expected_source.node_id), Utc::now())
+                .usage("dev", Some(&expected_source.node_id), UtcTimestamp::now())
                 .unwrap()
                 .unwrap();
             assert!(
@@ -2569,7 +2572,7 @@ mod tests {
             RemoteSyncHostSnapshot::capture_for_automatic(&config, config.host("dev").unwrap())
                 .unwrap();
         let expected_source = selected.host().expected_source().unwrap().clone();
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         seed_due_hard_pause(&state_root, &expected_source, now);
         let mut executor = FilesystemAutomaticRemoteSyncExecutor::with_transport(
             state_root.clone(),
@@ -2603,7 +2606,7 @@ mod tests {
             RemoteSyncHostSnapshot::capture_for_automatic(&config, config.host("dev").unwrap())
                 .unwrap();
         let expected_source = selected.host().expected_source().unwrap().clone();
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         seed_due_hard_pause(&state_root, &expected_source, now);
         let mut transport = ProbeTestTransport::new(true);
         transport.rotate_generation_during_probe = Some(store.clone());
@@ -2754,8 +2757,8 @@ mod tests {
         let config = automatic_config(NODE_A);
         let host = config.host("dev").unwrap();
         let expected_source = host.expected_source().unwrap().clone();
-        let completed_at = Utc::now();
-        let next_eligible_at = completed_at + chrono::TimeDelta::seconds(120);
+        let completed_at = UtcTimestamp::now();
+        let next_eligible_at = completed_at + crate::time::Duration::seconds(120);
         let health = RemoteSyncHealthStore::new(state_root.clone());
         health
             .record_failure(
@@ -2802,7 +2805,7 @@ mod tests {
         let config = automatic_config(NODE_A);
         let host = config.host("dev").unwrap();
         let expected_source = host.expected_source().unwrap();
-        let paused_at = Utc::now();
+        let paused_at = UtcTimestamp::now();
         let health = RemoteSyncHealthStore::new(state_root.clone());
         health
             .record_process_containment_pause(host.id(), expected_source, paused_at, host)
@@ -2828,7 +2831,7 @@ mod tests {
             .clear_process_containment_pause(
                 host.id(),
                 Some(expected_source),
-                paused_at + TimeDelta::seconds(1),
+                paused_at + SignedDuration::seconds(1),
             )
             .unwrap();
         assert!(matches!(
@@ -2846,7 +2849,7 @@ mod tests {
         let config = automatic_config(NODE_A);
         let host = config.host("dev").unwrap();
         let expected_source = host.expected_source().unwrap().clone();
-        let completed_at = Utc::now();
+        let completed_at = UtcTimestamp::now();
         RemoteSyncHealthStore::new(state_root.clone())
             .record_success(
                 host.id(),
@@ -2860,7 +2863,7 @@ mod tests {
                     response_bytes: 256,
                     completion: RemoteSyncCompletion::Complete,
                 },
-                Some(completed_at + TimeDelta::seconds(30)),
+                Some(completed_at + SignedDuration::seconds(30)),
             )
             .unwrap();
 
@@ -2890,8 +2893,8 @@ mod tests {
         let config = automatic_config(NODE_A);
         let host = config.host("dev").unwrap();
         let expected_source = host.expected_source().unwrap().clone();
-        let paused_at = Utc::now();
-        let stale_idle_deadline = paused_at + chrono::TimeDelta::hours(24);
+        let paused_at = UtcTimestamp::now();
+        let stale_idle_deadline = paused_at + crate::time::Duration::hours(24);
         let health = RemoteSyncHealthStore::new(state_root.clone());
         for _ in 0..2 {
             health
@@ -2945,7 +2948,7 @@ mod tests {
         let config = automatic_config(NODE_A);
         let host = config.host("dev").unwrap();
         let expected_source = host.expected_source().unwrap().clone();
-        let paused_at = Utc::now();
+        let paused_at = UtcTimestamp::now();
         RemoteSyncHealthStore::new(state_root.clone())
             .record_pause(
                 host.id(),
@@ -2992,14 +2995,14 @@ mod tests {
         let host = config.host("dev").unwrap();
         let mut other_source = host.expected_source().unwrap().clone();
         other_source.generation = NonZeroU64::new(2).unwrap();
-        let completed_at = Utc::now();
+        let completed_at = UtcTimestamp::now();
         RemoteSyncHealthStore::new(state_root.clone())
             .record_failure(
                 host.id(),
                 Some(&other_source),
                 completed_at,
                 RemoteSyncErrorCategory::Transport,
-                Some(completed_at + chrono::TimeDelta::seconds(120)),
+                Some(completed_at + crate::time::Duration::seconds(120)),
             )
             .unwrap();
 
@@ -3033,8 +3036,8 @@ mod tests {
         let continuation = crate::remote_ingest_state::RemoteDeltaNextRequestPosition {
             delta_cursor: Some(cursor),
             exact_range: Some(crate::remote_protocol::ExportRange {
-                from: Utc::now() - chrono::TimeDelta::days(1),
-                to: Utc::now(),
+                from: UtcTimestamp::now() - crate::time::Duration::days(1),
+                to: UtcTimestamp::now(),
             }),
             known_live_revision: None,
         };

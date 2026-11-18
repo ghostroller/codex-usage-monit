@@ -22,12 +22,12 @@ impl InitialRefreshHarness {
         let codex_home = directory.path().join("codex-home");
         let sessions = codex_home.join("sessions");
         std::fs::create_dir_all(&sessions).unwrap();
-        let observed_at = Utc::now() - ChronoDuration::minutes(5);
+        let observed_at = UtcTimestamp::now() - SignedDuration::minutes(5);
         let events = [
             serde_json::json!({"timestamp":observed_at,"type":"session_meta","payload":{"id":RESUMABLE_THREAD_ID,"source":"desktop"}}),
             serde_json::json!({"timestamp":observed_at,"type":"event_msg","payload":{"type":"task_started","turn_id":"initial-turn"}}),
-            serde_json::json!({"timestamp":observed_at+ChronoDuration::seconds(1),"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":17,"total_tokens":17},"last_token_usage":{"input_tokens":17,"total_tokens":17}}}}),
-            serde_json::json!({"timestamp":observed_at+ChronoDuration::seconds(2),"type":"event_msg","payload":{"type":"task_complete","turn_id":"initial-turn"}}),
+            serde_json::json!({"timestamp":observed_at+SignedDuration::seconds(1),"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":17,"total_tokens":17},"last_token_usage":{"input_tokens":17,"total_tokens":17}}}}),
+            serde_json::json!({"timestamp":observed_at+SignedDuration::seconds(2),"type":"event_msg","payload":{"type":"task_complete","turn_id":"initial-turn"}}),
         ];
         std::fs::write(
             sessions.join("rollout-initial.jsonl"),
@@ -233,7 +233,7 @@ fn initial_snapshot_is_interactive_while_history_is_blocked_then_completes() {
         .unwrap()
         .load_since_with_staged_selected(
             &HistorySourceSelection::AllIncluded,
-            history_view_since(Utc::now()),
+            history_view_since(UtcTimestamp::now()),
         );
     assert_eq!(
         durable

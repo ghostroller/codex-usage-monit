@@ -10,7 +10,6 @@ use std::ptr;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use windows_service::service::{
@@ -30,6 +29,8 @@ use windows_sys::Win32::System::Services::{
     SERVICE_WIN32_OWN_PROCESS,
 };
 use zeroize::Zeroizing;
+
+use crate::time::UtcTimestamp;
 
 mod process;
 mod runtime;
@@ -92,7 +93,7 @@ pub struct MachineReport {
     pub manager_pid: Option<u32>,
     pub recorder_pid: Option<u32>,
     pub healthy: bool,
-    pub last_history_heartbeat: Option<DateTime<Utc>>,
+    pub last_history_heartbeat: Option<UtcTimestamp>,
     pub last_exit_code: u32,
     pub phase: String,
     pub diagnostic: Option<String>,
@@ -1076,7 +1077,7 @@ fn report(
     let fresh = status.as_ref().is_some_and(|status| {
         status.build_id.as_deref() == Some(&receipt.selected.build_id)
             && status.last_history_heartbeat.is_some_and(|at| {
-                let age = Utc::now().signed_duration_since(at).num_seconds();
+                let age = UtcTimestamp::now().signed_duration_since(at).num_seconds();
                 (-5..=2 * status.heartbeat_interval_seconds.unwrap_or(60).min(3600) as i64 + 30)
                     .contains(&age)
             })
@@ -1147,7 +1148,7 @@ mod tests {
         let unique_name = format!(
             "codex-usage-monit-test-absent-{}-{}",
             std::process::id(),
-            Utc::now().timestamp_nanos_opt().unwrap()
+            UtcTimestamp::now().timestamp_nanos_opt().unwrap()
         );
         assert!(
             open_service(&manager, &unique_name, false)

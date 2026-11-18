@@ -1,20 +1,19 @@
 use std::collections::HashSet;
 use std::fs;
 
-use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, Utc};
 use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use jiff::civil::Date;
 use ratatui::style::Modifier;
 
 use crate::domain::{ApiCostAmount, PicoUsd, TokenUsage};
 use crate::history::{HISTORY_ESTIMATOR_REVISION, LocalHalfHourBucket, LocalProjectUsageGroup};
+use crate::time::{Duration as SignedDuration, UtcTimestamp};
 
 use super::super::*;
 use super::testkit::{ClickEdge, ControlId, TuiHarness, gallery_directory};
 
-fn summary_timestamp(value: &str) -> DateTime<Utc> {
-    DateTime::parse_from_rfc3339(value)
-        .unwrap()
-        .with_timezone(&Utc)
+fn summary_timestamp(value: &str) -> UtcTimestamp {
+    UtcTimestamp::parse_from_rfc3339(value).unwrap()
 }
 
 fn summary_group(
@@ -69,7 +68,7 @@ fn attributed_summary_group(
     session_thread_id: &str,
     session_turn_id: &str,
     message_preview: &str,
-    turn_started_at: DateTime<Utc>,
+    turn_started_at: UtcTimestamp,
 ) -> LocalProjectUsageGroup {
     group.turn_id = Some(turn_id.to_string());
     group.session_thread_id = Some(session_thread_id.to_string());
@@ -80,7 +79,7 @@ fn attributed_summary_group(
 }
 
 fn summary_bucket(
-    starts_at: DateTime<Utc>,
+    starts_at: UtcTimestamp,
     groups: Vec<LocalProjectUsageGroup>,
 ) -> LocalHalfHourBucket {
     let mut token_usage = TokenUsage::default();
@@ -98,8 +97,8 @@ fn summary_bucket(
     }
     LocalHalfHourBucket {
         starts_at,
-        ends_at: starts_at + ChronoDuration::minutes(15),
-        sampled_at: starts_at + ChronoDuration::minutes(15),
+        ends_at: starts_at + SignedDuration::minutes(15),
+        sampled_at: starts_at + SignedDuration::minutes(15),
         token_usage,
         estimated_cost_units,
         api_long_context_extra_cost_units: Some(api_long_context_extra_cost_units),
@@ -370,7 +369,7 @@ fn summary_daily_status_strip_distinguishes_known_zero_partial_and_missing_dates
         let mut buckets = (0_i64..96)
             .map(|index| {
                 summary_bucket(
-                    complete_day + ChronoDuration::minutes(index * 15),
+                    complete_day + SignedDuration::minutes(index * 15),
                     Vec::new(),
                 )
             })
@@ -458,12 +457,7 @@ fn summary_stacked_area_click_and_drag_inspect_exact_dates_without_hiding_gaps()
 #[test]
 fn summary_stacked_area_column_mapping_never_reports_a_different_date_bucket() {
     let dates = (1..=4)
-        .map(|day| {
-            NaiveDate::from_ymd_opt(2026, 7, day)
-                .expect("valid date")
-                .and_hms_opt(0, 0, 0)
-                .unwrap()
-        })
+        .map(|day| Date::new(2026, 7, day).expect("valid date").at(0, 0, 0, 0))
         .collect::<Vec<_>>();
     for width in [4_u16, 9, 52] {
         let hitbox = SummaryDailyHitbox {
@@ -901,9 +895,9 @@ fn summary_all_projects_preference_survives_a_range_where_it_is_inapplicable() {
         })
         .collect();
     harness.app.history.half_hour_buckets = (vec![
-        summary_bucket(now - ChronoDuration::days(20), older_groups),
+        summary_bucket(now - SignedDuration::days(20), older_groups),
         summary_bucket(
-            now - ChronoDuration::minutes(15),
+            now - SignedDuration::minutes(15),
             vec![summary_group(
                 "recent-thread",
                 None,
@@ -967,7 +961,7 @@ fn summary_daily_readout_prioritizes_selection_and_other_and_reserves_omission_c
     let index = chart
         .buckets
         .iter()
-        .position(|bucket| bucket.starts_at.date() == NaiveDate::from_ymd_opt(2026, 7, 12).unwrap())
+        .position(|bucket| bucket.starts_at.date() == Date::new(2026, 7, 12).unwrap())
         .unwrap();
     let state = prepared.chart_bucket_state(
         &chart.buckets[index],
@@ -1038,7 +1032,7 @@ fn summary_daily_readout_prioritizes_selection_and_other_and_reserves_omission_c
 fn summary_open_history_bucket_is_partial_and_dst_overlap_is_explicit() {
     let mut harness = summary_harness(120, 40, Theme::Dark);
     let open = &mut harness.app.history.half_hour_buckets[1];
-    open.sampled_at = open.starts_at + ChronoDuration::minutes(5);
+    open.sampled_at = open.starts_at + SignedDuration::minutes(5);
     let open_starts_at = open.starts_at;
     let prepared = prepare_summary(&harness.app, harness.app.snapshot.as_of);
     assert!(
@@ -1073,10 +1067,7 @@ fn summary_open_history_bucket_is_partial_and_dst_overlap_is_explicit() {
     let repeated_hour = SummaryChartData {
         grain: SummaryGrain::Hour,
         buckets: vec![SummaryChartBucket {
-            starts_at: NaiveDate::from_ymd_opt(2026, 11, 1)
-                .unwrap()
-                .and_hms_opt(1, 0, 0)
-                .unwrap(),
+            starts_at: Date::new(2026, 11, 1).unwrap().at(1, 0, 0, 0),
             totals: SummaryMetrics::default(),
             coverage: SummaryDailyCoverage {
                 expected_buckets: 8,
@@ -1374,7 +1365,7 @@ fn restored_all_projects_preference_survives_partial_data_until_projects_grow() 
 #[test]
 fn summary_cache_survives_refreshes_that_do_not_change_summary_inputs() {
     let mut harness = summary_harness(120, 40, Theme::Dark);
-    let next_as_of = harness.app.snapshot.as_of + ChronoDuration::seconds(2);
+    let next_as_of = harness.app.snapshot.as_of + SignedDuration::seconds(2);
     let mut snapshot = harness.app.snapshot.clone();
     snapshot.as_of = next_as_of;
     harness.app.replace(
@@ -1406,7 +1397,7 @@ fn summary_cache_survives_refreshes_that_do_not_change_summary_inputs() {
 fn summary_cache_is_invalidated_by_live_metadata_or_bucket_usage_changes() {
     let mut metadata = summary_harness(120, 40, Theme::Dark);
     let mut snapshot = metadata.app.snapshot.clone();
-    snapshot.as_of += ChronoDuration::seconds(2);
+    snapshot.as_of += SignedDuration::seconds(2);
     snapshot.tasks[0].title.push_str(" renamed");
     metadata.app.replace(
         CollectionResult {
@@ -1446,7 +1437,7 @@ fn summary_project_colors_stay_stable_across_range_subsets() {
     let now = harness.app.snapshot.as_of;
     harness.app.history.half_hour_buckets = (vec![
         summary_bucket(
-            now - ChronoDuration::days(20),
+            now - SignedDuration::days(20),
             vec![summary_group(
                 "older-thread",
                 None,
@@ -1458,7 +1449,7 @@ fn summary_project_colors_stay_stable_across_range_subsets() {
             )],
         ),
         summary_bucket(
-            now - ChronoDuration::minutes(15),
+            now - SignedDuration::minutes(15),
             vec![summary_group(
                 "recent-thread",
                 None,
@@ -1813,14 +1804,14 @@ fn summary_rolling_window_advances_when_the_snapshot_clock_is_frozen() {
     let initial_bucket = harness.app.summary_cache.as_ref().unwrap().query_bucket;
     assert!(!harness.app.summary_rows().is_empty());
 
-    let later = snapshot_as_of + ChronoDuration::days(8) + ChronoDuration::minutes(16);
+    let later = snapshot_as_of + SignedDuration::days(8) + SignedDuration::minutes(16);
     harness.render_at(later);
     let cache = harness.app.summary_cache.as_ref().unwrap();
 
     assert_ne!(cache.query_bucket, initial_bucket);
     assert_eq!(
         cache.prepared.usage.window.ends_at,
-        later + ChronoDuration::nanoseconds(1)
+        later + SignedDuration::nanoseconds(1)
     );
     assert!(harness.app.summary_rows().is_empty());
 }
@@ -1844,7 +1835,7 @@ fn summary_cycle_falls_back_after_a_frozen_server_window_expires() {
 fn summary_cycle_cache_expires_inside_the_same_fifteen_minute_bucket() {
     let mut harness = summary_harness(120, 40, Theme::Dark);
     let before_reset = harness.app.snapshot.as_of;
-    let reset_at = before_reset + ChronoDuration::minutes(5);
+    let reset_at = before_reset + SignedDuration::minutes(5);
     let weekly = harness
         .app
         .snapshot
@@ -1868,7 +1859,7 @@ fn summary_cycle_cache_expires_inside_the_same_fifteen_minute_bucket() {
         None
     );
 
-    harness.render_at(reset_at + ChronoDuration::seconds(1));
+    harness.render_at(reset_at + SignedDuration::seconds(1));
     let cache = harness.app.summary_cache.as_ref().unwrap();
     assert_eq!(cache.query_bucket, initial_bucket);
     assert_eq!(cache.prepared.range_note, Some("7d fallback"));
@@ -2016,11 +2007,11 @@ fn summary_daily_marks_a_fully_covered_non_exact_api_range_as_a_lower_bound() {
         .timestamp()
         .div_euclid(bucket_seconds)
         .saturating_mul(bucket_seconds);
-    let aligned = DateTime::from_timestamp(starts_at_seconds, 0).unwrap();
+    let aligned = UtcTimestamp::from_timestamp(starts_at_seconds, 0).unwrap();
     if aligned < window.starts_at {
         starts_at_seconds = starts_at_seconds.saturating_add(bucket_seconds);
     }
-    let mut starts_at = DateTime::from_timestamp(starts_at_seconds, 0).unwrap();
+    let mut starts_at = UtcTimestamp::from_timestamp(starts_at_seconds, 0).unwrap();
     let mut buckets = Vec::new();
     let mut inserted_usage = false;
     while starts_at < window.ends_at {
@@ -2048,7 +2039,7 @@ fn summary_daily_marks_a_fully_covered_non_exact_api_range_as_a_lower_bound() {
             vec![group]
         };
         buckets.push(summary_bucket(starts_at, groups));
-        starts_at += ChronoDuration::minutes(LOCAL_BUCKET_MINUTES);
+        starts_at += SignedDuration::minutes(LOCAL_BUCKET_MINUTES);
     }
     assert!(inserted_usage);
     harness.app.history = HistoryData {

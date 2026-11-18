@@ -12,7 +12,6 @@ use std::num::{NonZeroU32, NonZeroU64};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -41,6 +40,7 @@ use crate::source_identity::NodeId;
 #[cfg(windows)]
 use crate::source_identity::validate_windows_private_file;
 use crate::source_model::{ObservedProjectKey, SessionReplicaKey};
+use crate::time::{Duration, UtcTimestamp};
 
 const INGEST_LAYOUT_DIRECTORY: &str = "remote-ingest-locks";
 const INGEST_LOCK_FILE: &str = "ingest.lock";
@@ -961,7 +961,7 @@ impl RemoteDeltaIngestSession<'_> {
         &mut self,
         request: &RemoteExportRequest,
         response: &RemoteDeltaResponse,
-        received_at: DateTime<Utc>,
+        received_at: UtcTimestamp,
     ) -> io::Result<PreparedRemoteDeltaPage> {
         self.validate_fence()?;
         if self.state.pending.is_some() {
@@ -1264,7 +1264,7 @@ fn apply_remote_delta_records(
     session: &RemoteDeltaIngestSession<'_>,
     writer: &SourceHistoryWriter<'_, '_, '_>,
     page: &PreparedRemoteDeltaPage,
-    activated_at: chrono::DateTime<chrono::Utc>,
+    activated_at: UtcTimestamp,
 ) -> io::Result<()> {
     session.validate_history_writer(writer)?;
     session.validate_pending_page(page)?;
@@ -1405,7 +1405,7 @@ pub fn apply_and_commit_remote_delta_page(
     session: &mut RemoteDeltaIngestSession<'_>,
     writer: &SourceHistoryWriter<'_, '_, '_>,
     page: &PreparedRemoteDeltaPage,
-    activated_at: chrono::DateTime<chrono::Utc>,
+    activated_at: UtcTimestamp,
 ) -> io::Result<RemoteDeltaCommitReport> {
     let db = history_database(&session.store.history_store)?;
     let previous = session.state.clone();
@@ -1422,7 +1422,7 @@ fn apply_and_commit_remote_delta_page_inner(
     session: &mut RemoteDeltaIngestSession<'_>,
     writer: &SourceHistoryWriter<'_, '_, '_>,
     page: &PreparedRemoteDeltaPage,
-    activated_at: chrono::DateTime<chrono::Utc>,
+    activated_at: UtcTimestamp,
 ) -> io::Result<RemoteDeltaCommitReport> {
     apply_remote_delta_records(session, writer, page, activated_at)?;
     apply_remote_live_state(session, writer, page)?;
@@ -1438,7 +1438,7 @@ fn apply_and_commit_remote_delta_page_inner(
 pub fn activate_remote_delta_bootstrap(
     session: &mut RemoteDeltaIngestSession<'_>,
     writer: &SourceHistoryWriter<'_, '_, '_>,
-    activated_at: chrono::DateTime<chrono::Utc>,
+    activated_at: UtcTimestamp,
 ) -> io::Result<Option<RemoteBootstrapActivationReport>> {
     let db = history_database(&session.store.history_store)?;
     let previous = session.state.clone();
@@ -1453,7 +1453,7 @@ pub fn activate_remote_delta_bootstrap(
 fn activate_remote_delta_bootstrap_inner(
     session: &mut RemoteDeltaIngestSession<'_>,
     writer: &SourceHistoryWriter<'_, '_, '_>,
-    activated_at: chrono::DateTime<chrono::Utc>,
+    activated_at: UtcTimestamp,
 ) -> io::Result<Option<RemoteBootstrapActivationReport>> {
     session.validate_history_writer(writer)?;
     let Some(activation) = session.bootstrap_activation_required()? else {
@@ -1860,7 +1860,7 @@ struct StoredPendingPage {
     /// Center-clock time captured immediately after the SSH response arrived.
     /// Replaying this prepared page must never replace it with the later recovery time,
     /// otherwise an old live snapshot can appear fresh again after a crash.
-    received_at: DateTime<Utc>,
+    received_at: UtcTimestamp,
 }
 
 impl StoredPendingPage {
@@ -1894,7 +1894,7 @@ struct PendingPageHashInput<'a> {
     target: RemoteDeltaApplyTarget,
     request: &'a RemoteExportRequest,
     response: &'a RemoteDeltaResponse,
-    received_at: DateTime<Utc>,
+    received_at: UtcTimestamp,
 }
 
 fn pending_page_id(pending: &StoredPendingPage) -> io::Result<PreparedRemoteDeltaPageId> {
@@ -1910,7 +1910,7 @@ fn pending_page_id_from_parts(
     target: &RemoteDeltaApplyTarget,
     request: &RemoteExportRequest,
     response: &RemoteDeltaResponse,
-    received_at: DateTime<Utc>,
+    received_at: UtcTimestamp,
 ) -> io::Result<PreparedRemoteDeltaPageId> {
     let bytes = serde_json::to_vec(&PendingPageHashInput {
         target: target.clone(),
@@ -2502,7 +2502,7 @@ fn history_database(store: &SourceHistoryStore) -> io::Result<database::HistoryD
 mod tests {
     use std::num::{NonZeroU32, NonZeroU64};
 
-    use chrono::{DateTime, TimeZone, Utc};
+    use crate::time::UtcTimestamp;
     use tempfile::tempdir;
 
     use super::*;
@@ -2523,10 +2523,8 @@ mod tests {
     const OTHER_PROFILE: &str = "fedcba9876543210";
     const SOURCE: &str = "node-0123456789abcdef0123456789abcdef";
 
-    fn at(day: u32, hour: u32, minute: u32) -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 8, day, hour, minute, 0)
-            .single()
-            .unwrap()
+    fn at(day: u32, hour: u32, minute: u32) -> UtcTimestamp {
+        UtcTimestamp::from_utc(2026, 8, day, hour, minute, 0).unwrap()
     }
 
     fn nonzero32(value: u32) -> NonZeroU32 {
@@ -2598,7 +2596,7 @@ mod tests {
         .unwrap()
     }
 
-    fn export_range(from: DateTime<Utc>, minutes: i64) -> ExportRange {
+    fn export_range(from: UtcTimestamp, minutes: i64) -> ExportRange {
         ExportRange {
             from,
             to: from + Duration::minutes(minutes),
@@ -2699,7 +2697,7 @@ mod tests {
     fn tombstone_page(
         generation: u64,
         sequence: u64,
-        starts_at: DateTime<Utc>,
+        starts_at: UtcTimestamp,
     ) -> (DeltaPage, Vec<RemoteUsageBucketChange>) {
         (
             DeltaPage {
@@ -2724,7 +2722,7 @@ mod tests {
     fn bucket_change(
         binding: &RemoteDeltaIngestBinding,
         sequence: u64,
-        starts_at: DateTime<Utc>,
+        starts_at: UtcTimestamp,
         total_tokens: u64,
     ) -> RemoteUsageBucketChange {
         RemoteUsageBucketChange {
@@ -4495,10 +4493,10 @@ mod tests {
         let history = SourceHistoryStore::new(root.path().to_owned(), PROFILE.parse().unwrap());
         let ingest = RemoteDeltaIngestStateStore::new(history, binding.clone()).unwrap();
         let range = export_range(at(30, 3, 0), 60);
-        let make_change = |sequence, observed_at: DateTime<Utc>, remaining| RemoteQuotaChange {
+        let make_change = |sequence, observed_at: UtcTimestamp, remaining| RemoteQuotaChange {
             sequence: nonzero64(sequence),
             quota: RemoteQuotaDay {
-                day: observed_at.date_naive(),
+                day: observed_at.utc_date(),
                 points: vec![
                     RemoteQuotaPoint::from_local(&QuotaPoint {
                         observed_at,
@@ -4619,7 +4617,7 @@ mod tests {
                 let deletion = RemoteQuotaChange {
                     sequence: nonzero64(4),
                     quota: RemoteQuotaDay {
-                        day: at(29, 0, 0).date_naive(),
+                        day: at(29, 0, 0).utc_date(),
                         points: Vec::new(),
                     },
                 };

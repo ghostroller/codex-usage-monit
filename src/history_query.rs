@@ -14,8 +14,6 @@ use std::fmt;
 use std::io;
 use std::str::FromStr;
 
-use chrono::{DateTime, Duration, Utc};
-
 #[cfg(test)]
 use crate::domain::TokenUsage;
 use crate::domain::{ApiCostAmount, PicoUsd};
@@ -40,6 +38,7 @@ use crate::source_identity::{NodeId, SourceIdentity};
 #[cfg(test)]
 use crate::source_model::ObservedProjectKey;
 use crate::source_model::ThreadId;
+use crate::time::{Duration, UtcTimestamp};
 use crate::trace::{TraceFields, TraceOutcome, process_trace_log};
 
 #[cfg(test)]
@@ -232,7 +231,7 @@ pub struct UnifiedHistorySnapshot {
 pub fn load_unified_history_since(
     ownership: &HistoryOwnershipStore,
     source_history: &SourceHistoryStore,
-    since: DateTime<Utc>,
+    since: UtcTimestamp,
 ) -> io::Result<UnifiedHistorySnapshot> {
     let mapping = LoadedProjectMappingProjection::default();
     load_unified_history_since_inner(
@@ -253,7 +252,7 @@ pub fn load_unified_history_since_with_project_mapping_store(
     ownership: &HistoryOwnershipStore,
     source_history: &SourceHistoryStore,
     project_mapping_store: &ProjectMappingStore,
-    since: DateTime<Utc>,
+    since: UtcTimestamp,
 ) -> io::Result<UnifiedHistorySnapshot> {
     query_with_context(
         ownership,
@@ -278,7 +277,7 @@ pub fn load_unified_history_since_selected(
     source_history: &SourceHistoryStore,
     bound_local_source_id: &NodeId,
     selection: &HistorySourceSelection,
-    since: DateTime<Utc>,
+    since: UtcTimestamp,
 ) -> io::Result<UnifiedHistorySnapshot> {
     let mapping = LoadedProjectMappingProjection::default();
     load_unified_history_since_inner(
@@ -297,7 +296,7 @@ pub fn load_unified_history_since_selected_with_project_mapping_store(
     project_mapping_store: &ProjectMappingStore,
     bound_local_source_id: &NodeId,
     selection: &HistorySourceSelection,
-    since: DateTime<Utc>,
+    since: UtcTimestamp,
 ) -> io::Result<UnifiedHistorySnapshot> {
     query_with_context(
         ownership,
@@ -374,7 +373,7 @@ struct PreparedQuota {
 /// Every selection revalidates its ownership, policy, mapping and revision inputs.
 /// Remote revisions remain per-source observations, not a distributed snapshot.
 pub(crate) struct HistoryQueryContext {
-    since: DateTime<Utc>,
+    since: UtcTimestamp,
     budget: SourceHistoryReadBudget,
     quota: Option<PreparedQuota>,
     #[cfg(test)]
@@ -382,7 +381,7 @@ pub(crate) struct HistoryQueryContext {
 }
 
 impl HistoryQueryContext {
-    pub fn new(since: DateTime<Utc>) -> Self {
+    pub fn new(since: UtcTimestamp) -> Self {
         Self {
             since,
             budget: SourceHistoryReadBudget::for_query(),
@@ -392,7 +391,7 @@ impl HistoryQueryContext {
         }
     }
 
-    pub fn since(&self) -> DateTime<Utc> {
+    pub fn since(&self) -> UtcTimestamp {
         self.since
     }
 }
@@ -547,7 +546,7 @@ fn query_with_context_attempt(
         }
         let evidence_since = since
             .checked_sub_signed(Duration::days(QUERY_EVIDENCE_LOOKBACK_DAYS))
-            .unwrap_or(DateTime::<Utc>::MIN_UTC);
+            .unwrap_or(UtcTimestamp::MIN);
         let account = load_account_quota(
             source_history,
             &before.metadata,
@@ -642,7 +641,7 @@ fn load_unified_history_since_inner(
     project_mapping: &LoadedProjectMappingProjection,
     bound_local_source_id: Option<&NodeId>,
     selection: &HistorySourceSelection,
-    since: DateTime<Utc>,
+    since: UtcTimestamp,
 ) -> io::Result<UnifiedHistorySnapshot> {
     query_with_context(
         ownership,
@@ -822,7 +821,7 @@ fn load_account_quota(
     store: &SourceHistoryStore,
     metadata: &[SourceMetadata],
     query_redaction: RedactionProfile,
-    evidence_since: DateTime<Utc>,
+    evidence_since: UtcTimestamp,
     read_budget: &mut SourceHistoryReadBudget,
 ) -> io::Result<AccountHistoryData> {
     // Account quota is global and intentionally loaded once, independently
@@ -888,7 +887,7 @@ struct V2HistoryQuery<'a> {
     project_mapping: &'a LoadedProjectMappingProjection,
     bound_local_source_id: Option<&'a NodeId>,
     selection: &'a HistorySourceSelection,
-    since: DateTime<Utc>,
+    since: UtcTimestamp,
     metadata: &'a [SourceMetadata],
     account: &'a AccountHistoryData,
 }
@@ -943,7 +942,7 @@ fn load_v2_history_since_inner(
     } = *query;
     let evidence_since = since
         .checked_sub_signed(Duration::days(QUERY_EVIDENCE_LOOKBACK_DAYS))
-        .unwrap_or(DateTime::<Utc>::MIN_UTC);
+        .unwrap_or(UtcTimestamp::MIN);
     let metadata_before = query.metadata;
     let account = query.account;
     let mut slices = Vec::new();
@@ -1331,7 +1330,7 @@ mod tests {
     use std::num::{NonZeroU32, NonZeroU64};
     use std::path::Path;
 
-    use chrono::{FixedOffset, TimeZone, Timelike};
+    use jiff::tz::Offset;
 
     use super::*;
     use crate::api_cost::API_PRICING_CATALOG_REVISION;
@@ -1789,7 +1788,7 @@ mod tests {
 
         fn complete_gc_pass(
             writer: &crate::source_history::SourceHistoryWriter<'_, '_, '_>,
-            observed_at: DateTime<Utc>,
+            observed_at: UtcTimestamp,
         ) -> usize {
             let mut shards_pruned = 0;
             for _ in 0..64 {
@@ -1959,7 +1958,7 @@ mod tests {
                     &[RemoteQuotaChange {
                         sequence: NonZeroU64::new(sequence).unwrap(),
                         quota: RemoteQuotaDay {
-                            day: point.observed_at.date_naive(),
+                            day: point.observed_at.utc_date(),
                             points: vec![RemoteQuotaPoint::from_local(point).unwrap()],
                         },
                     }],
@@ -2171,14 +2170,13 @@ mod tests {
         let history_root = directory.path().join("state/history-v1");
         let codex_home = directory.path().join("codex");
         fs::create_dir_all(&codex_home).unwrap();
-        let starts_at = Utc::now() - Duration::minutes(30);
-        let starts_at = starts_at
-            .with_minute(starts_at.minute() / 15 * 15)
-            .unwrap()
-            .with_second(0)
-            .unwrap()
-            .with_nanosecond(0)
-            .unwrap();
+        let starts_at = UtcTimestamp::now() - Duration::minutes(30);
+        let bucket_seconds = crate::history::LOCAL_BUCKET_MINUTES * 60;
+        let starts_at = UtcTimestamp::from_timestamp(
+            starts_at.timestamp().div_euclid(bucket_seconds) * bucket_seconds,
+            0,
+        )
+        .unwrap();
         let initial_quota = quota(starts_at, starts_at + Duration::days(7));
         let observation = |total, label| HistoryObservation {
             observed_at: starts_at + Duration::minutes(15),
@@ -2495,10 +2493,8 @@ mod tests {
         assert!("server.example".parse::<HistorySourceSelector>().is_err());
     }
 
-    fn at(day: u32, hour: u32, minute: u32) -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 8, day, hour, minute, 0)
-            .single()
-            .unwrap()
+    fn at(day: u32, hour: u32, minute: u32) -> UtcTimestamp {
+        UtcTimestamp::from_utc(2026, 8, day, hour, minute, 0).unwrap()
     }
 
     fn source(
@@ -2511,7 +2507,7 @@ mod tests {
             .unwrap()
     }
 
-    fn bucket(starts_at: DateTime<Utc>, total: u64, project: &str) -> LocalHalfHourBucket {
+    fn bucket(starts_at: UtcTimestamp, total: u64, project: &str) -> LocalHalfHourBucket {
         let token_usage = TokenUsage {
             input_tokens: total,
             total_tokens: total,
@@ -2556,7 +2552,7 @@ mod tests {
     }
 
     fn bucket_with_calls(
-        starts_at: DateTime<Utc>,
+        starts_at: UtcTimestamp,
         total: u64,
         project: &str,
         call_count: u64,
@@ -2571,7 +2567,7 @@ mod tests {
 
     #[cfg_attr(windows, allow(dead_code))]
     fn incomplete_mixed_bucket(
-        starts_at: DateTime<Utc>,
+        starts_at: UtcTimestamp,
         target_project: &str,
         unrelated_project: &str,
     ) -> LocalHalfHourBucket {
@@ -2639,7 +2635,7 @@ mod tests {
 
     fn session_digest(
         source_id: &NodeId,
-        range_start: DateTime<Utc>,
+        range_start: UtcTimestamp,
         fingerprint: char,
         total: u64,
         event_count: u64,
@@ -2673,7 +2669,7 @@ mod tests {
     fn usage_fact(
         source_id: &NodeId,
         event_id: &str,
-        occurred_at: DateTime<Utc>,
+        occurred_at: UtcTimestamp,
         total: u64,
         project: ObservedProjectKey,
     ) -> UsageEventFactRecord {
@@ -2920,11 +2916,7 @@ mod tests {
         }
     }
 
-    fn weekly(
-        observed_at: DateTime<Utc>,
-        resets_at: DateTime<Utc>,
-        total: u64,
-    ) -> WeeklyLocalPoint {
+    fn weekly(observed_at: UtcTimestamp, resets_at: UtcTimestamp, total: u64) -> WeeklyLocalPoint {
         WeeklyLocalPoint {
             observed_at,
             resets_at,
@@ -2942,7 +2934,7 @@ mod tests {
         }
     }
 
-    fn quota(observed_at: DateTime<Utc>, resets_at: DateTime<Utc>) -> QuotaPoint {
+    fn quota(observed_at: UtcTimestamp, resets_at: UtcTimestamp) -> QuotaPoint {
         QuotaPoint {
             observed_at,
             limit_id: "codex".to_string(),
@@ -3026,7 +3018,7 @@ mod tests {
         store: &SourceHistoryStore,
         active: &HistoryOwnershipManifest,
         metadata: &SourceMetadata,
-        starts_at: DateTime<Utc>,
+        starts_at: UtcTimestamp,
         total: u64,
     ) {
         install_remote_bucket_with_catalog(
@@ -3047,7 +3039,7 @@ mod tests {
         store: &SourceHistoryStore,
         active: &HistoryOwnershipManifest,
         metadata: &SourceMetadata,
-        starts_at: DateTime<Utc>,
+        starts_at: UtcTimestamp,
         total: u64,
         model_catalog_fingerprint: crate::remote_protocol::ModelCatalogFingerprint,
     ) {
@@ -3268,7 +3260,7 @@ mod tests {
         let summary = summarize_samples(
             &summary_samples,
             SummaryWindow::new(at(2, 9, 0), at(2, 11, 0)).unwrap(),
-            FixedOffset::east_opt(0).unwrap(),
+            Offset::UTC,
         );
         assert_eq!(summary.projects.len(), 1);
         assert_eq!(summary.projects[0].totals.token_usage.total_tokens, 30);
@@ -6160,7 +6152,7 @@ mod tests {
         let resets =
             canonical_weekly_resets(&[source], &[quota(at(1, 0, 0), account_reset)]).unwrap();
         assert_eq!(resets, vec![account_reset]);
-        assert_eq!(account_reset.minute(), 0);
+        assert_eq!(account_reset.naive_utc().minute(), 0);
     }
 
     #[test]
@@ -6266,7 +6258,7 @@ mod tests {
                     &[RemoteQuotaChange {
                         sequence: NonZeroU64::new(2).unwrap(),
                         quota: RemoteQuotaDay {
-                            day: newer.observed_at.date_naive(),
+                            day: newer.observed_at.utc_date(),
                             points: vec![
                                 RemoteQuotaPoint::from_local(&newer).unwrap(),
                                 RemoteQuotaPoint::from_local(&later).unwrap(),

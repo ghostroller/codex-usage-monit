@@ -1,7 +1,7 @@
 use std::fs;
 use std::process::Command;
 
-use chrono::{Duration, Utc};
+use codex_usage_monit::time::{Duration, UtcTimestamp};
 use serde_json::Value;
 use tempfile::tempdir;
 
@@ -76,8 +76,8 @@ fn write_model_rollout(
 ) {
     let sessions = codex_home.join("sessions");
     fs::create_dir_all(&sessions).unwrap();
-    let started_at = Utc::now() - Duration::minutes(10);
-    let reset_at = (Utc::now() + Duration::hours(1)).timestamp();
+    let started_at = UtcTimestamp::now() - Duration::minutes(10);
+    let reset_at = (UtcTimestamp::now() + Duration::hours(1)).timestamp();
     let usage = |input_tokens: u64| {
         serde_json::json!({
             "input_tokens": input_tokens,

@@ -53,10 +53,10 @@ fn manifest_key(
     ))
 }
 
-fn record_days(records: &[UsageEventFactRecord]) -> Vec<NaiveDate> {
+fn record_days(records: &[UsageEventFactRecord]) -> Vec<UtcDay> {
     records
         .iter()
-        .map(|record| record.occurred_at().date_naive())
+        .map(|record| record.occurred_at().utc_date())
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
@@ -66,7 +66,7 @@ fn validate_proof(
     replica: &SessionReplicaKey,
     records: &[UsageEventFactRecord],
     bindings: &[FactDigestBinding],
-    retained_since: Option<DateTime<Utc>>,
+    retained_since: Option<UtcTimestamp>,
 ) -> io::Result<()> {
     let facts = records
         .iter()
@@ -251,7 +251,7 @@ impl SourceHistoryStore {
     pub(super) fn sqlite_load_digest_records(
         &self,
         source_id: &NodeId,
-        since: DateTime<Utc>,
+        since: UtcTimestamp,
         directory: &Path,
         budget: &mut SourceHistoryReadBudget,
     ) -> io::Result<Vec<SourceSessionDigestRecord>> {
@@ -579,7 +579,7 @@ impl SourceHistoryStore {
                     &batch.batch_id,
                     "staged-at.json",
                 )?,
-                &Utc::now(),
+                &UtcTimestamp::now(),
             )?;
             ensure_sql_fact_cap(self, &database, connection, source_id, redaction)
         })
@@ -908,11 +908,11 @@ pub(super) fn garbage_collect_session_evidence(
     store: &SourceHistoryStore,
     source_id: &NodeId,
     redaction: RedactionProfile,
-    cutoff_day: NaiveDate,
-    trusted_at: DateTime<Utc>,
+    cutoff_day: UtcDay,
+    trusted_at: UtcTimestamp,
 ) -> io::Result<(usize, bool)> {
     let database = store.sqlite_database().expect("SQLite backend");
-    let cutoff = cutoff_day.and_hms_opt(0, 0, 0).expect("midnight").and_utc();
+    let cutoff = cutoff_day.start();
     let mut pruned = 0;
     let mut changed = false;
     // Legacy small-fixture helpers drive the same bounded production units.

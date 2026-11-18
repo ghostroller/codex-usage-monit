@@ -12,12 +12,12 @@ sha2 = "0.10"
 [dependencies]
 anyhow = "1.0"
 base64 = "0.22"
-chrono = { version = "0.4", features = ["clock", "serde"] }
 clap = { version = "4.6.7", features = ["derive"] }
 crossterm = "0.29"
 flate2 = "1.1"
 getrandom = "0.4"
 hmac = "0.12"
+jiff = { version = "1.0.1", features = ["serde"] }
 quick-xml = "0.41"
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "layout-cache", "underline-color", "unstable-rendered-line-info"] }
 rusqlite = { version = "=0.41.1", features = ["bundled", "limits"] }

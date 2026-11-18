@@ -2,9 +2,9 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::time::{Duration, SystemTime};
 
-use chrono::{Duration as ChronoDuration, Utc};
 use codex_usage_monit::config::CollectConfig;
 use codex_usage_monit::rollout::RolloutCache;
+use codex_usage_monit::time::{Duration as SignedDuration, UtcTimestamp};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -32,7 +32,7 @@ fn write_fixture(root: &std::path::Path, name: &str, events: &[Value]) -> std::p
     fs::create_dir_all(root.join("sessions")).unwrap();
     let path = root.join("sessions").join(name);
     let mut file = File::create(&path).unwrap();
-    let at = Utc::now() - ChronoDuration::minutes(1);
+    let at = UtcTimestamp::now() - SignedDuration::minutes(1);
     for event in events {
         let mut event = event.clone();
         event["timestamp"] = json!(at);
@@ -71,8 +71,12 @@ fn native_request_evidence_reconciles_guardian_and_legacy_records_without_double
     ]);
     write_fixture(temp.path(), &format!("rollout-{THREAD}.jsonl"), &events);
     let mut cache = RolloutCache::new();
-    let first = cache.scan(&config(temp.path()), Utc::now()).unwrap();
-    let second = cache.scan(&config(temp.path()), Utc::now()).unwrap();
+    let first = cache
+        .scan(&config(temp.path()), UtcTimestamp::now())
+        .unwrap();
+    let second = cache
+        .scan(&config(temp.path()), UtcTimestamp::now())
+        .unwrap();
     for dataset in [first, second] {
         assert_eq!(dataset.calls.len(), 2);
         assert_eq!(dataset.tasks[0].token_usage.total_tokens, 340604);
@@ -95,7 +99,7 @@ fn native_request_evidence_deduplicates_copies_and_preserves_later_legacy_only_u
     ]);
     write_fixture(temp.path(), &format!("rollout-{THREAD}.jsonl"), &events);
     let dataset = RolloutCache::new()
-        .scan(&config(temp.path()), Utc::now())
+        .scan(&config(temp.path()), UtcTimestamp::now())
         .unwrap();
     assert_eq!(dataset.calls.len(), 2);
     assert_eq!(dataset.tasks[0].token_usage.total_tokens, 165);
@@ -111,7 +115,7 @@ fn guardian_without_request_evidence_does_not_claim_inherited_cumulative_tokens(
     ));
     write_fixture(temp.path(), &format!("rollout-{THREAD}.jsonl"), &events);
     let dataset = RolloutCache::new()
-        .scan(&config(temp.path()), Utc::now())
+        .scan(&config(temp.path()), UtcTimestamp::now())
         .unwrap();
     assert_eq!(dataset.tasks[0].token_usage.total_tokens, 78865);
     assert_eq!(dataset.stats.ambiguous_token_resets, 1);
@@ -144,7 +148,7 @@ fn copied_uuid_filename_does_not_make_unrelated_threads_exhaust_owner_budget() {
         &events,
     );
     let dataset = RolloutCache::new()
-        .scan(&config(temp.path()), Utc::now())
+        .scan(&config(temp.path()), UtcTimestamp::now())
         .unwrap();
     assert_eq!(dataset.stats.ambiguous_token_resets, 0);
     assert_eq!(dataset.tasks[0].token_usage.total_tokens, 110);
@@ -161,7 +165,7 @@ fn native_request_evidence_keeps_uncovered_legacy_prefix() {
     ]);
     write_fixture(temp.path(), &format!("rollout-{THREAD}.jsonl"), &events);
     let dataset = RolloutCache::new()
-        .scan(&config(temp.path()), Utc::now())
+        .scan(&config(temp.path()), UtcTimestamp::now())
         .unwrap();
     assert_eq!(dataset.calls.len(), 2);
     assert_eq!(dataset.tasks[0].token_usage.total_tokens, 77);
@@ -181,7 +185,7 @@ fn native_request_evidence_rejects_conflicting_identity_and_foreign_owner() {
     ]);
     write_fixture(temp.path(), &format!("rollout-{THREAD}.jsonl"), &events);
     let dataset = RolloutCache::new()
-        .scan(&config(temp.path()), Utc::now())
+        .scan(&config(temp.path()), UtcTimestamp::now())
         .unwrap();
     assert_eq!(dataset.calls.len(), 1);
     assert_eq!(dataset.tasks[0].token_usage.total_tokens, 33);
@@ -199,13 +203,13 @@ fn native_request_evidence_does_not_suppress_earlier_counter_across_clock_bounda
     let mut events = metadata();
     events.push(counter(tokens(100, 10), tokens(100, 10)));
     let path = write_fixture(temp.path(), &format!("rollout-{THREAD}.jsonl"), &events);
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let mut future = native("future", tokens(100, 10), tokens(100, 10));
-    future["timestamp"] = json!(now + ChronoDuration::hours(1));
+    future["timestamp"] = json!(now + SignedDuration::hours(1));
     writeln!(File::options().append(true).open(path).unwrap(), "{future}").unwrap();
     let mut cache = RolloutCache::new();
     let later = cache
-        .scan(&config(temp.path()), now + ChronoDuration::hours(2))
+        .scan(&config(temp.path()), now + SignedDuration::hours(2))
         .unwrap();
     assert_eq!(later.calls.len(), 1);
     assert!(
@@ -244,7 +248,7 @@ fn native_request_evidence_is_deduplicated_across_physical_rollout_copies() {
     )
     .unwrap();
     let dataset = RolloutCache::new()
-        .scan(&config(temp.path()), Utc::now())
+        .scan(&config(temp.path()), UtcTimestamp::now())
         .unwrap();
     assert_eq!(dataset.calls.len(), 1);
     assert_eq!(dataset.tasks[0].token_usage.total_tokens, 110);

@@ -7,7 +7,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, ensure};
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -25,6 +24,7 @@ use crate::domain::{
 };
 use crate::session_index::load_thread_titles;
 use crate::startup_progress::{StartupLoadProgressTracker, StartupLoadStage};
+use crate::time::{Duration as SignedDuration, UtcTimestamp};
 use crate::trace::{TraceFields, TraceOutcome};
 
 mod request_evidence;
@@ -75,7 +75,7 @@ const NATIVE_USAGE_EVENT_ID_PREFIX: &str = "usage-native-sha256-v1-";
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RolloutFile {
     path: PathBuf,
-    modified_at: DateTime<Utc>,
+    modified_at: UtcTimestamp,
     fingerprint: FileFingerprint,
 }
 
@@ -269,63 +269,63 @@ struct SelectedFile {
 enum ParsedEvent {
     RequestUsage(Box<RequestUsageEvent>),
     SessionMeta {
-        timestamp: DateTime<Utc>,
+        timestamp: UtcTimestamp,
         payload: Map<String, Value>,
     },
     ForeignCounterBaseline {
-        timestamp: DateTime<Utc>,
+        timestamp: UtcTimestamp,
         total_usage: TokenUsage,
     },
     ForeignThreadSettingsBaseline {
-        timestamp: DateTime<Utc>,
+        timestamp: UtcTimestamp,
         model: Option<String>,
         service_tier: Option<String>,
     },
     UserMessage {
-        timestamp: DateTime<Utc>,
+        timestamp: UtcTimestamp,
         preview: String,
         turn_id: Option<String>,
         source: UserMessageSource,
     },
     AgentCall {
-        requested_at: Option<DateTime<Utc>>,
+        requested_at: Option<UtcTimestamp>,
         call_id: String,
         parent_turn_id: String,
         kind: AgentInteractionKind,
     },
     AgentActivity {
-        recorded_at: Option<DateTime<Utc>>,
-        occurred_at: Option<DateTime<Utc>>,
+        recorded_at: Option<UtcTimestamp>,
+        occurred_at: Option<UtcTimestamp>,
         call_id: String,
         child_thread_id: String,
         kind: AgentInteractionKind,
     },
     ThreadSettingsApplied {
-        timestamp: DateTime<Utc>,
+        timestamp: UtcTimestamp,
         service_tier: Option<String>,
     },
     Activity {
-        timestamp: DateTime<Utc>,
+        timestamp: UtcTimestamp,
     },
     TurnContext {
-        timestamp: DateTime<Utc>,
+        timestamp: UtcTimestamp,
         payload: Map<String, Value>,
     },
     TaskStarted {
-        timestamp: DateTime<Utc>,
+        timestamp: UtcTimestamp,
         turn_id: String,
-        started_at: Option<DateTime<Utc>>,
+        started_at: Option<UtcTimestamp>,
     },
     TaskComplete {
-        timestamp: DateTime<Utc>,
+        timestamp: UtcTimestamp,
         turn_id: String,
-        completed_at: Option<DateTime<Utc>>,
+        completed_at: Option<UtcTimestamp>,
         duration_ms: Option<u64>,
     },
     TurnAborted {
-        timestamp: DateTime<Utc>,
+        timestamp: UtcTimestamp,
         turn_id: String,
-        completed_at: Option<DateTime<Utc>>,
+        completed_at: Option<UtcTimestamp>,
         duration_ms: Option<u64>,
         failed: bool,
     },
@@ -336,7 +336,7 @@ enum ParsedEvent {
 // event. Box keeps their existing externally tagged serialized object shape.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct RequestUsageEvent {
-    timestamp: DateTime<Utc>,
+    timestamp: UtcTimestamp,
     turn_id: String,
     response_id: String,
     usage: TokenUsage,
@@ -345,7 +345,7 @@ struct RequestUsageEvent {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct TokenCountEvent {
-    timestamp: DateTime<Utc>,
+    timestamp: UtcTimestamp,
     line_number: usize,
     total_usage: Option<TokenUsage>,
     #[serde(default)]
@@ -382,7 +382,7 @@ struct TailGuard {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct ParsedFile {
     owner_thread_id: Option<String>,
-    activity_updated_at: Option<DateTime<Utc>>,
+    activity_updated_at: Option<UtcTimestamp>,
     events: ParsedEvents,
     parsed_lines: usize,
     skipped_lines: usize,
@@ -394,14 +394,14 @@ struct ParsedFile {
     #[serde(default)]
     source_lines: usize,
     #[serde(default)]
-    owning_created_at: Option<DateTime<Utc>>,
+    owning_created_at: Option<UtcTimestamp>,
     /// Stable, content-derived bounds used to order multiple files belonging
     /// to the same thread. Unlike filesystem mtimes these survive copies,
     /// restores, and explicit `touch` operations.
     #[serde(default)]
-    replay_started_at: Option<DateTime<Utc>>,
+    replay_started_at: Option<UtcTimestamp>,
     #[serde(default)]
-    replay_updated_at: Option<DateTime<Utc>>,
+    replay_updated_at: Option<UtcTimestamp>,
     /// Whether every content event that participates in replay supplied a
     /// stable timestamp. This must be true before timestamp bounds can safely
     /// order multiple files for the same thread.
@@ -487,8 +487,8 @@ struct ReplayPlan {
 
 #[derive(Clone, Copy, Debug)]
 struct ReplayRange {
-    started_at: Option<DateTime<Utc>>,
-    updated_at: Option<DateTime<Utc>>,
+    started_at: Option<UtcTimestamp>,
+    updated_at: Option<UtcTimestamp>,
     timestamps_complete: bool,
 }
 
@@ -613,7 +613,7 @@ struct DiscoveryCache {
     unreadable_files: usize,
     complete: bool,
     full_scan_at: Instant,
-    logical_now: DateTime<Utc>,
+    logical_now: UtcTimestamp,
 }
 
 #[derive(Debug, Default)]
@@ -646,20 +646,20 @@ pub struct RolloutCache {
     last_disk_prune: Option<Instant>,
     last_refresh: RolloutCacheRefresh,
     metrics: RolloutCacheMetrics,
-    last_materialized_at: Option<DateTime<Utc>>,
+    last_materialized_at: Option<UtcTimestamp>,
     last_materialized_active_grace: Option<Duration>,
-    next_freshness_deadline: Option<DateTime<Utc>>,
-    next_as_of_evidence_boundary: Option<DateTime<Utc>>,
+    next_freshness_deadline: Option<UtcTimestamp>,
+    next_as_of_evidence_boundary: Option<UtcTimestamp>,
     as_of_reduced: Option<ReducedRollouts>,
     #[cfg(test)]
     as_of_reduce_count: usize,
-    last_external_materialized_at: Option<DateTime<Utc>>,
-    next_external_evidence_boundary: Option<DateTime<Utc>>,
+    last_external_materialized_at: Option<UtcTimestamp>,
+    next_external_evidence_boundary: Option<UtcTimestamp>,
     last_discovery: Option<DiscoveryState>,
     discovery_cache: Option<DiscoveryCache>,
     omitted_owner_probes: HashMap<PathBuf, CachedOwnerProbe>,
-    local_coverage_started_at: Option<DateTime<Utc>>,
-    local_coverage_last_complete_at: Option<DateTime<Utc>>,
+    local_coverage_started_at: Option<UtcTimestamp>,
+    local_coverage_last_complete_at: Option<UtcTimestamp>,
     materialization_pending: bool,
     deleted_ledger_fingerprint: Option<String>,
     startup_progress: Option<StartupLoadProgressTracker>,
@@ -898,8 +898,8 @@ impl PersistentCacheUsage {
 struct SessionTitleCache {
     state: SessionTitleState,
     titles: HashMap<String, String>,
-    materialized_at: Option<DateTime<Utc>>,
-    next_update_at: Option<DateTime<Utc>>,
+    materialized_at: Option<UtcTimestamp>,
+    next_update_at: Option<UtcTimestamp>,
 }
 
 #[derive(Debug, Default)]
@@ -929,9 +929,9 @@ struct ThreadBuilder {
     title_turn_id: Option<String>,
     cwd: Option<PathBuf>,
     source: Option<String>,
-    created_at: Option<DateTime<Utc>>,
-    updated_at: Option<DateTime<Utc>>,
-    session_metadata_updated_at: Option<DateTime<Utc>>,
+    created_at: Option<UtcTimestamp>,
+    updated_at: Option<UtcTimestamp>,
+    session_metadata_updated_at: Option<UtcTimestamp>,
     service_tier: Option<String>,
     service_tier_observed: bool,
     inherited_thread_settings: Option<(String, String)>,
@@ -947,7 +947,7 @@ struct ThreadBuilder {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct AgentCallEvidence {
-    requested_at: Option<DateTime<Utc>>,
+    requested_at: Option<UtcTimestamp>,
     call_id: String,
     parent_turn_id: String,
     kind: AgentInteractionKind,
@@ -955,7 +955,7 @@ struct AgentCallEvidence {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct AgentActivityEvidence {
-    occurred_at: Option<DateTime<Utc>>,
+    occurred_at: Option<UtcTimestamp>,
     call_id: String,
     child_thread_id: String,
     kind: AgentInteractionKind,
@@ -969,8 +969,8 @@ struct TurnBuilder {
     service_tier: Option<String>,
     message_preview: Option<String>,
     message_source: Option<UserMessageSource>,
-    started_at: Option<DateTime<Utc>>,
-    completed_at: Option<DateTime<Utc>>,
+    started_at: Option<UtcTimestamp>,
+    completed_at: Option<UtcTimestamp>,
     duration_ms: Option<u64>,
     status: TurnStatus,
     token_usage: TokenUsage,
@@ -980,7 +980,7 @@ struct TurnBuilder {
 ///
 /// Rollout formats are internal to Codex, so this adapter deliberately parses
 /// only the fields it understands and ignores unknown records and fields.
-pub fn scan_rollouts(config: &CollectConfig, now: DateTime<Utc>) -> Result<RolloutDataset> {
+pub fn scan_rollouts(config: &CollectConfig, now: UtcTimestamp) -> Result<RolloutDataset> {
     RolloutCache::default().scan(config, now)
 }
 
@@ -1225,7 +1225,7 @@ fn discover_session_capture_files(
             let file = RolloutFile {
                 fingerprint: FileFingerprint::from_path_and_metadata(&path, &metadata)?,
                 path,
-                modified_at: DateTime::<Utc>::from(metadata.modified()?),
+                modified_at: rollout_modified_at(metadata.modified()?)?,
             };
             let mut reader = BufReader::new(handle.take(OWNER_PROBE_MAX_BYTES));
             let mut line = Vec::new();
@@ -1293,7 +1293,7 @@ fn discover_session_capture_files(
 pub(crate) fn capture_session_usage(
     config: &CollectConfig,
     targets: &HashSet<String>,
-    as_of: DateTime<Utc>,
+    as_of: UtcTimestamp,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<SessionUsageCapture> {
     use std::sync::atomic::Ordering;
@@ -1386,7 +1386,7 @@ pub(crate) fn capture_session_usage(
                         matches!(event,
                         ParsedEvent::TaskStarted { started_at:Some(started_at), .. }
                             if parsed.owning_created_at.is_some_and(|created_at|
-                                *started_at >= created_at - ChronoDuration::seconds(2)
+                                *started_at >= created_at - SignedDuration::seconds(2)
                                     && *started_at <= counter.timestamp))
                     })
             });
@@ -1453,25 +1453,24 @@ pub(crate) fn capture_session_usage(
 #[cfg(test)]
 mod deleted_capture_tests {
     use super::*;
-    use chrono::TimeZone;
     use serde_json::json;
     use std::sync::atomic::AtomicBool;
 
     const THREAD: &str = "01a10855-6354-7043-be0b-dfebaaa70758";
-    fn time() -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 10, 20, 12, 0, 0).unwrap()
+    fn time() -> UtcTimestamp {
+        UtcTimestamp::from_utc(2026, 10, 20, 12, 0, 0).unwrap()
     }
     fn log(future: bool, fork: bool) -> String {
-        let at = time() - ChronoDuration::hours(6);
+        let at = time() - SignedDuration::hours(6);
         let mut owner = json!({"id":THREAD});
         if fork {
             owner["forked_from_id"] = json!("01a10855-6354-7043-be0b-dfebaaa70759");
         }
         [
             json!({"timestamp":at,"type":"session_meta","payload":owner}),
-            json!({"timestamp":at+ChronoDuration::seconds(1),"type":"event_msg","payload":{"type":"task_started","turn_id":"turn","started_at":at+ChronoDuration::seconds(1)}}),
-            json!({"timestamp":if future {time()+ChronoDuration::seconds(1)} else {at+ChronoDuration::seconds(2)},"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":17,"total_tokens":17},"last_token_usage":{"input_tokens":17,"total_tokens":17}}}}),
-            json!({"timestamp":at+ChronoDuration::seconds(3),"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn"}}),
+            json!({"timestamp":at+SignedDuration::seconds(1),"type":"event_msg","payload":{"type":"task_started","turn_id":"turn","started_at":at+SignedDuration::seconds(1)}}),
+            json!({"timestamp":if future {time()+SignedDuration::seconds(1)} else {at+SignedDuration::seconds(2)},"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":17,"total_tokens":17},"last_token_usage":{"input_tokens":17,"total_tokens":17}}}}),
+            json!({"timestamp":at+SignedDuration::seconds(3),"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn"}}),
         ].iter().map(Value::to_string).collect::<Vec<_>>().join("\n")+"\n"
     }
     fn fixture(contents: &str) -> (tempfile::TempDir, CollectConfig, PathBuf) {
@@ -1704,7 +1703,7 @@ mod deleted_capture_tests {
                 .collect();
             records.insert(
                 2,
-                json!({"timestamp":time()-ChronoDuration::hours(6)+ChronoDuration::seconds(1),
+                json!({"timestamp":time()-SignedDuration::hours(6)+SignedDuration::seconds(1),
                 "type":"event_msg","payload":{"type":"token_count","info":{
                     "total_token_usage":{"input_tokens":0,"total_tokens":0},
                     "last_token_usage":{"input_tokens":last,"total_tokens":last}}}}),
@@ -1791,7 +1790,7 @@ mod deleted_capture_tests {
             assert_eq!(dataset.tasks[0].token_usage.total_tokens, 17);
             assert_eq!(
                 dataset.calls[0].timestamp,
-                time() - ChronoDuration::hours(6) + ChronoDuration::seconds(2)
+                time() - SignedDuration::hours(6) + SignedDuration::seconds(2)
             );
             assert!(dataset.turns[0].message_preview.is_none());
             assert_eq!(dataset.tasks[0].title, "Deleted short title");
@@ -1867,7 +1866,7 @@ mod deleted_capture_tests {
                 available_count: 2,
                 credits: None,
                 provenance: Provenance::ServerSnapshot,
-                as_of: Utc::now() - ChronoDuration::hours(1),
+                as_of: UtcTimestamp::now() - SignedDuration::hours(1),
             }),
             ..crate::domain::AccountSnapshot::default()
         };
@@ -1902,7 +1901,7 @@ pub(crate) fn load_detail_usage(
     paths: &[PathBuf],
     codex_home: &Path,
     thread_id: &str,
-    as_of: DateTime<Utc>,
+    as_of: UtcTimestamp,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> RolloutDataset {
     use std::sync::atomic::Ordering;
@@ -1949,7 +1948,7 @@ pub(crate) fn load_detail_usage(
                 handle,
                 RolloutFile {
                     path: path.clone(),
-                    modified_at: DateTime::<Utc>::from(metadata.modified()?),
+                    modified_at: rollout_modified_at(metadata.modified()?)?,
                     fingerprint,
                 },
             ))
@@ -2069,9 +2068,9 @@ impl RolloutCache {
     /// rollout files represented zero usage.
     pub(crate) fn update_local_coverage(
         &mut self,
-        now: DateTime<Utc>,
+        now: UtcTimestamp,
         complete: bool,
-    ) -> Option<DateTime<Utc>> {
+    ) -> Option<UtcTimestamp> {
         let discovery_complete = self
             .discovery_cache
             .as_ref()
@@ -2084,7 +2083,7 @@ impl RolloutCache {
         let lookback = self
             .discovery_cache
             .as_ref()
-            .and_then(|discovery| ChronoDuration::try_days(discovery.key.lookback_days.max(0)));
+            .and_then(|discovery| SignedDuration::try_days(discovery.key.lookback_days.max(0)));
         let coverage_is_continuous =
             self.local_coverage_last_complete_at
                 .is_some_and(|last_complete_at| {
@@ -2103,7 +2102,7 @@ impl RolloutCache {
     fn discover_rollout_files(
         &mut self,
         config: &CollectConfig,
-        now: DateTime<Utc>,
+        now: UtcTimestamp,
         dataset: &mut RolloutDataset,
         suppressed_warnings: &mut usize,
         refresh: &mut RolloutCacheRefresh,
@@ -2177,7 +2176,7 @@ impl RolloutCache {
 
     /// Scans recent rollouts, reparsing rollout files and reloading the session
     /// title index only when their metadata fingerprints change.
-    pub fn scan(&mut self, config: &CollectConfig, now: DateTime<Utc>) -> Result<RolloutDataset> {
+    pub fn scan(&mut self, config: &CollectConfig, now: UtcTimestamp) -> Result<RolloutDataset> {
         Ok(self
             .scan_inner(config, now, true, false, None)?
             .expect("a forced rollout scan always materializes a dataset"))
@@ -2186,8 +2185,8 @@ impl RolloutCache {
     pub(crate) fn scan_with_external_boundary(
         &mut self,
         config: &CollectConfig,
-        now: DateTime<Utc>,
-        next_external_boundary: Option<DateTime<Utc>>,
+        now: UtcTimestamp,
+        next_external_boundary: Option<UtcTimestamp>,
     ) -> Result<RolloutDataset> {
         Ok(self
             .scan_inner(config, now, true, false, next_external_boundary)?
@@ -2199,7 +2198,7 @@ impl RolloutCache {
     pub fn scan_if_changed(
         &mut self,
         config: &CollectConfig,
-        now: DateTime<Utc>,
+        now: UtcTimestamp,
     ) -> Result<Option<RolloutDataset>> {
         self.scan_inner(config, now, false, false, None)
     }
@@ -2207,8 +2206,8 @@ impl RolloutCache {
     pub(crate) fn scan_if_changed_with_external_boundary(
         &mut self,
         config: &CollectConfig,
-        now: DateTime<Utc>,
-        next_external_boundary: Option<DateTime<Utc>>,
+        now: UtcTimestamp,
+        next_external_boundary: Option<UtcTimestamp>,
     ) -> Result<Option<RolloutDataset>> {
         self.scan_inner(config, now, false, false, next_external_boundary)
     }
@@ -2220,16 +2219,16 @@ impl RolloutCache {
     pub(crate) fn scan_if_changed_coalesced_with_external_boundary(
         &mut self,
         config: &CollectConfig,
-        now: DateTime<Utc>,
-        next_external_boundary: Option<DateTime<Utc>>,
+        now: UtcTimestamp,
+        next_external_boundary: Option<UtcTimestamp>,
     ) -> Result<Option<RolloutDataset>> {
         self.scan_inner(config, now, false, true, next_external_boundary)
     }
 
     pub(crate) fn set_external_boundary(
         &mut self,
-        now: DateTime<Utc>,
-        next_external_boundary: Option<DateTime<Utc>>,
+        now: UtcTimestamp,
+        next_external_boundary: Option<UtcTimestamp>,
     ) {
         self.last_external_materialized_at = Some(now);
         self.next_external_evidence_boundary = next_external_boundary;
@@ -2238,10 +2237,10 @@ impl RolloutCache {
     fn scan_inner(
         &mut self,
         config: &CollectConfig,
-        now: DateTime<Utc>,
+        now: UtcTimestamp,
         force_materialize: bool,
         coalesce_materialization: bool,
-        next_external_boundary: Option<DateTime<Utc>>,
+        next_external_boundary: Option<UtcTimestamp>,
     ) -> Result<Option<RolloutDataset>> {
         if self
             .startup_progress
@@ -3251,7 +3250,7 @@ impl RolloutCache {
     fn refresh_session_titles(
         &mut self,
         config: &CollectConfig,
-        now: DateTime<Utc>,
+        now: UtcTimestamp,
         discovery: &mut RolloutDataset,
         suppressed_warnings: &mut usize,
         refresh: &mut RolloutCacheRefresh,
@@ -4038,7 +4037,7 @@ fn sort_rollout_files_for_replay(files: &mut [RolloutFile], cache: &HashMap<Path
 fn sort_rollout_files_for_replay_as_of(
     files: &mut [RolloutFile],
     cache: &HashMap<PathBuf, CachedFile>,
-    as_of: Option<DateTime<Utc>>,
+    as_of: Option<UtcTimestamp>,
 ) {
     let visible_starts = as_of.map(|as_of| {
         files
@@ -4078,7 +4077,7 @@ fn build_replay_plan(
     discovery: Option<&DiscoveryCache>,
     owner_probes: &mut HashMap<PathBuf, CachedOwnerProbe>,
     config: &CollectConfig,
-    as_of: Option<DateTime<Utc>>,
+    as_of: Option<UtcTimestamp>,
 ) -> ReplayPlan {
     let mut plan = ReplayPlan::default();
     let mut files_by_thread = HashMap::<String, Vec<(&RolloutFile, ReplayRange)>>::new();
@@ -4263,7 +4262,7 @@ fn build_replay_plan(
     plan
 }
 
-fn replay_range(parsed: &ParsedFile, as_of: Option<DateTime<Utc>>) -> Option<ReplayRange> {
+fn replay_range(parsed: &ParsedFile, as_of: Option<UtcTimestamp>) -> Option<ReplayRange> {
     let Some(as_of) = as_of else {
         return Some(ReplayRange {
             started_at: parsed.replay_started_at,
@@ -4384,7 +4383,7 @@ fn reduce_cached_files_as_of(
     cache: &HashMap<PathBuf, CachedFile>,
     config: &CollectConfig,
     replay_plan: &ReplayPlan,
-    as_of: DateTime<Utc>,
+    as_of: UtcTimestamp,
 ) -> ReducedRollouts {
     reduce_cached_files_inner(files, cache, config, replay_plan, Some(as_of))
 }
@@ -4394,7 +4393,7 @@ fn reduce_cached_files_inner(
     cache: &HashMap<PathBuf, CachedFile>,
     config: &CollectConfig,
     replay_plan: &ReplayPlan,
-    as_of: Option<DateTime<Utc>>,
+    as_of: Option<UtcTimestamp>,
 ) -> ReducedRollouts {
     let mut reduced = ReducedRollouts {
         incomplete_counter_threads: replay_plan.incomplete_counter_threads.clone(),
@@ -4533,7 +4532,7 @@ fn replay_file_into_reduced(
     file: &RolloutFile,
     parsed: &ParsedFile,
     config: &CollectConfig,
-    as_of: Option<DateTime<Utc>>,
+    as_of: Option<UtcTimestamp>,
 ) {
     let incomplete_counter_boundary = parsed
         .owner_thread_id
@@ -4679,7 +4678,7 @@ fn archived_rollout_is_subsumed_by_active_as_of(
     files: &[RolloutFile],
     cache: &HashMap<PathBuf, CachedFile>,
     config: &CollectConfig,
-    as_of: Option<DateTime<Utc>>,
+    as_of: Option<UtcTimestamp>,
 ) -> bool {
     if !parsed.complete
         || !file
@@ -4709,7 +4708,7 @@ fn materialize_dataset(
     mut discovery: RolloutDataset,
     discovery_suppressed_warnings: usize,
     config: &CollectConfig,
-    now: DateTime<Utc>,
+    now: UtcTimestamp,
     thread_titles: &HashMap<String, String>,
 ) -> RolloutDataset {
     discovery.stats.scanned_files = reduced.dataset.stats.scanned_files;
@@ -4745,10 +4744,10 @@ fn materialize_dataset(
 
 fn next_freshness_deadline(
     reduced: &ReducedRollouts,
-    now: DateTime<Utc>,
+    now: UtcTimestamp,
     active_grace: Duration,
-) -> Option<DateTime<Utc>> {
-    let Ok(active_grace) = ChronoDuration::from_std(active_grace) else {
+) -> Option<UtcTimestamp> {
+    let Ok(active_grace) = SignedDuration::from_std(active_grace) else {
         return None;
     };
     reduced
@@ -4763,10 +4762,10 @@ fn next_freshness_deadline(
 fn next_as_of_evidence_boundary(
     files: &[RolloutFile],
     cache: &HashMap<PathBuf, CachedFile>,
-    now: DateTime<Utc>,
-) -> Option<DateTime<Utc>> {
+    now: UtcTimestamp,
+) -> Option<UtcTimestamp> {
     let mut next = None;
-    let mut consider = |timestamp: DateTime<Utc>| {
+    let mut consider = |timestamp: UtcTimestamp| {
         if timestamp > now && next.is_none_or(|current| timestamp < current) {
             next = Some(timestamp);
         }
@@ -4786,7 +4785,7 @@ fn next_as_of_evidence_boundary(
     next
 }
 
-fn crossed_local_coverage_bucket(last_materialized_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+fn crossed_local_coverage_bucket(last_materialized_at: UtcTimestamp, now: UtcTimestamp) -> bool {
     last_materialized_at
         .timestamp()
         .div_euclid(LOCAL_COVERAGE_BUCKET_SECONDS)
@@ -4795,7 +4794,7 @@ fn crossed_local_coverage_bucket(last_materialized_at: DateTime<Utc>, now: DateT
 
 fn discover_rollout_inventory(
     config: &CollectConfig,
-    now: DateTime<Utc>,
+    now: UtcTimestamp,
     key: &DiscoveryKey,
     refresh: &mut RolloutCacheRefresh,
 ) -> DiscoveryCache {
@@ -4966,12 +4965,12 @@ fn discover_rollout_inventory(
 fn selected_rollout_inventory_paths(
     inventory: &HashMap<PathBuf, RolloutFile>,
     config: &CollectConfig,
-    now: DateTime<Utc>,
+    now: UtcTimestamp,
 ) -> HashSet<PathBuf> {
     let lookback_days = config.lookback_days.max(0);
-    let cutoff = ChronoDuration::try_days(lookback_days)
+    let cutoff = SignedDuration::try_days(lookback_days)
         .and_then(|lookback| now.checked_sub_signed(lookback))
-        .unwrap_or(DateTime::<Utc>::MIN_UTC);
+        .unwrap_or(UtcTimestamp::MIN);
     let mut files = inventory
         .values()
         .filter(|file| file.modified_at >= cutoff)
@@ -5026,7 +5025,7 @@ fn push_bounded_owner_candidate(candidates: &mut Vec<PathBuf>, path: PathBuf) {
 fn refresh_cached_discovery(
     cache: &mut DiscoveryCache,
     selected: &[SelectedFile],
-    now: DateTime<Utc>,
+    now: UtcTimestamp,
     refresh: &mut RolloutCacheRefresh,
 ) -> Result<(), ()> {
     for (path, expected) in &cache.roots {
@@ -5049,7 +5048,7 @@ fn refresh_cached_discovery(
 fn refresh_selected_rollout_files(
     cache: &mut DiscoveryCache,
     selected: &[SelectedFile],
-    now: DateTime<Utc>,
+    now: UtcTimestamp,
     refresh: &mut RolloutCacheRefresh,
 ) -> Result<(), ()> {
     for selected in selected {
@@ -5076,14 +5075,14 @@ fn inspect_rollout_directory(path: &Path) -> std::io::Result<Option<FileFingerpr
 fn select_rollout_files(
     cache: &DiscoveryCache,
     config: &CollectConfig,
-    now: DateTime<Utc>,
+    now: UtcTimestamp,
     dataset: &mut RolloutDataset,
     suppressed_warnings: &mut usize,
 ) -> Vec<RolloutFile> {
     let lookback_days = config.lookback_days.max(0);
-    let cutoff = ChronoDuration::try_days(lookback_days)
+    let cutoff = SignedDuration::try_days(lookback_days)
         .and_then(|lookback| now.checked_sub_signed(lookback))
-        .unwrap_or(DateTime::<Utc>::MIN_UTC);
+        .unwrap_or(UtcTimestamp::MIN);
     dataset.stats.unreadable_files = cache.unreadable_files;
     dataset.warnings = cache.warnings.clone();
     *suppressed_warnings = cache.suppressed_warnings;
@@ -5188,10 +5187,12 @@ fn refresh_stable_rollout_file(
                     tail_guard_validation_bytes,
                 };
             }
-            if attempt == 0 {
+            if attempt == 0
+                && let Ok(modified_at) = rollout_modified_at(final_fingerprint.modified)
+            {
                 candidate = RolloutFile {
                     path: candidate.path,
-                    modified_at: DateTime::<Utc>::from(final_fingerprint.modified),
+                    modified_at,
                     fingerprint: final_fingerprint,
                 };
                 continue;
@@ -5357,9 +5358,14 @@ fn inspect_rollout_file(path: &Path) -> std::io::Result<RolloutFile> {
     let fingerprint = FileFingerprint::from_path_and_metadata(path, &metadata)?;
     Ok(RolloutFile {
         path: path.to_owned(),
-        modified_at: DateTime::<Utc>::from(fingerprint.modified),
+        modified_at: rollout_modified_at(fingerprint.modified)?,
         fingerprint,
     })
+}
+
+fn rollout_modified_at(modified: SystemTime) -> std::io::Result<UtcTimestamp> {
+    UtcTimestamp::try_from(modified)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }
 
 fn parse_rollout_file(file: &RolloutFile, config: &CollectConfig) -> ParsedFile {
@@ -5788,7 +5794,7 @@ fn push_parsed_warning(parsed: &mut ParsedFile, warning: String) {
 
 fn retain_latest_foreign_baseline(
     events: &mut ParsedEvents,
-    timestamp: DateTime<Utc>,
+    timestamp: UtcTimestamp,
     total_usage: TokenUsage,
 ) -> bool {
     // Locate without mutable iteration: inspecting an immutable shared prefix
@@ -5826,7 +5832,7 @@ fn retain_latest_foreign_baseline(
 
 fn retain_latest_foreign_thread_settings(
     events: &mut ParsedEvents,
-    timestamp: DateTime<Utc>,
+    timestamp: UtcTimestamp,
     model: Option<String>,
     service_tier: Option<String>,
 ) {
@@ -5840,7 +5846,7 @@ fn retain_latest_foreign_thread_settings(
 fn cache_event_message(
     events: &mut ParsedEvents,
     payload: &Map<String, Value>,
-    timestamp: DateTime<Utc>,
+    timestamp: UtcTimestamp,
     line_number: usize,
 ) {
     let turn_id = || string_field_in(payload, &["turn_id", "turnId"]).map(str::to_owned);
@@ -6180,7 +6186,7 @@ fn replay_rollout_file(
     config: &CollectConfig,
     threads: &mut HashMap<String, ThreadBuilder>,
     dataset: &mut RolloutDataset,
-    as_of: Option<DateTime<Utc>>,
+    as_of: Option<UtcTimestamp>,
     incomplete_counter_boundary: bool,
 ) {
     let Some(thread_id) = parsed.owner_thread_id.as_deref() else {
@@ -6389,7 +6395,7 @@ fn replay_rollout_file(
     }
 }
 
-fn parsed_event_available_at(event: &ParsedEvent) -> Option<DateTime<Utc>> {
+fn parsed_event_available_at(event: &ParsedEvent) -> Option<UtcTimestamp> {
     match event {
         ParsedEvent::SessionMeta { timestamp, .. }
         | ParsedEvent::ForeignCounterBaseline { timestamp, .. }
@@ -6431,7 +6437,7 @@ fn parsed_event_available_at(event: &ParsedEvent) -> Option<DateTime<Utc>> {
 fn apply_session_meta(
     thread: &mut ThreadBuilder,
     payload: &Map<String, Value>,
-    timestamp: DateTime<Utc>,
+    timestamp: UtcTimestamp,
 ) {
     if is_subagent_session(payload) && thread.previous_cumulative.is_none() {
         thread.incomplete_counter_boundary = true;
@@ -6512,7 +6518,7 @@ fn response_item_turn_with_preview(thread: &ThreadBuilder, preview: &str) -> Opt
 fn apply_turn_context(
     thread: &mut ThreadBuilder,
     payload: &Map<String, Value>,
-    timestamp: DateTime<Utc>,
+    timestamp: UtcTimestamp,
 ) {
     let Some(turn_id) = string_field_in(payload, &["turn_id", "turnId"]).map(str::to_owned) else {
         return;
@@ -6562,7 +6568,7 @@ fn apply_thread_settings(thread: &mut ThreadBuilder, service_tier: Option<String
     }
 }
 
-fn activate_turn(thread: &mut ThreadBuilder, turn_id: &str, started_at: DateTime<Utc>) {
+fn activate_turn(thread: &mut ThreadBuilder, turn_id: &str, started_at: UtcTimestamp) {
     let service_tier = thread.service_tier.clone();
     let turn = ensure_turn(thread, turn_id);
     if matches!(
@@ -6586,7 +6592,7 @@ fn activate_turn(thread: &mut ThreadBuilder, turn_id: &str, started_at: DateTime
 fn finish_turn(
     thread: &mut ThreadBuilder,
     turn_id: &str,
-    completed_at: DateTime<Utc>,
+    completed_at: UtcTimestamp,
     duration_ms: Option<u64>,
     status: TurnStatus,
 ) {
@@ -6610,7 +6616,7 @@ fn apply_token_count(
     thread: &mut ThreadBuilder,
     usage: TokenCounterSample,
     rate_limits: Option<&CachedRateLimits>,
-    timestamp: DateTime<Utc>,
+    timestamp: UtcTimestamp,
     path: &Path,
     line_number: usize,
     dataset: &mut RolloutDataset,
@@ -6745,7 +6751,7 @@ fn apply_token_count(
 
 fn fallback_usage_event_id(
     thread_id: &str,
-    timestamp: DateTime<Utc>,
+    timestamp: UtcTimestamp,
     cumulative: TokenUsage,
     last: Option<TokenUsage>,
 ) -> String {
@@ -6824,7 +6830,7 @@ pub(crate) fn starts_owning_segment(
     record_type: Option<&str>,
     payload: Option<&Map<String, Value>>,
     owning_thread_id: &str,
-    owning_created_at: Option<DateTime<Utc>>,
+    owning_created_at: Option<UtcTimestamp>,
 ) -> bool {
     if record_type != Some("event_msg") {
         return false;
@@ -6849,7 +6855,7 @@ pub(crate) fn starts_owning_segment(
     let timestamp_is_owning = match (started_at, owning_created_at) {
         // started_at is second-granularity in current rollouts, hence tolerance.
         (Some(started_at), Some(created_at)) => {
-            started_at >= created_at - ChronoDuration::seconds(2)
+            started_at >= created_at - SignedDuration::seconds(2)
         }
         _ => false,
     };
@@ -6967,7 +6973,7 @@ fn parse_token_usage(value: &Value) -> Option<TokenUsage> {
 
 fn finish_dataset(
     config: &CollectConfig,
-    now: DateTime<Utc>,
+    now: UtcTimestamp,
     threads: &HashMap<String, ThreadBuilder>,
     thread_titles: &HashMap<String, String>,
     dataset: &mut RolloutDataset,
@@ -6985,7 +6991,7 @@ fn finish_dataset(
 
     let mut usage_by_thread = HashMap::<String, TokenUsage>::new();
     let mut usage_by_turn = HashMap::<(String, String), TokenUsage>::new();
-    let mut latest_call_by_thread = HashMap::<String, DateTime<Utc>>::new();
+    let mut latest_call_by_thread = HashMap::<String, UtcTimestamp>::new();
     for call in &dataset.calls {
         usage_by_thread
             .entry(call.thread_id.clone())
@@ -7180,10 +7186,10 @@ fn finish_dataset(
 
 fn materialize_thread_as_of(
     thread: &ThreadBuilder,
-    now: DateTime<Utc>,
+    now: UtcTimestamp,
     token_usage: TokenUsage,
     usage_by_turn: &HashMap<(String, String), TokenUsage>,
-    latest_call: Option<DateTime<Utc>>,
+    latest_call: Option<UtcTimestamp>,
 ) -> Option<ThreadBuilder> {
     let mut visible = thread.clone();
     let session_metadata_is_future = thread
@@ -7412,7 +7418,7 @@ fn task_status(
     let latest = thread.turns.values().max_by_key(|turn| {
         turn.completed_at
             .or(turn.started_at)
-            .unwrap_or(DateTime::<Utc>::MIN_UTC)
+            .unwrap_or(UtcTimestamp::MIN)
     });
     match latest.map(|turn| turn.status) {
         Some(TurnStatus::Completed) => (
@@ -7446,8 +7452,8 @@ fn ensure_turn<'a>(thread: &'a mut ThreadBuilder, turn_id: &str) -> &'a mut Turn
 }
 
 fn timestamp_is_fresh(
-    timestamp: Option<DateTime<Utc>>,
-    now: DateTime<Utc>,
+    timestamp: Option<UtcTimestamp>,
+    now: UtcTimestamp,
     grace: std::time::Duration,
 ) -> bool {
     let Some(timestamp) = timestamp else {
@@ -7528,10 +7534,10 @@ fn session_source_label(payload: &Map<String, Value>) -> Option<String> {
     })
 }
 
-fn parse_timestamp(value: &Value) -> Option<DateTime<Utc>> {
+fn parse_timestamp(value: &Value) -> Option<UtcTimestamp> {
     if let Some(timestamp) = value.as_str() {
-        if let Ok(timestamp) = DateTime::parse_from_rfc3339(timestamp) {
-            return Some(timestamp.with_timezone(&Utc));
+        if let Ok(timestamp) = UtcTimestamp::parse_from_rfc3339(timestamp) {
+            return Some(timestamp);
         }
         if let Ok(timestamp) = timestamp.parse::<i64>() {
             return timestamp_from_integer(timestamp);
@@ -7544,15 +7550,15 @@ fn parse_timestamp(value: &Value) -> Option<DateTime<Utc>> {
     value.as_f64().and_then(|timestamp| {
         let seconds = timestamp.trunc() as i64;
         let nanos = (timestamp.fract().abs() * 1_000_000_000.0) as u32;
-        DateTime::from_timestamp(seconds, nanos)
+        UtcTimestamp::from_timestamp(seconds, nanos)
     })
 }
 
-fn timestamp_from_integer(timestamp: i64) -> Option<DateTime<Utc>> {
+fn timestamp_from_integer(timestamp: i64) -> Option<UtcTimestamp> {
     if timestamp.unsigned_abs() >= 100_000_000_000 {
-        DateTime::from_timestamp_millis(timestamp)
+        UtcTimestamp::from_timestamp_millis(timestamp)
     } else {
-        DateTime::from_timestamp(timestamp, 0)
+        UtcTimestamp::from_timestamp(timestamp, 0)
     }
 }
 
@@ -7620,13 +7626,13 @@ fn f64_field_in(value: &Map<String, Value>, fields: &[&str]) -> Option<f64> {
     })
 }
 
-fn set_min_timestamp(slot: &mut Option<DateTime<Utc>>, value: DateTime<Utc>) {
+fn set_min_timestamp(slot: &mut Option<UtcTimestamp>, value: UtcTimestamp) {
     if slot.is_none_or(|current| value < current) {
         *slot = Some(value);
     }
 }
 
-fn set_max_timestamp(slot: &mut Option<DateTime<Utc>>, value: DateTime<Utc>) {
+fn set_max_timestamp(slot: &mut Option<UtcTimestamp>, value: UtcTimestamp) {
     if slot.is_none_or(|current| value > current) {
         *slot = Some(value);
     }

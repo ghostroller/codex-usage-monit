@@ -11,11 +11,11 @@ fn poisoned_history_exit_does_not_persist_staged_observation() {
     let history_root = directory.path().join("state/history-v1");
     let mut runtime = HistoryRuntime::new(history_root.clone(), &codex_home, false).unwrap();
     let profile_lease = acquire_runtime_profile_lease(&runtime).unwrap();
-    let starts_at = Utc.with_ymd_and_hms(2026, 8, 30, 9, 0, 0).unwrap();
+    let starts_at = UtcTimestamp::from_utc(2026, 8, 30, 9, 0, 0).unwrap();
     let _ = prepare_tui_history_runtime(
         &mut runtime,
         &profile_lease,
-        starts_at + ChronoDuration::minutes(20),
+        starts_at + SignedDuration::minutes(20),
     );
     runtime
         .record_local_observation(
@@ -41,7 +41,7 @@ fn poisoned_history_exit_does_not_persist_staged_observation() {
 
     let mut reader = HistoryRuntime::new(history_root, &codex_home, false).unwrap();
     let persisted = reader
-        .load_unified_history_since(starts_at - ChronoDuration::hours(1))
+        .load_unified_history_since(starts_at - SignedDuration::hours(1))
         .unwrap();
     assert_eq!(
         persisted.history.half_hour_buckets[0]
@@ -345,7 +345,7 @@ fn stopped_refresh_source_control_keeps_geometry_without_an_active_shortcut() {
         app.record_refresh_worker_failure(
             RefreshWorkerFailure::HistoryStatePoisoned,
             Instant::now(),
-            Utc::now(),
+            UtcTimestamp::now(),
         );
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let hitbox = app.history_source_control_hitbox;

@@ -17,7 +17,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use chrono::{DateTime, Utc};
 use serde_json::{Map, Value, json};
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
@@ -43,6 +42,7 @@ use crate::domain::{
     LimitWindow, Provenance, RateLimitResetCredit, RateLimitResetCreditsSnapshot,
 };
 use crate::startup::StartupTrace;
+use crate::time::UtcTimestamp;
 use crate::trace::{TraceFields, TraceLog, TraceOutcome};
 
 const INITIALIZE_ID: u64 = 1;
@@ -1020,14 +1020,14 @@ pub(crate) mod session_management {
 /// function above and retain response-completion timestamps.
 pub(crate) fn fetch_account_snapshot_as_of(
     config: &CollectConfig,
-    as_of: DateTime<Utc>,
+    as_of: UtcTimestamp,
 ) -> Result<AccountSnapshot> {
     fetch_account_snapshot_inner(config, Some(as_of), app_server_rpc_deadline)
 }
 
 fn fetch_account_snapshot_inner(
     config: &CollectConfig,
-    snapshot_as_of: Option<DateTime<Utc>>,
+    snapshot_as_of: Option<UtcTimestamp>,
     mut rpc_deadline: impl FnMut(Duration) -> Result<Instant>,
 ) -> Result<AccountSnapshot> {
     let operation_trace = config
@@ -1371,7 +1371,7 @@ fn fetch_account_snapshot_inner(
         let mut snapshot = AccountSnapshot::default();
         match rate_limits {
             Ok(result) => {
-                let as_of = snapshot_as_of.unwrap_or_else(Utc::now);
+                let as_of = snapshot_as_of.unwrap_or_else(UtcTimestamp::now);
                 match parse_rate_limits_result(&result, as_of) {
                     Ok(limits) => snapshot.limits = limits,
                     Err(error) => snapshot.errors.push(format!(
@@ -1626,7 +1626,7 @@ fn path_component_equals(value: &OsStr, expected: &str) -> bool {
 }
 
 /// Parses the `result` object returned by `account/rateLimits/read`.
-pub fn parse_rate_limits_result(result: &Value, as_of: DateTime<Utc>) -> Result<Vec<LimitBucket>> {
+pub fn parse_rate_limits_result(result: &Value, as_of: UtcTimestamp) -> Result<Vec<LimitBucket>> {
     let result = unwrap_result(result);
     let object = result
         .as_object()
@@ -1677,7 +1677,7 @@ pub fn parse_rate_limits_result(result: &Value, as_of: DateTime<Utc>) -> Result<
 /// Parses the reset opportunities returned alongside `account/rateLimits/read`.
 pub fn parse_rate_limit_reset_credits_result(
     result: &Value,
-    as_of: DateTime<Utc>,
+    as_of: UtcTimestamp,
 ) -> Result<Option<RateLimitResetCreditsSnapshot>> {
     let Some(reset_credits) = rate_limit_reset_credits_object(result)? else {
         return Ok(None);
@@ -1699,7 +1699,7 @@ pub fn parse_rate_limit_reset_credits_result(
 
 fn parse_rate_limit_reset_credits_result_lossy(
     result: &Value,
-    as_of: DateTime<Utc>,
+    as_of: UtcTimestamp,
     warnings: &mut ProtocolWarnings,
 ) -> Result<(Option<RateLimitResetCreditsSnapshot>, bool)> {
     let Some(reset_credits) = rate_limit_reset_credits_object(result)? else {
@@ -1826,7 +1826,7 @@ pub fn parse_account_usage_result(result: &Value) -> Result<AccountTokenUsage> {
 fn parse_limit_bucket(
     value: &Value,
     fallback_id: &str,
-    as_of: DateTime<Utc>,
+    as_of: UtcTimestamp,
 ) -> Result<LimitBucket> {
     let object = value
         .as_object()
@@ -1957,13 +1957,13 @@ fn parse_reset_credit(value: &Value, index: usize) -> Result<RateLimitResetCredi
 fn optional_unix_seconds_timestamp(
     object: &Map<String, Value>,
     key: &str,
-) -> Result<Option<DateTime<Utc>>> {
+) -> Result<Option<UtcTimestamp>> {
     match object.get(key) {
         Some(Value::Number(value)) => {
             let seconds = value
                 .as_i64()
                 .ok_or_else(|| anyhow!("{key} must be Unix seconds as an int64"))?;
-            DateTime::from_timestamp(seconds, 0)
+            UtcTimestamp::from_timestamp(seconds, 0)
                 .map(Some)
                 .ok_or_else(|| anyhow!("{key} is outside the supported timestamp range"))
         }
@@ -2437,7 +2437,7 @@ fn optional_i64(object: &Map<String, Value>, key: &str) -> Result<Option<i64>> {
     }
 }
 
-fn optional_timestamp(object: &Map<String, Value>, key: &str) -> Result<Option<DateTime<Utc>>> {
+fn optional_timestamp(object: &Map<String, Value>, key: &str) -> Result<Option<UtcTimestamp>> {
     let Some(value) = object.get(key) else {
         return Ok(None);
     };
@@ -2448,8 +2448,8 @@ fn optional_timestamp(object: &Map<String, Value>, key: &str) -> Result<Option<D
         if let Ok(seconds) = value.parse::<i64>() {
             return timestamp_from_integer(seconds, key).map(Some);
         }
-        return DateTime::parse_from_rfc3339(value)
-            .map(|timestamp| Some(timestamp.with_timezone(&Utc)))
+        return UtcTimestamp::parse_from_rfc3339(value)
+            .map(Some)
             .with_context(|| format!("{key} must be Unix seconds or an RFC 3339 timestamp"));
     }
     let seconds = value
@@ -2458,7 +2458,7 @@ fn optional_timestamp(object: &Map<String, Value>, key: &str) -> Result<Option<D
     timestamp_from_integer(seconds, key).map(Some)
 }
 
-fn timestamp_from_integer(value: i64, key: &str) -> Result<DateTime<Utc>> {
+fn timestamp_from_integer(value: i64, key: &str) -> Result<UtcTimestamp> {
     let (seconds, nanos) = if value.unsigned_abs() >= 1_000_000_000_000 {
         (
             value.div_euclid(1_000),
@@ -2467,7 +2467,7 @@ fn timestamp_from_integer(value: i64, key: &str) -> Result<DateTime<Utc>> {
     } else {
         (value, 0)
     };
-    DateTime::from_timestamp(seconds, nanos)
+    UtcTimestamp::from_timestamp(seconds, nanos)
         .ok_or_else(|| anyhow!("{key} is outside the supported timestamp range"))
 }
 
@@ -2481,7 +2481,7 @@ mod diagnostic_tests {
     use std::time::Duration;
     use std::time::Instant;
 
-    use chrono::Utc;
+    use crate::time::UtcTimestamp;
     use serde_json::{Value, json};
 
     use super::{
@@ -2966,9 +2966,12 @@ sleep 5
             }
         });
 
-        let (snapshot, partial) =
-            parse_rate_limit_reset_credits_result_lossy(&result, Utc::now(), &mut warnings)
-                .unwrap();
+        let (snapshot, partial) = parse_rate_limit_reset_credits_result_lossy(
+            &result,
+            UtcTimestamp::now(),
+            &mut warnings,
+        )
+        .unwrap();
         let snapshot = snapshot.unwrap();
         let messages = warnings.into_messages();
 
@@ -2980,7 +2983,7 @@ sleep 5
             Some("suppressed 4066 additional codex app-server protocol warnings")
         );
         assert!(
-            parse_rate_limit_reset_credits_result(&result, Utc::now())
+            parse_rate_limit_reset_credits_result(&result, UtcTimestamp::now())
                 .unwrap_err()
                 .to_string()
                 .contains("exceeding the 4096-detail limit")

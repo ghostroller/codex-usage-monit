@@ -6,36 +6,36 @@
 
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::history::{HistoryData, LOCAL_BUCKET_MINUTES};
+use crate::time::{Duration, UtcTimestamp};
 
 pub const FIVE_HOUR_WINDOW_MINUTES: i64 = 300;
 pub const WEEKLY_WINDOW_MINUTES: i64 = 10_080;
 pub const TRENDS_REPORT_SCHEMA_VERSION: u32 = 1;
 
-fn datetime_saturating_add(timestamp: DateTime<Utc>, duration: Duration) -> DateTime<Utc> {
+fn datetime_saturating_add(timestamp: UtcTimestamp, duration: Duration) -> UtcTimestamp {
     timestamp.checked_add_signed(duration).unwrap_or_else(|| {
         if duration < Duration::zero() {
-            DateTime::<Utc>::MIN_UTC
+            UtcTimestamp::MIN
         } else {
-            DateTime::<Utc>::MAX_UTC
+            UtcTimestamp::MAX
         }
     })
 }
 
-fn datetime_saturating_sub(timestamp: DateTime<Utc>, duration: Duration) -> DateTime<Utc> {
+fn datetime_saturating_sub(timestamp: UtcTimestamp, duration: Duration) -> UtcTimestamp {
     timestamp.checked_sub_signed(duration).unwrap_or_else(|| {
         if duration < Duration::zero() {
-            DateTime::<Utc>::MAX_UTC
+            UtcTimestamp::MAX
         } else {
-            DateTime::<Utc>::MIN_UTC
+            UtcTimestamp::MIN
         }
     })
 }
 
-fn interval_midpoint(starts_at: DateTime<Utc>, ends_at: DateTime<Utc>) -> DateTime<Utc> {
+fn interval_midpoint(starts_at: UtcTimestamp, ends_at: UtcTimestamp) -> UtcTimestamp {
     datetime_saturating_add(starts_at, ends_at.signed_duration_since(starts_at) / 2)
 }
 
@@ -43,8 +43,8 @@ fn interval_midpoint(starts_at: DateTime<Utc>, ends_at: DateTime<Utc>) -> DateTi
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TrendInterval {
-    pub starts_at: DateTime<Utc>,
-    pub ends_at: DateTime<Utc>,
+    pub starts_at: UtcTimestamp,
+    pub ends_at: UtcTimestamp,
 }
 
 /// Exact value used for labels and machine-readable output.
@@ -71,11 +71,11 @@ impl TrendReadoutValue {
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TrendPoint {
-    pub at: DateTime<Utc>,
+    pub at: UtcTimestamp,
     pub value: f64,
     pub readout_value: TrendReadoutValue,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sampled_at: Option<DateTime<Utc>>,
+    pub sampled_at: Option<UtcTimestamp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interval: Option<TrendInterval>,
     pub partial: bool,
@@ -98,7 +98,7 @@ impl TrendPoint {
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TrendReadout {
-    pub sampled_at: DateTime<Utc>,
+    pub sampled_at: UtcTimestamp,
     pub value: TrendReadoutValue,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interval: Option<TrendInterval>,
@@ -110,7 +110,7 @@ pub struct TrendReadout {
 #[serde(rename_all = "camelCase")]
 pub struct TrendsReport {
     pub schema_version: u32,
-    pub as_of: DateTime<Utc>,
+    pub as_of: UtcTimestamp,
     pub day_offset: u16,
     pub five_hour_remaining: Vec<TrendPoint>,
     pub weekly_remaining: Vec<TrendPoint>,
@@ -128,7 +128,7 @@ pub struct TrendsReport {
     pub weekly_estimated_readout: Option<TrendReadout>,
     /// Bounds for the fifteen-minute series. The interval is half-open.
     #[serde(rename = "fifteenMinuteBounds", alias = "halfHourBounds")]
-    pub half_hour_bounds: [DateTime<Utc>; 2],
+    pub half_hour_bounds: [UtcTimestamp; 2],
     pub weekly_history_present: bool,
     #[serde(
         rename = "fifteenMinuteHistoryPresent",
@@ -149,7 +149,7 @@ pub struct TrendsReport {
 /// `api_long_context_multiplier` changes only estimated-quota series.
 pub fn build_trends_report(
     history: &HistoryData,
-    now: DateTime<Utc>,
+    now: UtcTimestamp,
     day_offset: u16,
     api_long_context_multiplier: bool,
 ) -> TrendsReport {
@@ -280,7 +280,7 @@ pub fn build_trends_report(
 }
 
 /// Returns the aligned, half-open 24-hour interval selected by the Trends UI.
-pub fn trend_day_bounds(as_of: DateTime<Utc>, day_offset: u16) -> [DateTime<Utc>; 2] {
+pub fn trend_day_bounds(as_of: UtcTimestamp, day_offset: u16) -> [UtcTimestamp; 2] {
     let shifted = datetime_saturating_sub(as_of, Duration::days(i64::from(day_offset)));
     let bucket_seconds = LOCAL_BUCKET_MINUTES * 60;
     let end_seconds = shifted
@@ -288,14 +288,14 @@ pub fn trend_day_bounds(as_of: DateTime<Utc>, day_offset: u16) -> [DateTime<Utc>
         .saturating_add(bucket_seconds - 1)
         .div_euclid(bucket_seconds)
         .saturating_mul(bucket_seconds);
-    let end = DateTime::from_timestamp(end_seconds, 0).unwrap_or(shifted);
+    let end = UtcTimestamp::from_timestamp(end_seconds, 0).unwrap_or(shifted);
     [datetime_saturating_sub(end, Duration::hours(24)), end]
 }
 
 fn trend_point(
-    at: DateTime<Utc>,
+    at: UtcTimestamp,
     readout_value: TrendReadoutValue,
-    sampled_at: Option<DateTime<Utc>>,
+    sampled_at: Option<UtcTimestamp>,
     interval: Option<TrendInterval>,
     partial: bool,
 ) -> TrendPoint {
@@ -309,10 +309,7 @@ fn trend_point(
     }
 }
 
-fn latest_real_point_at_or_before<T>(
-    points: &[T],
-    now: DateTime<Utc>,
-) -> Option<(&T, DateTime<Utc>)>
+fn latest_real_point_at_or_before<T>(points: &[T], now: UtcTimestamp) -> Option<(&T, UtcTimestamp)>
 where
     T: SampledPoint,
 {
@@ -327,11 +324,11 @@ where
 }
 
 trait SampledPoint {
-    fn sampled_at(&self) -> Option<DateTime<Utc>>;
+    fn sampled_at(&self) -> Option<UtcTimestamp>;
 }
 
 impl SampledPoint for crate::history::WeeklyCumulativePoint {
-    fn sampled_at(&self) -> Option<DateTime<Utc>> {
+    fn sampled_at(&self) -> Option<UtcTimestamp> {
         self.sampled_at
     }
 }
@@ -339,7 +336,7 @@ impl SampledPoint for crate::history::WeeklyCumulativePoint {
 fn remaining_trend_readout(
     history: &HistoryData,
     duration_mins: i64,
-    now: DateTime<Utc>,
+    now: UtcTimestamp,
 ) -> Option<TrendReadout> {
     history
         .quota_points
@@ -360,8 +357,8 @@ fn remaining_trend_readout(
 
 fn half_hour_estimated_trend(
     history: &HistoryData,
-    bounds: [DateTime<Utc>; 2],
-    as_of: DateTime<Utc>,
+    bounds: [UtcTimestamp; 2],
+    as_of: UtcTimestamp,
     api_long_context: bool,
 ) -> Vec<TrendPoint> {
     if !history.weekly_projection_available() {
@@ -444,16 +441,16 @@ fn half_hour_estimated_trend(
 #[cfg(test)]
 pub(crate) fn weekly_resets_overlapping(
     history: &HistoryData,
-    bounds: [DateTime<Utc>; 2],
-) -> Vec<DateTime<Utc>> {
-    weekly_resets_overlapping_as_of(history, bounds, DateTime::<Utc>::MAX_UTC)
+    bounds: [UtcTimestamp; 2],
+) -> Vec<UtcTimestamp> {
+    weekly_resets_overlapping_as_of(history, bounds, UtcTimestamp::MAX)
 }
 
 pub(crate) fn weekly_resets_overlapping_as_of(
     history: &HistoryData,
-    bounds: [DateTime<Utc>; 2],
-    as_of: DateTime<Utc>,
-) -> Vec<DateTime<Utc>> {
+    bounds: [UtcTimestamp; 2],
+    as_of: UtcTimestamp,
+) -> Vec<UtcTimestamp> {
     const RESET_DRIFT_SECONDS: i64 = 120;
 
     let mut candidates = history
@@ -471,9 +468,9 @@ pub(crate) fn weekly_resets_overlapping_as_of(
         .collect::<Vec<_>>();
     candidates.sort_unstable_by_key(|(reset, observed_at)| (*reset, *observed_at));
 
-    let mut resets = Vec::<(DateTime<Utc>, DateTime<Utc>)>::new();
+    let mut resets = Vec::<(UtcTimestamp, UtcTimestamp)>::new();
     let mut cluster_end = None;
-    let mut representative = None::<(DateTime<Utc>, DateTime<Utc>)>;
+    let mut representative = None::<(UtcTimestamp, UtcTimestamp)>;
     for (reset, observed_at) in candidates {
         let joins_cluster = cluster_end.is_some_and(|end| {
             reset <= datetime_saturating_add(end, Duration::seconds(RESET_DRIFT_SECONDS))
@@ -507,13 +504,13 @@ pub(crate) fn weekly_resets_overlapping_as_of(
 /// Kept crate-visible so UI contract tests do not duplicate transition logic.
 #[cfg(test)]
 pub(crate) fn remaining_trend(history: &HistoryData, duration_mins: i64) -> Vec<TrendPoint> {
-    remaining_trend_as_of(history, duration_mins, DateTime::<Utc>::MAX_UTC)
+    remaining_trend_as_of(history, duration_mins, UtcTimestamp::MAX)
 }
 
 pub(crate) fn remaining_trend_as_of(
     history: &HistoryData,
     duration_mins: i64,
-    as_of: DateTime<Utc>,
+    as_of: UtcTimestamp,
 ) -> Vec<TrendPoint> {
     let mut points = history.remaining_series_as_of(duration_mins, as_of);
     // Keep real observations from every loaded cycle. A reset credit can start
@@ -540,7 +537,7 @@ pub(crate) fn remaining_trend_as_of(
 
 #[cfg(test)]
 mod tests {
-    use chrono::Duration;
+    use crate::time::Duration;
     use serde_json::json;
 
     use super::*;
@@ -551,16 +548,14 @@ mod tests {
         QuotaPoint, WeeklyLocalPoint,
     };
 
-    fn at(value: &str) -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339(value)
-            .unwrap()
-            .with_timezone(&Utc)
+    fn at(value: &str) -> UtcTimestamp {
+        UtcTimestamp::parse_from_rfc3339(value).unwrap()
     }
 
     fn quota_point(
-        observed_at: DateTime<Utc>,
+        observed_at: UtcTimestamp,
         duration_mins: i64,
-        resets_at: DateTime<Utc>,
+        resets_at: UtcTimestamp,
         used_percent: f64,
     ) -> QuotaPoint {
         QuotaPoint {
@@ -575,7 +570,7 @@ mod tests {
     }
 
     fn bucket(
-        starts_at: DateTime<Utc>,
+        starts_at: UtcTimestamp,
         total_tokens: u64,
         estimated_cost_units: u128,
         api_long_context_extra_cost_units: Option<u128>,
@@ -603,7 +598,7 @@ mod tests {
         }
     }
 
-    fn history_fixture(now: DateTime<Utc>) -> HistoryData {
+    fn history_fixture(now: UtcTimestamp) -> HistoryData {
         let weekly_reset = now + Duration::days(3);
         let bounds = trend_day_bounds(now, 0);
         let mut history = HistoryData {
@@ -1045,8 +1040,8 @@ mod tests {
 
     #[test]
     fn datetime_extremes_are_safe_for_trend_windows() {
-        let minimum = DateTime::<Utc>::MIN_UTC;
-        let maximum = DateTime::<Utc>::MAX_UTC;
+        let minimum = UtcTimestamp::MIN;
+        let maximum = UtcTimestamp::MAX;
 
         let minimum_bounds = trend_day_bounds(minimum, u16::MAX);
         assert_eq!(minimum_bounds[0], minimum);

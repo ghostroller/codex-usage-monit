@@ -1,9 +1,9 @@
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::{CollectionStats, Snapshot, SourceStatus};
 use crate::history::HistoryData;
 use crate::service::{RecorderStatusFile, ServiceStatus};
+use crate::time::UtcTimestamp;
 
 pub const HEALTH_REPORT_SCHEMA_VERSION: u32 = 1;
 
@@ -19,7 +19,7 @@ pub const HEALTH_REPORT_SCHEMA_VERSION: u32 = 1;
 pub struct HealthReport {
     pub schema_version: u32,
     /// Time at which time-sensitive recorder state was evaluated.
-    pub as_of: DateTime<Utc>,
+    pub as_of: UtcTimestamp,
     pub snapshot: SnapshotHealth,
     pub history: HistoryHealth,
     pub recorder: RecorderHealth,
@@ -35,7 +35,7 @@ impl HealthReport {
         recorder_status: Option<&RecorderStatusFile>,
         recorder_error: Option<&str>,
         service_status: Option<&ServiceStatus>,
-        now: DateTime<Utc>,
+        now: UtcTimestamp,
     ) -> Self {
         Self::new_with_service_error(
             snapshot,
@@ -55,7 +55,7 @@ impl HealthReport {
         recorder_error: Option<&str>,
         service_status: Option<&ServiceStatus>,
         service_error: Option<&str>,
-        now: DateTime<Utc>,
+        now: UtcTimestamp,
     ) -> Self {
         Self {
             schema_version: HEALTH_REPORT_SCHEMA_VERSION,
@@ -73,7 +73,7 @@ impl HealthReport {
 #[serde(rename_all = "camelCase")]
 pub struct SnapshotHealth {
     pub schema_version: u32,
-    pub as_of: DateTime<Utc>,
+    pub as_of: UtcTimestamp,
     pub partial: bool,
     pub sources: Vec<SourceStatus>,
     pub stats: CollectionStats,
@@ -134,7 +134,7 @@ impl RecorderHealth {
     pub fn new(
         status: Option<&RecorderStatusFile>,
         error: Option<&str>,
-        now: DateTime<Utc>,
+        now: UtcTimestamp,
     ) -> Self {
         let state = if error.is_some() || status.is_some_and(|status| status.last_error.is_some()) {
             RecorderHealthState::Error
@@ -159,14 +159,14 @@ impl RecorderHealth {
 mod tests {
     use std::path::PathBuf;
 
-    use chrono::{Duration, TimeZone};
+    use crate::time::Duration;
     use serde_json::json;
 
     use super::*;
     use crate::domain::{ApiPricingMetadata, AttributionSummary};
     use crate::service::ServiceState;
 
-    fn snapshot(now: DateTime<Utc>) -> Snapshot {
+    fn snapshot(now: UtcTimestamp) -> Snapshot {
         Snapshot {
             schema_version: 2,
             api_pricing: ApiPricingMetadata::default(),
@@ -202,7 +202,7 @@ mod tests {
 
     #[test]
     fn report_combines_health_sources_with_stable_json_names() {
-        let now = Utc.with_ymd_and_hms(2026, 8, 30, 12, 0, 0).unwrap();
+        let now = UtcTimestamp::from_utc(2026, 8, 30, 12, 0, 0).unwrap();
         let snapshot = snapshot(now);
         let history = HistoryData {
             warnings: vec!["history warning".to_string()],
@@ -305,7 +305,7 @@ mod tests {
 
     #[test]
     fn recorder_state_matches_tui_health_semantics() {
-        let now = Utc.with_ymd_and_hms(2026, 8, 30, 12, 0, 0).unwrap();
+        let now = UtcTimestamp::from_utc(2026, 8, 30, 12, 0, 0).unwrap();
         assert_eq!(
             RecorderHealth::new(None, None, now).state,
             RecorderHealthState::Idle

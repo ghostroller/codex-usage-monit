@@ -36,7 +36,7 @@ fn metrics(total: u64, calls: u64) -> SessionUsageMetrics {
 fn fixture_replica(
     source: NodeId,
     project: char,
-    starts_at: DateTime<Utc>,
+    starts_at: UtcTimestamp,
     remote: bool,
 ) -> (ReplicaFacts, LocalHalfHourBucket, SourceSessionDigest) {
     let thread: ThreadId = "thread-1".parse().unwrap();
@@ -55,7 +55,7 @@ fn fixture_replica(
         let fact = UsageEventFact::new(
             replica.clone(),
             event.parse().unwrap(),
-            starts_at + ChronoDuration::minutes(minutes),
+            starts_at + SignedDuration::minutes(minutes),
             project.clone(),
             Some("turn".into()),
             None,
@@ -81,12 +81,8 @@ fn fixture_replica(
     bucket.project_groups[0].session_turn_id = Some("turn".into());
     bucket.project_groups[0].api_long_context_extra_cost_units = Some(0);
     bucket.project_groups[0].call_count = records.len() as u64;
-    let range_start = starts_at
-        .date_naive()
-        .and_hms_opt(0, 0, 0)
-        .unwrap()
-        .and_utc();
-    let range_end = range_start + ChronoDuration::days(1);
+    let range_start = UtcTimestamp::from_civil(starts_at.date_naive().at(0, 0, 0, 0)).unwrap();
+    let range_end = range_start + SignedDuration::days(1);
     let facts = records
         .iter()
         .map(|record| match record.change() {
@@ -177,7 +173,7 @@ fn try_publish(
             FactCursor::new(1, replica.records.len() as u64).unwrap(),
             |active| active.cursor,
         ),
-        completed_at: Utc.with_ymd_and_hms(2026, 8, 31, 0, 0, 0).unwrap(),
+        completed_at: UtcTimestamp::from_utc(2026, 8, 31, 0, 0, 0).unwrap(),
         changes: if kind == FactBatchKind::Snapshot {
             replica.records.clone()
         } else {
@@ -217,7 +213,7 @@ fn v2_projection_cache_invalidates_for_external_local_remote_facts_and_proof_onl
     .unwrap();
     let profile_lease = acquire_runtime_profile_lease(&runtime).unwrap();
     let active = runtime.ensure_v2_active().unwrap();
-    let starts_at = Utc.with_ymd_and_hms(2026, 8, 30, 9, 0, 0).unwrap();
+    let starts_at = UtcTimestamp::from_utc(2026, 8, 30, 9, 0, 0).unwrap();
     let (local, local_bucket, local_digest) = fixture_replica(
         runtime.source_identity().node_id().clone(),
         'a',
@@ -298,13 +294,13 @@ fn v2_projection_cache_invalidates_for_external_local_remote_facts_and_proof_onl
                 None,
                 &generation,
                 binding,
-                starts_at + ChronoDuration::minutes(20),
+                starts_at + SignedDuration::minutes(20),
             )
             .unwrap();
     }
     let mut store = TuiHistoryStore::runtime(runtime, Some(profile_lease), vec![]);
     let selection = HistorySourceSelection::AllIncluded;
-    let since = history_view_since(starts_at + ChronoDuration::minutes(20));
+    let since = history_view_since(starts_at + SignedDuration::minutes(20));
     let initial = store.load_since_with_staged_selected(&selection, since);
     assert!(initial.history.warnings.iter().any(
         |warning| warning == crate::history_query::DUPLICATE_SESSION_DEDUP_UNAVAILABLE_WARNING
@@ -411,7 +407,7 @@ fn sqlite_fact_projection_stamp_and_active_proof_roll_back_together_then_retry()
         let (replica, _, _) = fixture_replica(
             source.clone(),
             'a',
-            Utc.with_ymd_and_hms(2026, 8, 30, 9, 0, 0).unwrap(),
+            UtcTimestamp::from_utc(2026, 8, 30, 9, 0, 0).unwrap(),
             remote,
         );
         {
