@@ -51,23 +51,52 @@ that capability if the protocol changes; a tier's UI description such as
    [`testing.md`](testing.md) for platform coverage and integration/release gates.
    Report what changed, the verified pricing basis, and any remaining unknowns.
 
-### Pricing audit on October 1, 2026
+### Pricing audit on November 18, 2026
 
-The two pricing Markdown sources and supporting model/Speed pages were retrieved
-for this update. GPT-6.1 Sol receives an independent exact-ID profile; other
-currently listed bundled prices were checked and retained. GPT-5.4/mini credit
-weights and their earlier `2x` Fast multiplier remain legacy compatibility
-values; the current credit card and Speed page do not re-confirm them. Its full API and credit
-matrices are recorded in the [data-capabilities reference](codex-data-capabilities.md).
-Bundled revisions are estimator `8` and API catalog `5`; example revisions are
-`9` and `6` so it remains a valid complete external override.
+The OpenAI Docs connector retrieved both pricing Markdown sources, Codex Models
+and Speed, and the three API model pages on November 18, 2026. OpenAI launched
+GPT-6.2 Astra and Sol on November 17 and GPT-6.1 Terra on October 26. Each has
+an exact-ID Standard/Fast profile. [API changelog](https://developers.openai.com/api/docs/changelog),
+[Codex launch notes](https://learn.chatgpt.com/docs/whats-new/gpt-62-astra-sol).
 
-This audit does not establish complete support for every public model or tier.
-Rosalind API billing begins on October 5, 2026; effective-date handling and
-confirmed Fast/long-context semantics remain required before adding that profile.
-Image pricing needs modality evidence that ordinary rollout token calls lack.
-Astra Ultrafast needs a distinct tier in the schema and runtime; it is deferred
-and has no supported API pricing projection in this batch.
+API tuples are input / cached input / 30-minute cache write / output in USD per
+million tokens. Codex tuples are Standard input / cached input / output in
+credits per million tokens.
+
+| Exact ID | API Standard short | API Standard long | Codex Standard | Codex Fast included / purchased |
+| --- | --- | --- | --- | --- |
+| `gpt-6.2-astra` | 8 / 0.4 / 10 / 40 | 16 / 0.8 / 20 / 60 | 200 / 10 / 1,000 | 2x / 2x |
+| `gpt-6.2-sol` | 2 / 0.1 / 2.5 / 10 | 4 / 0.2 / 5 / 15 | 50 / 2.5 / 250 | 2x / 2x |
+| `gpt-6.1-terra` | 1 / 0.05 / 1.25 / 5 | 2 / 0.1 / 2.5 / 7.5 | 25 / 1.25 / 125 | 2.5x / 2x |
+
+For all three models, API Fast costs twice the corresponding Standard price.
+Long rates apply to the whole request when input exceeds 272,000 tokens. This
+also qualifies the three models for the optional API-based Longx estimate.
+[API pricing](https://developers.openai.com/api/docs/pricing.md),
+[Codex pricing](https://learn.chatgpt.com/docs/pricing.md),
+[GPT-6.2 Astra](https://developers.openai.com/api/docs/models/gpt-6.2-astra),
+[GPT-6.2 Sol](https://developers.openai.com/api/docs/models/gpt-6.2-sol),
+[GPT-6.1 Terra](https://developers.openai.com/api/docs/models/gpt-6.1-terra).
+
+Other bundled mappings retain their prices. GPT-5.5 credits and the earlier
+GPT-5.6, GPT-5.5, and GPT-5.4 Fast multipliers are compatibility values. The
+GPT-5.6 Sol API promotion is listed through November 30, 2026, and its Codex
+credit promotion is listed at least through November 21, 2026.
+
+This update prices Standard and Fast. Ultrafast requires separate tier
+handling and a date-aware API rate for the GPT-6.2 models. The API promotion
+uses `3x` Standard through February 28, 2027 and switches to `6x` on March 1
+in Pacific time. Codex included usage uses `6x` and eligible purchased credits
+use the promotional `3x` before switching to `6x`. API equivalence leaves
+Ultrafast samples unpriced, and EST uses its existing Standard weighting for
+unrecognized tiers. The catalog uses 30-minute cache-write rates because
+rollout usage records a cache-write token count without retention. Image
+pricing needs modality evidence. Specialized trusted-access models are outside
+this update.
+
+Bundled revisions are estimator `9` and API catalog `6`. The complete
+example uses `10` and `7`. The full API and Codex matrices are in the
+[data-capabilities reference](codex-data-capabilities.md).
 
 ## Rules to preserve
 

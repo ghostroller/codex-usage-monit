@@ -666,8 +666,11 @@ mod tests {
             total_tokens: 999,
         };
         let cases = [
+            ("gpt-6.2-astra", 32_240, 64_480),
+            ("gpt-6.2-sol", 8_060, 16_120),
             ("gpt-6-astra", 40_600, 101_500),
             ("gpt-6.1-sol", 8_060, 20_150),
+            ("gpt-6.1-terra", 4_030, 10_075),
             ("gpt-6-sol", 8_120, 20_300),
             ("gpt-6-luna", 406, 1_015),
             ("gpt-5.6-sol", 16_240, 40_600),
@@ -829,7 +832,7 @@ mod tests {
     }
 
     #[test]
-    fn gpt_6_sol_profiles_and_luna_preserve_fractional_credits_with_optional_long_context() {
+    fn gpt_6_family_profiles_preserve_fractional_credits_with_optional_long_context() {
         let tokens = TokenUsage {
             input_tokens: 272_001,
             cached_input_tokens: 200_000,
@@ -842,8 +845,14 @@ mod tests {
         // eighth-credit units, including Luna Fast's 0.625 cached rate and
         // its optional long-context 46.875 output rate.
         for (model, fast, base, with_long) in [
+            ("gpt-6.2-astra", false, 131_209_600, 262_415_200),
+            ("gpt-6.2-astra", true, 262_419_200, 524_830_400),
+            ("gpt-6.2-sol", false, 32_802_400, 65_603_800),
+            ("gpt-6.2-sol", true, 65_604_800, 131_207_600),
             ("gpt-6.1-sol", false, 32_802_400, 65_603_800),
             ("gpt-6.1-sol", true, 82_006_000, 164_009_500),
+            ("gpt-6.1-terra", false, 16_401_200, 32_801_900),
+            ("gpt-6.1-terra", true, 41_003_000, 82_004_750),
             ("gpt-6-sol", false, 36_802_400, 73_603_800),
             ("gpt-6-sol", true, 92_006_000, 184_009_500),
             ("gpt-6-luna", false, 1_840_120, 3_680_190),
@@ -859,22 +868,40 @@ mod tests {
     }
 
     #[test]
-    fn gpt_6_1_sol_exact_id_uses_fractional_fast_cache_rates_without_new_aliases() {
+    fn gpt_6_exact_ids_use_fractional_fast_cache_rates_without_guessed_aliases() {
         let tokens = TokenUsage {
             input_tokens: 1,
             cached_input_tokens: 1,
             total_tokens: 1,
             ..TokenUsage::default()
         };
-        for (tier, expected) in [(None, 20), (Some("fast"), 50), (Some("priority"), 50)] {
-            let mut call = rated_call(" GPT-6.1-SOL ", false, tokens);
-            call.service_tier = tier.map(str::to_owned);
-            let weight = estimate_call_weight(&call);
-            assert_eq!(weight.units, expected, "{tier:?}");
-            assert!(!weight.used_model_fallback);
-            assert!(!weight.used_token_breakdown_fallback);
+        for (model, standard, fast) in [
+            (" GPT-6.2-ASTRA ", 80, 160),
+            (" GPT-6.2-SOL ", 20, 40),
+            (" GPT-6.1-SOL ", 20, 50),
+            (" GPT-6.1-TERRA ", 10, 25),
+        ] {
+            for (tier, expected) in [
+                (None, standard),
+                (Some("fast"), fast),
+                (Some("priority"), fast),
+            ] {
+                let mut call = rated_call(model, false, tokens);
+                call.service_tier = tier.map(str::to_owned);
+                let weight = estimate_call_weight(&call);
+                assert_eq!(weight.units, expected, "{model} {tier:?}");
+                assert!(!weight.used_model_fallback);
+                assert!(!weight.used_token_breakdown_fallback);
+            }
         }
-        for model in ["gpt-6.1", "gpt-6.1-sol-latest"] {
+        for model in [
+            "gpt-6.2",
+            "gpt-6.2-astra-latest",
+            "gpt-6.2-sol-latest",
+            "gpt-6.1",
+            "gpt-6.1-sol-latest",
+            "gpt-6.1-terra-latest",
+        ] {
             let weight = estimate_call_weight(&rated_call(model, false, tokens));
             assert!(weight.used_model_fallback, "{model}");
             // Unknown slugs retain the GPT-5.6 Luna fallback's 0.5 cached rate.
@@ -957,8 +984,11 @@ mod tests {
         };
 
         for model in [
+            "gpt-6.2-astra",
+            "gpt-6.2-sol",
             "gpt-6-astra",
             "gpt-6.1-sol",
+            "gpt-6.1-terra",
             "gpt-6-sol",
             "gpt-6-luna",
             "gpt-5.6",

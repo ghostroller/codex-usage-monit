@@ -177,7 +177,8 @@ machine overrides in user Cargo configuration or environment variables, or
 explicitly supply an ignored local file with
 `cargo --config .cargo/config.local.toml`; Cargo does not read that local filename
 automatically. External `LIBSQLITE3_FLAGS` values must include
-`SQLITE_ENABLE_FILESTAT`. The guest checks the archive SHA-256 and expands it into a unique
+`SQLITE_ENABLE_FILESTAT` and `SQLITE_ENABLE_WALSTAT` for bundled SQLite 3.54.1.
+The guest checks the archive SHA-256 and expands it into a unique
 local temporary directory, so compilation and tests do not depend on WebDAV
 locking or source files changing underneath them.
 

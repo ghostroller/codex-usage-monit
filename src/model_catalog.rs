@@ -8,9 +8,9 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 pub(crate) const MODEL_CATALOG_VERSION: u32 = 1;
-pub(crate) const BUNDLED_ESTIMATOR_REVISION: u32 = 8;
-pub(crate) const BUNDLED_API_PRICING_CATALOG_REVISION: u32 = 5;
-pub(crate) const BUNDLED_API_PRICING_RATES_AS_OF: &str = "2026-10-01";
+pub(crate) const BUNDLED_ESTIMATOR_REVISION: u32 = 9;
+pub(crate) const BUNDLED_API_PRICING_CATALOG_REVISION: u32 = 6;
+pub(crate) const BUNDLED_API_PRICING_RATES_AS_OF: &str = "2026-11-18";
 pub(crate) const BUNDLED_API_PRICING_SOURCE_URL: &str =
     "https://developers.openai.com/api/docs/pricing";
 
@@ -1039,6 +1039,68 @@ fn bundled_catalog() -> ModelCatalog {
         models: BTreeMap::new(),
     };
 
+    // The November 18 audit uses included-usage Fast multipliers and
+    // the 30-minute API cache-write rows. See docs/model-catalog-maintenance.md.
+    catalog.insert_builtin(
+        &["gpt-6.2-astra"],
+        ModelEntry {
+            credit: credit_model(
+                CreditTokenRates::new(1_600, 80, 8_000),
+                Some(CreditTokenRates::new(3_200, 160, 16_000)),
+                true,
+            ),
+            api: Some(ApiModelRates {
+                standard: api_tier(
+                    ApiTokenRates::new(8_000_000, 400_000, Some(10_000_000), 40_000_000),
+                    ApiLongContextRates::Published(ApiTokenRates::new(
+                        16_000_000,
+                        800_000,
+                        Some(20_000_000),
+                        60_000_000,
+                    )),
+                ),
+                fast: Some(api_tier(
+                    ApiTokenRates::new(16_000_000, 800_000, Some(20_000_000), 80_000_000),
+                    ApiLongContextRates::Published(ApiTokenRates::new(
+                        32_000_000,
+                        1_600_000,
+                        Some(40_000_000),
+                        120_000_000,
+                    )),
+                )),
+            }),
+        },
+    );
+    catalog.insert_builtin(
+        &["gpt-6.2-sol"],
+        ModelEntry {
+            credit: credit_model(
+                CreditTokenRates::new(400, 20, 2_000),
+                Some(CreditTokenRates::new(800, 40, 4_000)),
+                true,
+            ),
+            api: Some(ApiModelRates {
+                standard: api_tier(
+                    ApiTokenRates::new(2_000_000, 100_000, Some(2_500_000), 10_000_000),
+                    ApiLongContextRates::Published(ApiTokenRates::new(
+                        4_000_000,
+                        200_000,
+                        Some(5_000_000),
+                        15_000_000,
+                    )),
+                ),
+                fast: Some(api_tier(
+                    ApiTokenRates::new(4_000_000, 200_000, Some(5_000_000), 20_000_000),
+                    ApiLongContextRates::Published(ApiTokenRates::new(
+                        8_000_000,
+                        400_000,
+                        Some(10_000_000),
+                        30_000_000,
+                    )),
+                )),
+            }),
+        },
+    );
     catalog.insert_builtin(
         &["gpt-6-astra"],
         ModelEntry {
@@ -1069,10 +1131,6 @@ fn bundled_catalog() -> ModelCatalog {
             }),
         },
     );
-    // GPT-6.1 Sol has its own cached-input rates; it is not an alias of GPT-6 Sol.
-    // Sources checked 2026-10-01: API pricing.md, Codex pricing.md, and Speed.
-    // Fast credits retain the estimator's included-subscription 2.5x basis;
-    // long_context_pricing enables the existing optional API Longx projection.
     catalog.insert_builtin(
         &["gpt-6.1-sol"],
         ModelEntry {
@@ -1098,6 +1156,36 @@ fn bundled_catalog() -> ModelCatalog {
                         400_000,
                         Some(10_000_000),
                         30_000_000,
+                    )),
+                )),
+            }),
+        },
+    );
+    catalog.insert_builtin(
+        &["gpt-6.1-terra"],
+        ModelEntry {
+            credit: credit_model(
+                CreditTokenRates::new(200, 10, 1_000),
+                Some(CreditTokenRates::new(500, 25, 2_500)),
+                true,
+            ),
+            api: Some(ApiModelRates {
+                standard: api_tier(
+                    ApiTokenRates::new(1_000_000, 50_000, Some(1_250_000), 5_000_000),
+                    ApiLongContextRates::Published(ApiTokenRates::new(
+                        2_000_000,
+                        100_000,
+                        Some(2_500_000),
+                        7_500_000,
+                    )),
+                ),
+                fast: Some(api_tier(
+                    ApiTokenRates::new(2_000_000, 100_000, Some(2_500_000), 10_000_000),
+                    ApiLongContextRates::Published(ApiTokenRates::new(
+                        4_000_000,
+                        200_000,
+                        Some(5_000_000),
+                        15_000_000,
                     )),
                 )),
             }),
@@ -1418,9 +1506,27 @@ mod tests {
     }
 
     #[test]
-    fn bundled_sol_and_luna_keep_fractional_rates_exact() {
+    fn bundled_gpt_6_models_keep_fractional_rates_exact() {
         let catalog = bundled_catalog();
         let cases = [
+            (
+                "gpt-6.2-astra",
+                CreditTokenRates::new(1_600, 80, 8_000),
+                CreditTokenRates::new(3_200, 160, 16_000),
+                ApiTokenRates::new(8_000_000, 400_000, Some(10_000_000), 40_000_000),
+                ApiTokenRates::new(16_000_000, 800_000, Some(20_000_000), 60_000_000),
+                ApiTokenRates::new(16_000_000, 800_000, Some(20_000_000), 80_000_000),
+                ApiTokenRates::new(32_000_000, 1_600_000, Some(40_000_000), 120_000_000),
+            ),
+            (
+                "gpt-6.2-sol",
+                CreditTokenRates::new(400, 20, 2_000),
+                CreditTokenRates::new(800, 40, 4_000),
+                ApiTokenRates::new(2_000_000, 100_000, Some(2_500_000), 10_000_000),
+                ApiTokenRates::new(4_000_000, 200_000, Some(5_000_000), 15_000_000),
+                ApiTokenRates::new(4_000_000, 200_000, Some(5_000_000), 20_000_000),
+                ApiTokenRates::new(8_000_000, 400_000, Some(10_000_000), 30_000_000),
+            ),
             (
                 "gpt-6.1-sol",
                 CreditTokenRates::new(400, 20, 2_000),
@@ -1429,6 +1535,15 @@ mod tests {
                 ApiTokenRates::new(4_000_000, 200_000, Some(5_000_000), 15_000_000),
                 ApiTokenRates::new(4_000_000, 200_000, Some(5_000_000), 20_000_000),
                 ApiTokenRates::new(8_000_000, 400_000, Some(10_000_000), 30_000_000),
+            ),
+            (
+                "gpt-6.1-terra",
+                CreditTokenRates::new(200, 10, 1_000),
+                CreditTokenRates::new(500, 25, 2_500),
+                ApiTokenRates::new(1_000_000, 50_000, Some(1_250_000), 5_000_000),
+                ApiTokenRates::new(2_000_000, 100_000, Some(2_500_000), 7_500_000),
+                ApiTokenRates::new(2_000_000, 100_000, Some(2_500_000), 10_000_000),
+                ApiTokenRates::new(4_000_000, 200_000, Some(5_000_000), 15_000_000),
             ),
             (
                 "gpt-6-sol",
@@ -1471,7 +1586,11 @@ mod tests {
         for unlisted in [
             "gpt-6",
             "gpt-6.1",
+            "gpt-6.2",
+            "gpt-6.2-astra-latest",
+            "gpt-6.2-sol-latest",
             "gpt-6.1-sol-latest",
+            "gpt-6.1-terra-latest",
             "gpt-6-sol-latest",
             "gpt-6-luna-latest",
         ] {

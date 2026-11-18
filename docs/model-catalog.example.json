@@ -1,12 +1,60 @@
 {
   "version": 1,
-  "estimatorRevision": 9,
-  "apiPricingCatalogRevision": 6,
-  "ratesAsOf": "2026-10-01",
+  "estimatorRevision": 10,
+  "apiPricingCatalogRevision": 7,
+  "ratesAsOf": "2026-11-18",
   "sourceUrl": "https://developers.openai.com/api/docs/pricing",
   "longContextInputThreshold": 272000,
   "creditFallbackModel": "gpt-5.6-luna",
   "models": [
+    {
+      "id": "gpt-6.2-astra",
+      "credit": {
+        "standard": { "input": 200, "cachedInput": 10, "output": 1000 },
+        "fast": { "input": 400, "cachedInput": 20, "output": 2000 },
+        "longContextPricing": true
+      },
+      "api": {
+        "standard": {
+          "short": { "input": 8, "cachedInput": "0.4", "cacheWrite": 10, "output": 40 },
+          "long": {
+            "mode": "published",
+            "rates": { "input": 16, "cachedInput": "0.8", "cacheWrite": 20, "output": 60 }
+          }
+        },
+        "fast": {
+          "short": { "input": 16, "cachedInput": "0.8", "cacheWrite": 20, "output": 80 },
+          "long": {
+            "mode": "published",
+            "rates": { "input": 32, "cachedInput": "1.6", "cacheWrite": 40, "output": 120 }
+          }
+        }
+      }
+    },
+    {
+      "id": "gpt-6.2-sol",
+      "credit": {
+        "standard": { "input": 50, "cachedInput": "2.5", "output": 250 },
+        "fast": { "input": 100, "cachedInput": 5, "output": 500 },
+        "longContextPricing": true
+      },
+      "api": {
+        "standard": {
+          "short": { "input": 2, "cachedInput": "0.1", "cacheWrite": "2.5", "output": 10 },
+          "long": {
+            "mode": "published",
+            "rates": { "input": 4, "cachedInput": "0.2", "cacheWrite": 5, "output": 15 }
+          }
+        },
+        "fast": {
+          "short": { "input": 4, "cachedInput": "0.2", "cacheWrite": 5, "output": 20 },
+          "long": {
+            "mode": "published",
+            "rates": { "input": 8, "cachedInput": "0.4", "cacheWrite": 10, "output": 30 }
+          }
+        }
+      }
+    },
     {
       "id": "gpt-6-astra",
       "credit": {
@@ -51,6 +99,30 @@
           "long": {
             "mode": "published",
             "rates": { "input": 8, "cachedInput": "0.4", "cacheWrite": 10, "output": 30 }
+          }
+        }
+      }
+    },
+    {
+      "id": "gpt-6.1-terra",
+      "credit": {
+        "standard": { "input": 25, "cachedInput": "1.25", "output": 125 },
+        "fast": { "input": "62.5", "cachedInput": "3.125", "output": "312.5" },
+        "longContextPricing": true
+      },
+      "api": {
+        "standard": {
+          "short": { "input": 1, "cachedInput": "0.05", "cacheWrite": "1.25", "output": 5 },
+          "long": {
+            "mode": "published",
+            "rates": { "input": 2, "cachedInput": "0.1", "cacheWrite": "2.5", "output": "7.5" }
+          }
+        },
+        "fast": {
+          "short": { "input": 2, "cachedInput": "0.1", "cacheWrite": "2.5", "output": 10 },
+          "long": {
+            "mode": "published",
+            "rates": { "input": 4, "cachedInput": "0.2", "cacheWrite": 5, "output": 15 }
           }
         }
       }

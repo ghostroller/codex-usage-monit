@@ -4,6 +4,20 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.7.3] - 2026-11-18
+
+### Added
+
+- Add exact pricing profiles for GPT-6.2 Astra, GPT-6.2 Sol, and GPT-6.1 Terra. The profiles cover Codex credit estimates and Standard/Fast API-equivalent pricing, including published long-context and 30-minute cache-write rates. See the [November pricing audit](docs/model-catalog-maintenance.md#pricing-audit-on-november-18-2026).
+
+### Security
+
+- Update bundled SQLite and rustix to address [RUSTSEC-2026-0459](https://rustsec.org/advisories/RUSTSEC-2026-0459.html) and [RUSTSEC-2026-0486](https://rustsec.org/advisories/RUSTSEC-2026-0486.html).
+
+### Compatibility
+
+- The bundled estimator revision is 9 and the API pricing catalog revision is 6. The complete external catalog example uses 10/7. Use matching catalog revisions and fingerprints across synchronized nodes.
+
 ## [0.7.2] - 2026-10-27
 
 ### Fixed
@@ -403,7 +417,8 @@ All notable changes to this project are documented in this file.
 
 - JSON schema remains version 1. Existing confidence and preferred five-hour fields keep their prior meaning; reset-credit fields are additive and backward compatible.
 
-[Unreleased]: https://github.com/ghostroller/codex-usage-monit/compare/v0.7.2...HEAD
+[Unreleased]: https://github.com/ghostroller/codex-usage-monit/compare/v0.7.3...HEAD
+[0.7.3]: https://github.com/ghostroller/codex-usage-monit/compare/v0.7.2...v0.7.3
 [0.7.2]: https://github.com/ghostroller/codex-usage-monit/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/ghostroller/codex-usage-monit/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/ghostroller/codex-usage-monit/compare/v0.6.0...v0.7.0

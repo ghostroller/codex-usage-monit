@@ -507,6 +507,20 @@ mod tests {
         };
         let cases = [
             (
+                "gpt-6.2-astra",
+                868_000_000_000,
+                1_736_000_000_000,
+                4_680_000_000_000,
+                9_360_000_000_000,
+            ),
+            (
+                "gpt-6.2-sol",
+                217_000_000_000,
+                434_000_000_000,
+                1_170_000_000_000,
+                2_340_000_000_000,
+            ),
+            (
                 "gpt-6-astra",
                 1_095_000_000_000,
                 2_190_000_000_000,
@@ -519,6 +533,13 @@ mod tests {
                 434_000_000_000,
                 1_170_000_000_000,
                 2_340_000_000_000,
+            ),
+            (
+                "gpt-6.1-terra",
+                108_500_000_000,
+                217_000_000_000,
+                585_000_000_000,
+                1_170_000_000_000,
             ),
             (
                 "gpt-6-sol",
@@ -735,6 +756,24 @@ mod tests {
         };
         for (model, short_price, long_price, ambiguous_min) in [
             (
+                "gpt-6.2-astra",
+                2_176_000_000_000,
+                4_352_016_000_000,
+                2_176_008_000_000,
+            ),
+            (
+                "gpt-6.2-sol",
+                544_000_000_000,
+                1_088_004_000_000,
+                544_002_000_000,
+            ),
+            (
+                "gpt-6.1-terra",
+                272_000_000_000,
+                544_002_000_000,
+                272_001_000_000,
+            ),
+            (
                 "gpt-5.6-sol",
                 1_088_000_000_000,
                 2_176_008_000_000,
@@ -798,16 +837,31 @@ mod tests {
     }
 
     #[test]
-    fn gpt_6_1_sol_mapping_does_not_price_guessed_aliases_or_incomplete_breakdowns() {
+    fn gpt_6_mapping_does_not_price_guessed_aliases_unsupported_tiers_or_incomplete_breakdowns() {
         let cached = TokenUsage {
             input_tokens: 1,
             cached_input_tokens: 1,
             total_tokens: 1,
             ..TokenUsage::default()
         };
-        assert_exact_price(" GPT-6.1-SOL ", None, cached, 100_000);
-        assert_exact_price("gpt-6.1-sol", Some("priority"), cached, 200_000);
-        for model in ["gpt-6.1", "gpt-6.1-sol-latest"] {
+        for (model, standard, fast) in [
+            (" GPT-6.2-ASTRA ", 400_000, 800_000),
+            (" GPT-6.2-SOL ", 100_000, 200_000),
+            (" GPT-6.1-SOL ", 100_000, 200_000),
+            (" GPT-6.1-TERRA ", 50_000, 100_000),
+        ] {
+            assert_exact_price(model, None, cached, standard);
+            assert_exact_price(model, Some("priority"), cached, fast);
+            assert_unpriced_price(model, Some("ultrafast"), cached, SERVICE_TIER_UNKNOWN);
+        }
+        for model in [
+            "gpt-6.2",
+            "gpt-6.2-astra-latest",
+            "gpt-6.2-sol-latest",
+            "gpt-6.1",
+            "gpt-6.1-sol-latest",
+            "gpt-6.1-terra-latest",
+        ] {
             assert_unpriced_price(model, None, cached, MODEL_UNKNOWN);
         }
         assert_unpriced_price(

@@ -1,6 +1,6 @@
 [package]
 name = "codex-usage-monit"
-version = "0.7.2"
+version = "0.7.3"
 edition = "2024"
 description = "Local-first TUI and CLI monitor for Codex tasks, token usage, and quota windows"
 license = "MIT"
@@ -20,7 +20,7 @@ getrandom = "0.4"
 hmac = "0.12"
 quick-xml = "0.41"
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "layout-cache", "underline-color", "unstable-rendered-line-info"] }
-rusqlite = { version = "=0.40.2", features = ["bundled", "limits"] }
+rusqlite = { version = "=0.41.1", features = ["bundled", "limits"] }
 semver = "1.0.28"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

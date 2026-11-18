@@ -57,7 +57,8 @@ SQLite FILESTAT. Ignored machine state, including `.cargo/config.local.toml` and
 configuration or environment variables, or explicitly supply an ignored local
 file with `cargo --config .cargo/config.local.toml`; Cargo does not read that
 local filename automatically. External `LIBSQLITE3_FLAGS` values must include
-`SQLITE_ENABLE_FILESTAT`. Tests use an initialized independent Git repository.
+`SQLITE_ENABLE_FILESTAT` and `SQLITE_ENABLE_WALSTAT` for bundled SQLite 3.54.1.
+Tests use an initialized independent Git repository.
 Host Cargo/Rustup configuration is not mounted; both Cargo target
 and Cargo build directories are explicitly container paths. Rustup caches and
 targets are separated by Linux architecture, while crate downloads are shared.
