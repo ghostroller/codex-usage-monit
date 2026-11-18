@@ -830,9 +830,14 @@ mod tests {
             timestamp.to_rfc3339(),
             "1969-12-31T23:59:59.999999999+00:00"
         );
+        // A Windows SystemTime tick is 100 ns. The timestamp assertions above
+        // exercise the finer precision without going through the platform clock.
+        let before_epoch = SystemTime::UNIX_EPOCH
+            .checked_sub(StdDuration::from_nanos(100))
+            .unwrap();
         assert_eq!(
-            UtcTimestamp::try_from(SystemTime::UNIX_EPOCH - StdDuration::from_nanos(1)).unwrap(),
-            timestamp,
+            UtcTimestamp::try_from(before_epoch).unwrap(),
+            UtcTimestamp::from_timestamp(-1, 999_999_900).unwrap(),
         );
         assert_eq!(
             UtcTimestamp::from_timestamp_millis(-1)
@@ -952,12 +957,13 @@ mod tests {
                 format!("\"{text}\"")
             );
         }
+        // Year 10000 exceeds Jiff's native range and fits the Windows clock.
+        let system_time = SystemTime::UNIX_EPOCH
+            .checked_add(StdDuration::from_secs(253_402_300_800))
+            .unwrap();
         assert_eq!(
-            UtcTimestamp::try_from(
-                SystemTime::UNIX_EPOCH + StdDuration::from_secs(1_783_834_200_123)
-            )
-            .unwrap(),
-            timestamp
+            UtcTimestamp::try_from(system_time).unwrap(),
+            UtcTimestamp::from_utc(10_000, 1, 1, 0, 0, 0).unwrap(),
         );
         assert_eq!(
             (timestamp - Duration::nanoseconds(1)).timestamp_subsec_nanos(),
