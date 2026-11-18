@@ -19,7 +19,7 @@ use codex_usage_monit::domain::{Provenance, RateLimitResetCreditsSnapshot};
 use codex_usage_monit::rollout::RolloutCache;
 #[cfg(unix)]
 use codex_usage_monit::snapshot::collect_snapshot_cached;
-use codex_usage_monit::time::{Duration as SignedDuration, UtcTimestamp};
+use codex_usage_monit::time::UtcTimestamp;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 
@@ -916,6 +916,8 @@ while IFS= read -r ignored; do :; done
 #[cfg(unix)]
 #[test]
 fn optional_usage_eof_does_not_degrade_snapshot_health() {
+    use codex_usage_monit::time::Duration as SignedDuration;
+
     let primary_reset = (UtcTimestamp::now() + SignedDuration::hours(2)).timestamp();
     let weekly_reset = (UtcTimestamp::now() + SignedDuration::days(5)).timestamp();
     let script = r#"#!/bin/sh

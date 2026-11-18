@@ -1965,25 +1965,67 @@ mod tests {
             return;
         }
         let directory = tempfile::tempdir().unwrap();
-        let script = concat!(
-            "import os,time\n",
-            "pid=os.fork()\n",
-            "if pid == 0:\n",
-            " os.setsid()\n",
-            " time.sleep(0.4)\n",
-            " os._exit(0)\n",
-            "print('ready', end='', flush=True)\n",
-        );
-        let started = Instant::now();
-        let error = bounded_command_output(
+        // The primary exits only after the descendant has escaped its process
+        // group. The descendant holds stdout open until the test can probe it.
+        let script = r#"
+import os
+import time
+
+ready_read, ready_write = os.pipe()
+if os.fork() == 0:
+    os.close(ready_read)
+    os.setsid()
+    os.write(ready_write, b'1')
+    os.close(ready_write)
+    watchdog = time.monotonic() + 15
+    while not os.path.exists('probe') and time.monotonic() < watchdog:
+        time.sleep(0.01)
+    if not os.path.exists('probe'):
+        os._exit(1)
+    try:
+        os.write(1, b'probe')
+        result = 'open'
+    except BrokenPipeError:
+        result = 'closed'
+    with open('result.tmp', 'w') as output:
+        output.write(result)
+    os.replace('result.tmp', 'result')
+    os._exit(0)
+os.close(ready_write)
+assert os.read(ready_read, 1) == b'1'
+os.close(ready_read)
+print('ready', end='', flush=True)
+"#;
+        let result = bounded_command_output(
             OsStr::new("python3"),
             directory.path(),
             &["-c", script],
-            Duration::from_millis(500),
-        )
-        .unwrap_err();
+            Duration::from_secs(5),
+        );
+        std::fs::write(directory.path().join("probe"), b"").unwrap();
+        let error = result.unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
-        assert!(started.elapsed() < Duration::from_millis(300));
+        assert_eq!(
+            error.to_string(),
+            "git stdout remained open after process-tree cleanup"
+        );
+
+        let result_path = directory.path().join("result");
+        let watchdog = Instant::now() + Duration::from_secs(5);
+        loop {
+            match std::fs::read_to_string(&result_path) {
+                Ok(result) => {
+                    assert_eq!(result, "closed", "the escaped writer still has a reader");
+                    break;
+                }
+                Err(error)
+                    if error.kind() == io::ErrorKind::NotFound && Instant::now() < watchdog =>
+                {
+                    thread::sleep(GIT_POLL_INTERVAL);
+                }
+                Err(error) => panic!("cannot read the escaped writer's probe result: {error}"),
+            }
+        }
     }
 
     #[cfg(unix)]
