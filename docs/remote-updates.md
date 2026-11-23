@@ -142,8 +142,14 @@ and platform archives/executable, with explicit local trust.
    lock, validate CLI ownership when requested, and persist the selected scope,
    target and CLI plan in `update-journal.json` before activation.
 3. Call the existing recorder upgrade mechanism. Import the actual current-user
-   service definition, preserving collection options, Codex paths, custom
+   service definition, preserving collection options, custom
    history/status paths, remote configuration, PATH, logs and enabled state.
+   On macOS and Linux, recorder installation using automatic Codex discovery
+   saves the absolute standalone `current/codex` path when the Codex found
+   on PATH matches the configured standalone installation's current release.
+   If the registered Codex executable is unavailable because its standalone
+   release directory was removed, the update registers that same installation's
+   verified `current/codex` path. Other configured Codex paths are preserved.
    Unknown or modified definitions fail before the old recorder is stopped.
 4. Persist the service upgrade journal, disable automatic triggers and request
    cooperative stop. The platform manager provides bounded termination for old

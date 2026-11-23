@@ -3965,7 +3965,17 @@ fn resolve_service_codex(config: &CollectConfig) -> Result<PathBuf> {
             crate::app_server::installed_windows_codex_cli(),
         )
     }
-    #[cfg(not(windows))]
+    #[cfg(unix)]
+    {
+        crate::service::codex_cli::resolve_for_service(
+            &config.codex_home,
+            config.codex_bin.as_deref(),
+            &path,
+            &current_dir,
+        )
+        .map_err(anyhow::Error::new)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         crate::session_launch::resolve_executable(
             "codex",

@@ -4,6 +4,12 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.7.4] - 2026-11-23
+
+### Fixed
+
+- Keep the stable standalone Codex executable path when automatically configuring a recorder on macOS and Linux. When an existing recorder update encounters a saved path to a removed Codex release, migrate it to the verified current executable in the same installation.
+
 ## [0.7.3] - 2026-11-18
 
 ### Added
@@ -422,7 +428,8 @@ All notable changes to this project are documented in this file.
 
 - JSON schema remains version 1. Existing confidence and preferred five-hour fields keep their prior meaning; reset-credit fields are additive and backward compatible.
 
-[Unreleased]: https://github.com/ghostroller/codex-usage-monit/compare/v0.7.3...HEAD
+[Unreleased]: https://github.com/ghostroller/codex-usage-monit/compare/v0.7.4...HEAD
+[0.7.4]: https://github.com/ghostroller/codex-usage-monit/compare/v0.7.3...v0.7.4
 [0.7.3]: https://github.com/ghostroller/codex-usage-monit/compare/v0.7.2...v0.7.3
 [0.7.2]: https://github.com/ghostroller/codex-usage-monit/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/ghostroller/codex-usage-monit/compare/v0.7.0...v0.7.1

@@ -26,6 +26,8 @@ use crate::history::HistoryStore;
 use crate::source_identity::validate_windows_private_file;
 use crate::time::UtcTimestamp;
 
+#[cfg(unix)]
+pub(crate) mod codex_cli;
 mod launchd_plist;
 mod recorder_coordination;
 mod upgrade;

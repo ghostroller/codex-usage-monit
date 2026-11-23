@@ -304,6 +304,8 @@ fn upgrade_registered_recorder_checked(allow_dev_build: bool) -> Result<ServiceU
             // Forward repair by a later candidate is allowed only if the
             // registration is still the saved old or attempted new definition.
             validate_resume_registration(&journal, existing.as_ref())?;
+            #[cfg(unix)]
+            super::codex_cli::rebind_retired_release(&mut journal.target);
             if journal.build_id == build_id
                 && existing
                     .as_ref()
@@ -341,6 +343,8 @@ fn upgrade_registered_recorder_checked(allow_dev_build: bool) -> Result<ServiceU
             };
             let mut target = existing.options;
             target.executable = executable;
+            #[cfg(unix)]
+            super::codex_cli::rebind_retired_release(&mut target);
             target = windows_host::prepare(&target, existing.enabled)?;
             let mut journal = UpgradeJournal {
                 schema_version: JOURNAL_VERSION,
